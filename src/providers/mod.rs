@@ -1,0 +1,955 @@
+pub mod registry;
+
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow};
+use async_trait::async_trait;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+use crate::storage::ChatMessage;
+
+fn is_transient_error_message(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    [
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "rate limit",
+        "overloaded",
+        "timeout",
+        "timed out",
+        "temporarily unavailable",
+        "connection reset",
+        "connection refused",
+        "broken pipe",
+        "error decoding response body",
+        "stream client disconnected",
+        "server error",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolCallRequest {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
+impl ToolCallRequest {
+    pub fn to_openai_tool_call(&self) -> Value {
+        json!({
+            "id": self.id,
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "arguments": self.arguments.to_string(),
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LlmUsage {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmResponse {
+    pub content: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCallRequest>,
+    pub finish_reason: String,
+    #[serde(default)]
+    pub usage: LlmUsage,
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
+    #[serde(default)]
+    pub thinking_blocks: Option<Vec<Value>>,
+}
+
+impl LlmResponse {
+    pub fn has_tool_calls(&self) -> bool {
+        !self.tool_calls.is_empty()
+    }
+}
+
+pub type TextStreamCallback = Arc<Mutex<Box<dyn FnMut(String) + Send>>>;
+
+#[derive(Debug, Clone)]
+pub struct GenerationSettings {
+    pub temperature: f32,
+    pub max_tokens: usize,
+}
+
+impl Default for GenerationSettings {
+    fn default() -> Self {
+        Self {
+            temperature: 0.7,
+            max_tokens: 4096,
+        }
+    }
+}
+
+#[async_trait]
+pub trait LlmProvider: Send + Sync {
+    fn default_model(&self) -> &str;
+
+    fn generation(&self) -> GenerationSettings {
+        GenerationSettings::default()
+    }
+
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Value]>,
+        model: Option<&str>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+    ) -> Result<LlmResponse>;
+
+    async fn chat_stream(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Value]>,
+        model: Option<&str>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        text_stream: Option<TextStreamCallback>,
+    ) -> Result<LlmResponse> {
+        let response = self
+            .chat(messages, tools, model, max_tokens, temperature)
+            .await?;
+        if let Some(content) = response.content.clone() {
+            emit_text_delta(text_stream.as_ref(), &content);
+        }
+        Ok(response)
+    }
+
+    async fn chat_with_retry(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Value]>,
+        model: Option<&str>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+    ) -> Result<LlmResponse> {
+        let delays = [1_u64, 2, 4];
+        let mut last_error: Option<anyhow::Error> = None;
+        for (attempt, delay) in delays.into_iter().enumerate() {
+            match self
+                .chat(messages, tools, model, max_tokens, temperature)
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(err) => {
+                    let transient = is_transient_error_message(&err.to_string());
+                    last_error = Some(err);
+                    if !transient || attempt == 2 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("provider request failed")))
+    }
+
+    async fn chat_with_retry_stream(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Value]>,
+        model: Option<&str>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        text_stream: Option<TextStreamCallback>,
+    ) -> Result<LlmResponse> {
+        let delays = [1_u64, 2, 4];
+        let mut last_error: Option<anyhow::Error> = None;
+        for (attempt, delay) in delays.into_iter().enumerate() {
+            match self
+                .chat_stream(
+                    messages,
+                    tools,
+                    model,
+                    max_tokens,
+                    temperature,
+                    text_stream.clone(),
+                )
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(err) => {
+                    let transient = is_transient_error_message(&err.to_string());
+                    last_error = Some(err);
+                    if !transient || attempt == 2 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("provider request failed")))
+    }
+}
+
+pub struct OpenAiCompatibleProvider {
+    client: Client,
+    api_key: String,
+    api_base: String,
+    default_model: String,
+    extra_headers: BTreeMap<String, String>,
+    generation: GenerationSettings,
+}
+
+impl OpenAiCompatibleProvider {
+    pub fn new(
+        api_key: String,
+        api_base: Option<String>,
+        default_model: String,
+        extra_headers: BTreeMap<String, String>,
+        generation: GenerationSettings,
+        proxy: Option<&str>,
+    ) -> Result<Self> {
+        let mut builder = Client::builder().timeout(Duration::from_secs(60));
+        if let Some(proxy) = proxy {
+            builder = builder.proxy(reqwest::Proxy::all(proxy)?);
+        }
+        Ok(Self {
+            client: builder.build()?,
+            api_key,
+            api_base: api_base.unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+            default_model,
+            extra_headers,
+            generation,
+        })
+    }
+}
+
+pub struct CustomProvider {
+    inner: OpenAiCompatibleProvider,
+}
+
+impl CustomProvider {
+    pub fn new(
+        api_key: String,
+        api_base: Option<String>,
+        default_model: String,
+        mut extra_headers: BTreeMap<String, String>,
+        generation: GenerationSettings,
+        proxy: Option<&str>,
+    ) -> Result<Self> {
+        extra_headers
+            .entry("x-session-affinity".to_string())
+            .or_insert_with(|| Uuid::new_v4().simple().to_string());
+        Ok(Self {
+            inner: OpenAiCompatibleProvider::new(
+                api_key,
+                api_base.or_else(|| Some("http://localhost:8000/v1".to_string())),
+                default_model,
+                extra_headers,
+                generation,
+                proxy,
+            )?,
+        })
+    }
+}
+
+#[async_trait]
+impl LlmProvider for CustomProvider {
+    fn default_model(&self) -> &str {
+        self.inner.default_model()
+    }
+
+    fn generation(&self) -> GenerationSettings {
+        self.inner.generation()
+    }
+
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Value]>,
+        model: Option<&str>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+    ) -> Result<LlmResponse> {
+        self.inner
+            .chat(messages, tools, model, max_tokens, temperature)
+            .await
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Value]>,
+        model: Option<&str>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        text_stream: Option<TextStreamCallback>,
+    ) -> Result<LlmResponse> {
+        self.inner
+            .chat_stream(messages, tools, model, max_tokens, temperature, text_stream)
+            .await
+    }
+}
+
+pub struct AzureOpenAiProvider {
+    client: Client,
+    api_key: String,
+    api_base: String,
+    default_model: String,
+    generation: GenerationSettings,
+}
+
+impl AzureOpenAiProvider {
+    pub fn new(
+        api_key: String,
+        api_base: String,
+        default_model: String,
+        generation: GenerationSettings,
+        proxy: Option<&str>,
+    ) -> Result<Self> {
+        if api_key.trim().is_empty() {
+            return Err(anyhow!("Azure OpenAI api_key is required"));
+        }
+        if api_base.trim().is_empty() {
+            return Err(anyhow!("Azure OpenAI api_base is required"));
+        }
+        let mut builder = Client::builder().timeout(Duration::from_secs(60));
+        if let Some(proxy) = proxy {
+            builder = builder.proxy(reqwest::Proxy::all(proxy)?);
+        }
+        Ok(Self {
+            client: builder.build()?,
+            api_key,
+            api_base: api_base.trim_end_matches('/').to_string(),
+            default_model,
+            generation,
+        })
+    }
+
+    fn build_chat_url(&self, deployment_name: &str) -> String {
+        format!(
+            "{}/openai/deployments/{}/chat/completions?api-version=2024-10-21",
+            self.api_base, deployment_name
+        )
+    }
+}
+
+#[async_trait]
+impl LlmProvider for OpenAiCompatibleProvider {
+    fn default_model(&self) -> &str {
+        &self.default_model
+    }
+
+    fn generation(&self) -> GenerationSettings {
+        self.generation.clone()
+    }
+
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Value]>,
+        model: Option<&str>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+    ) -> Result<LlmResponse> {
+        self.chat_stream(messages, tools, model, max_tokens, temperature, None)
+            .await
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Value]>,
+        model: Option<&str>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        text_stream: Option<TextStreamCallback>,
+    ) -> Result<LlmResponse> {
+        let endpoint = format!("{}/chat/completions", self.api_base.trim_end_matches('/'));
+        let mut request = self.client.post(endpoint).json(&json!({
+            "model": model.unwrap_or(self.default_model()),
+            "messages": messages,
+            "tools": tools.unwrap_or(&[]),
+            "max_tokens": max_tokens.unwrap_or(self.generation.max_tokens),
+            "temperature": temperature.unwrap_or(self.generation.temperature),
+            "stream": true,
+            "stream_options": {
+                "include_usage": true
+            }
+        }));
+        if !self.api_key.trim().is_empty() {
+            request = request.bearer_auth(&self.api_key);
+        }
+        for (key, value) in &self.extra_headers {
+            request = request.header(key, value);
+        }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!("provider error {status}: {body}"));
+        }
+
+        parse_openai_like_response_stream_first(response, text_stream.as_ref()).await
+    }
+}
+
+#[async_trait]
+impl LlmProvider for AzureOpenAiProvider {
+    fn default_model(&self) -> &str {
+        &self.default_model
+    }
+
+    fn generation(&self) -> GenerationSettings {
+        self.generation.clone()
+    }
+
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Value]>,
+        model: Option<&str>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+    ) -> Result<LlmResponse> {
+        self.chat_stream(messages, tools, model, max_tokens, temperature, None)
+            .await
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Value]>,
+        model: Option<&str>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        text_stream: Option<TextStreamCallback>,
+    ) -> Result<LlmResponse> {
+        let endpoint = self.build_chat_url(model.unwrap_or(&self.default_model));
+        let mut payload = json!({
+            "messages": messages,
+            "max_completion_tokens": max_tokens.unwrap_or(self.generation.max_tokens),
+            "stream": true,
+        });
+        if let Some(temp) = temperature {
+            payload["temperature"] = json!(temp);
+        } else {
+            payload["temperature"] = json!(self.generation.temperature);
+        }
+        if let Some(tools) = tools {
+            payload["tools"] = Value::Array(tools.to_vec());
+            payload["tool_choice"] = json!("auto");
+        }
+        let response = self
+            .client
+            .post(endpoint)
+            .header("api-key", &self.api_key)
+            .header("Content-Type", "application/json")
+            .header("x-session-affinity", Uuid::new_v4().simple().to_string())
+            .json(&payload)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!("provider error {status}: {body}"));
+        }
+        parse_openai_like_response_stream_first(response, text_stream.as_ref()).await
+    }
+}
+
+async fn parse_openai_like_response_stream_first(
+    mut response: reqwest::Response,
+    text_stream: Option<&TextStreamCallback>,
+) -> Result<LlmResponse> {
+    let is_stream = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.contains("text/event-stream"))
+        .unwrap_or(false);
+    if !is_stream {
+        let parsed = parse_openai_like_response(response.json().await?)?;
+        if let Some(content) = parsed.content.clone() {
+            emit_text_delta(text_stream, &content);
+        }
+        return Ok(parsed);
+    }
+
+    let mut state = OpenAiLikeStreamState::default();
+    let mut buffer = String::new();
+    loop {
+        let next_chunk = match response.chunk().await {
+            Ok(chunk) => chunk,
+            Err(err) => {
+                if state.has_partial_response() {
+                    return Ok(state.into_response());
+                }
+                return Err(err.into());
+            }
+        };
+        let Some(chunk) = next_chunk else {
+            break;
+        };
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(event) = extract_next_sse_event(&mut buffer) {
+            if let Err(err) = apply_openai_like_sse_event(&mut state, &event, text_stream) {
+                if state.has_partial_response() {
+                    return Ok(state.into_response());
+                }
+                return Err(err);
+            }
+        }
+    }
+    if !buffer.trim().is_empty() {
+        if let Err(err) = apply_openai_like_sse_event(&mut state, &buffer, text_stream) {
+            if state.has_partial_response() {
+                return Ok(state.into_response());
+            }
+            return Err(err);
+        }
+    }
+    Ok(state.into_response())
+}
+
+fn parse_openai_like_response(payload: Value) -> Result<LlmResponse> {
+    let choice = payload
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .cloned()
+        .ok_or_else(|| anyhow!("missing choice in provider response"))?;
+    let message = choice
+        .get("message")
+        .cloned()
+        .ok_or_else(|| anyhow!("missing message in provider response"))?;
+
+    let content = message.get("content").and_then(|content| match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    });
+    let mut tool_calls = Vec::new();
+    if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for tool_call in calls {
+            let id = tool_call
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let function = tool_call
+                .get("function")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let arguments = function
+                .get("arguments")
+                .and_then(Value::as_str)
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_else(|| {
+                    function
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}))
+                });
+            tool_calls.push(ToolCallRequest {
+                id,
+                name,
+                arguments,
+            });
+        }
+    }
+
+    let usage = payload.get("usage").cloned().unwrap_or_else(|| json!({}));
+    Ok(LlmResponse {
+        content,
+        tool_calls,
+        finish_reason: choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("stop")
+            .to_string(),
+        usage: LlmUsage {
+            prompt_tokens: usage
+                .get("prompt_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize,
+            completion_tokens: usage
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize,
+        },
+        reasoning_content: message
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        thinking_blocks: message
+            .get("thinking_blocks")
+            .and_then(Value::as_array)
+            .cloned(),
+    })
+}
+
+#[cfg(test)]
+fn parse_openai_like_sse_text(raw: &str) -> Result<LlmResponse> {
+    let mut state = OpenAiLikeStreamState::default();
+    let normalized = raw.replace("\r\n", "\n");
+    for event in normalized.split("\n\n") {
+        if let Err(err) = apply_openai_like_sse_event(&mut state, event, None) {
+            if state.has_partial_response() {
+                return Ok(state.into_response());
+            }
+            return Err(err);
+        }
+    }
+    Ok(state.into_response())
+}
+
+fn extract_delta_text(content: Option<&Value>) -> Option<String> {
+    match content {
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(Value::Array(parts)) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| part.get("content").and_then(Value::as_str))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct PartialToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+#[derive(Default)]
+struct OpenAiLikeStreamState {
+    content: String,
+    finish_reason: String,
+    usage: LlmUsage,
+    reasoning_content: String,
+    thinking_blocks: Vec<Value>,
+    tool_calls: BTreeMap<usize, PartialToolCall>,
+}
+
+impl OpenAiLikeStreamState {
+    fn has_partial_response(&self) -> bool {
+        !self.content.trim().is_empty()
+            || !self.reasoning_content.trim().is_empty()
+            || !self.thinking_blocks.is_empty()
+            || !self.tool_calls.is_empty()
+            || self.usage.prompt_tokens > 0
+            || self.usage.completion_tokens > 0
+            || !self.finish_reason.is_empty()
+    }
+
+    fn into_response(self) -> LlmResponse {
+        let parsed_tool_calls = self
+            .tool_calls
+            .into_values()
+            .map(|call| ToolCallRequest {
+                id: call.id,
+                name: call.name,
+                arguments: serde_json::from_str(&call.arguments)
+                    .unwrap_or_else(|_| Value::String(call.arguments)),
+            })
+            .collect::<Vec<_>>();
+
+        LlmResponse {
+            content: (!self.content.trim().is_empty()).then_some(self.content.trim().to_string()),
+            tool_calls: parsed_tool_calls,
+            finish_reason: if self.finish_reason.is_empty() {
+                "stop".to_string()
+            } else {
+                self.finish_reason
+            },
+            usage: self.usage,
+            reasoning_content: (!self.reasoning_content.is_empty())
+                .then_some(self.reasoning_content),
+            thinking_blocks: (!self.thinking_blocks.is_empty()).then_some(self.thinking_blocks),
+        }
+    }
+}
+
+fn emit_text_delta(text_stream: Option<&TextStreamCallback>, delta: &str) {
+    if delta.is_empty() {
+        return;
+    }
+    if let Some(text_stream) = text_stream {
+        let mut callback = text_stream.lock().expect("text stream lock poisoned");
+        (callback)(delta.to_string());
+    }
+}
+
+fn extract_next_sse_event(buffer: &mut String) -> Option<String> {
+    let unix = buffer.find("\n\n");
+    let windows = buffer.find("\r\n\r\n");
+    let (index, separator_len) = match (unix, windows) {
+        (Some(unix), Some(windows)) if unix <= windows => (unix, 2),
+        (Some(_unix), Some(windows)) => (windows, 4),
+        (Some(unix), None) => (unix, 2),
+        (None, Some(windows)) => (windows, 4),
+        (None, None) => return None,
+    };
+    let event = buffer[..index].to_string();
+    buffer.drain(..index + separator_len);
+    Some(event)
+}
+
+fn apply_openai_like_sse_event(
+    state: &mut OpenAiLikeStreamState,
+    event: &str,
+    text_stream: Option<&TextStreamCallback>,
+) -> Result<()> {
+    let data_lines = event
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim))
+        .collect::<Vec<_>>();
+    if data_lines.is_empty() {
+        return Ok(());
+    }
+    let data = data_lines.join("\n");
+    if data == "[DONE]" {
+        return Ok(());
+    }
+    let payload: Value = serde_json::from_str(&data)?;
+    if let Some(usage_payload) = payload.get("usage") {
+        state.usage.prompt_tokens = usage_payload
+            .get("prompt_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(state.usage.prompt_tokens as u64)
+            as usize;
+        state.usage.completion_tokens = usage_payload
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(state.usage.completion_tokens as u64)
+            as usize;
+    }
+    let Some(choice) = payload
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+    else {
+        return Ok(());
+    };
+    if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+        state.finish_reason = reason.to_string();
+    }
+    let Some(delta) = choice.get("delta") else {
+        return Ok(());
+    };
+    if let Some(text) = extract_delta_text(delta.get("content")) {
+        emit_text_delta(text_stream, &text);
+        state.content.push_str(&text);
+    }
+    if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
+        state.reasoning_content.push_str(reasoning);
+    }
+    if let Some(blocks) = delta.get("thinking_blocks").and_then(Value::as_array) {
+        state.thinking_blocks.extend(blocks.iter().cloned());
+    }
+    if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+        for call in calls {
+            let index = call
+                .get("index")
+                .and_then(Value::as_u64)
+                .unwrap_or(state.tool_calls.len() as u64) as usize;
+            let entry = state.tool_calls.entry(index).or_default();
+            if let Some(id) = call.get("id").and_then(Value::as_str) {
+                entry.id = id.to_string();
+            }
+            if let Some(name) = call
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+            {
+                entry.name.push_str(name);
+            }
+            if let Some(arguments) = call
+                .get("function")
+                .and_then(|function| function.get("arguments"))
+                .and_then(Value::as_str)
+            {
+                entry.arguments.push_str(arguments);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+pub struct QueuedProvider {
+    queue: Mutex<VecDeque<LlmResponse>>,
+    model: String,
+}
+
+impl QueuedProvider {
+    pub fn new(model: impl Into<String>, responses: Vec<LlmResponse>) -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::from(responses)),
+            model: model.into(),
+        }
+    }
+
+    pub fn push(&self, response: LlmResponse) {
+        self.queue
+            .lock()
+            .expect("queue lock poisoned")
+            .push_back(response);
+    }
+}
+
+#[async_trait]
+impl LlmProvider for QueuedProvider {
+    fn default_model(&self) -> &str {
+        &self.model
+    }
+
+    async fn chat(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: Option<usize>,
+        _temperature: Option<f32>,
+    ) -> Result<LlmResponse> {
+        self.queue
+            .lock()
+            .expect("queue lock poisoned")
+            .pop_front()
+            .context("queued provider exhausted")
+    }
+}
+
+pub type SharedProvider = Arc<dyn LlmProvider>;
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LlmProvider, LlmResponse, LlmUsage, ToolCallRequest, is_transient_error_message,
+        parse_openai_like_sse_text,
+    };
+    use crate::storage::ChatMessage;
+    use anyhow::{Result, anyhow};
+    use async_trait::async_trait;
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FlakyProvider {
+        attempts: AtomicUsize,
+        transient_failures: usize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for FlakyProvider {
+        fn default_model(&self) -> &str {
+            "test-model"
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: Option<usize>,
+            _temperature: Option<f32>,
+        ) -> Result<LlmResponse> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt < self.transient_failures {
+                return Err(anyhow!("provider error 503: upstream overloaded"));
+            }
+            Ok(LlmResponse {
+                content: Some("ok".to_string()),
+                tool_calls: Vec::<ToolCallRequest>::new(),
+                finish_reason: "stop".to_string(),
+                usage: LlmUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                },
+                reasoning_content: None,
+                thinking_blocks: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_only_transient_errors() {
+        let provider = FlakyProvider {
+            attempts: AtomicUsize::new(0),
+            transient_failures: 2,
+        };
+        let result = provider
+            .chat_with_retry(
+                &[ChatMessage::text("user", "hello")],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.content.as_deref(), Some("ok"));
+        assert_eq!(provider.attempts.load(Ordering::SeqCst), 3);
+        assert!(is_transient_error_message("provider error 503"));
+        assert!(!is_transient_error_message("schema mismatch"));
+    }
+
+    #[test]
+    fn parses_streaming_openai_chunks() {
+        let response = parse_openai_like_sse_text(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"},\"finish_reason\":null}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\"world\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":4}}\n\n\
+             data: [DONE]\n\n",
+        )
+        .unwrap();
+        assert_eq!(response.content.as_deref(), Some("Hello world"));
+        assert_eq!(response.usage.prompt_tokens, 12);
+        assert_eq!(response.usage.completion_tokens, 4);
+    }
+
+    #[test]
+    fn salvages_partial_stream_when_tail_is_malformed() {
+        let response = parse_openai_like_sse_text(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Partial answer\"},\"finish_reason\":null}]}\n\n\
+             data: {\"choices\":[{\"delta\":",
+        )
+        .unwrap();
+        assert_eq!(response.content.as_deref(), Some("Partial answer"));
+    }
+
+    #[test]
+    fn treats_body_decode_errors_as_transient() {
+        assert!(is_transient_error_message("error decoding response body"));
+    }
+}

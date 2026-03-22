@@ -1,0 +1,199 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderSpec {
+    pub name: &'static str,
+    pub keywords: &'static [&'static str],
+    pub is_gateway: bool,
+    pub is_local: bool,
+    pub detect_by_key_prefix: &'static str,
+    pub detect_by_base_keyword: &'static str,
+    pub default_api_base: &'static str,
+    pub is_oauth: bool,
+}
+
+pub const PROVIDERS: &[ProviderSpec] = &[
+    ProviderSpec {
+        name: "custom",
+        keywords: &[],
+        is_gateway: false,
+        is_local: false,
+        detect_by_key_prefix: "",
+        detect_by_base_keyword: "",
+        default_api_base: "",
+        is_oauth: false,
+    },
+    ProviderSpec {
+        name: "azure_openai",
+        keywords: &["azure", "azure-openai"],
+        is_gateway: false,
+        is_local: false,
+        detect_by_key_prefix: "",
+        detect_by_base_keyword: "",
+        default_api_base: "",
+        is_oauth: false,
+    },
+    ProviderSpec {
+        name: "openrouter",
+        keywords: &["openrouter"],
+        is_gateway: true,
+        is_local: false,
+        detect_by_key_prefix: "sk-or-",
+        detect_by_base_keyword: "openrouter",
+        default_api_base: "https://openrouter.ai/api/v1",
+        is_oauth: false,
+    },
+    ProviderSpec {
+        name: "aihubmix",
+        keywords: &["aihubmix"],
+        is_gateway: true,
+        is_local: false,
+        detect_by_key_prefix: "",
+        detect_by_base_keyword: "aihubmix",
+        default_api_base: "https://aihubmix.com/v1",
+        is_oauth: false,
+    },
+    ProviderSpec {
+        name: "siliconflow",
+        keywords: &["siliconflow"],
+        is_gateway: true,
+        is_local: false,
+        detect_by_key_prefix: "",
+        detect_by_base_keyword: "siliconflow",
+        default_api_base: "https://api.siliconflow.cn/v1",
+        is_oauth: false,
+    },
+    ProviderSpec {
+        name: "volcengine",
+        keywords: &["volcengine", "volces", "ark"],
+        is_gateway: true,
+        is_local: false,
+        detect_by_key_prefix: "",
+        detect_by_base_keyword: "volces",
+        default_api_base: "https://ark.cn-beijing.volces.com/api/v3",
+        is_oauth: false,
+    },
+    ProviderSpec {
+        name: "byteplus",
+        keywords: &["byteplus"],
+        is_gateway: true,
+        is_local: false,
+        detect_by_key_prefix: "",
+        detect_by_base_keyword: "bytepluses",
+        default_api_base: "https://ark.ap-southeast.bytepluses.com/api/v3",
+        is_oauth: false,
+    },
+    ProviderSpec {
+        name: "anthropic",
+        keywords: &["anthropic", "claude"],
+        is_gateway: false,
+        is_local: false,
+        detect_by_key_prefix: "",
+        detect_by_base_keyword: "",
+        default_api_base: "",
+        is_oauth: false,
+    },
+    ProviderSpec {
+        name: "openai",
+        keywords: &["openai", "gpt"],
+        is_gateway: false,
+        is_local: false,
+        detect_by_key_prefix: "",
+        detect_by_base_keyword: "",
+        default_api_base: "https://api.openai.com/v1",
+        is_oauth: false,
+    },
+    ProviderSpec {
+        name: "deepseek",
+        keywords: &["deepseek"],
+        is_gateway: false,
+        is_local: false,
+        detect_by_key_prefix: "",
+        detect_by_base_keyword: "",
+        default_api_base: "",
+        is_oauth: false,
+    },
+    ProviderSpec {
+        name: "groq",
+        keywords: &["groq"],
+        is_gateway: false,
+        is_local: false,
+        detect_by_key_prefix: "",
+        detect_by_base_keyword: "",
+        default_api_base: "",
+        is_oauth: false,
+    },
+    ProviderSpec {
+        name: "gemini",
+        keywords: &["gemini"],
+        is_gateway: false,
+        is_local: false,
+        detect_by_key_prefix: "",
+        detect_by_base_keyword: "",
+        default_api_base: "",
+        is_oauth: false,
+    },
+    ProviderSpec {
+        name: "moonshot",
+        keywords: &["moonshot", "kimi"],
+        is_gateway: false,
+        is_local: false,
+        detect_by_key_prefix: "",
+        detect_by_base_keyword: "",
+        default_api_base: "",
+        is_oauth: false,
+    },
+    ProviderSpec {
+        name: "ollama",
+        keywords: &["ollama", "llama", "qwen", "mistral"],
+        is_gateway: false,
+        is_local: true,
+        detect_by_key_prefix: "",
+        detect_by_base_keyword: "11434",
+        default_api_base: "http://localhost:11434/v1",
+        is_oauth: false,
+    },
+    ProviderSpec {
+        name: "vllm",
+        keywords: &["vllm"],
+        is_gateway: false,
+        is_local: true,
+        detect_by_key_prefix: "",
+        detect_by_base_keyword: "8000",
+        default_api_base: "http://localhost:8000/v1",
+        is_oauth: false,
+    },
+    ProviderSpec {
+        name: "openai_codex",
+        keywords: &["openai-codex", "codex"],
+        is_gateway: false,
+        is_local: false,
+        detect_by_key_prefix: "",
+        detect_by_base_keyword: "",
+        default_api_base: "",
+        is_oauth: true,
+    },
+];
+
+pub fn find_by_name(name: &str) -> Option<&'static ProviderSpec> {
+    let normalized = normalize_provider_name(name);
+    PROVIDERS
+        .iter()
+        .find(|spec| normalize_provider_name(spec.name) == normalized)
+}
+
+pub fn normalize_provider_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut prev_lower = false;
+    for ch in name.chars() {
+        if ch == '-' || ch == ' ' {
+            out.push('_');
+            prev_lower = false;
+            continue;
+        }
+        if ch.is_ascii_uppercase() && prev_lower {
+            out.push('_');
+        }
+        out.push(ch.to_ascii_lowercase());
+        prev_lower = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+    }
+    out
+}

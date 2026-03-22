@@ -1,0 +1,404 @@
+use std::collections::BTreeMap;
+use std::net::IpAddr;
+
+use anyhow::{Result, anyhow, bail};
+
+use crate::channels::{EmailConfig, FeishuConfig, SlackConfig, TelegramConfig};
+use crate::config::{Config, ProviderConfig};
+use crate::providers::registry::find_by_name;
+use crate::providers::{
+    AzureOpenAiProvider, CustomProvider, GenerationSettings, OpenAiCompatibleProvider,
+    SharedProvider,
+};
+use url::Url;
+
+fn normalize_path(path: &str) -> String {
+    if path.trim().is_empty() {
+        "/".to_string()
+    } else if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
+}
+
+fn enabled_channel_names(config: &Config) -> Vec<String> {
+    config
+        .channels
+        .sections
+        .iter()
+        .filter_map(|(name, section)| {
+            section
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                .then_some(name.clone())
+        })
+        .collect()
+}
+
+pub fn validate_run_config(config: &Config, model: &str) -> Result<()> {
+    let enabled_channels = enabled_channel_names(config);
+    if enabled_channels.is_empty() {
+        bail!("run requires at least one enabled channel");
+    }
+
+    if config.provider_for_model(Some(model)).is_none() {
+        bail!("no configured provider matched model '{model}'");
+    }
+
+    let mut webhook_paths = BTreeMap::<String, String>::new();
+
+    if let Some(section) = config.channels.section("email") {
+        let email: EmailConfig = serde_json::from_value(section.clone())
+            .map_err(|err| anyhow!("invalid email channel config: {err}"))?;
+        if email.enabled {
+            if !email.consent_granted {
+                bail!("email channel is enabled but consentGranted is false");
+            }
+            for (value, field) in [
+                (&email.imap_host, "imapHost"),
+                (&email.imap_username, "imapUsername"),
+                (&email.imap_password, "imapPassword"),
+                (&email.smtp_host, "smtpHost"),
+                (&email.smtp_username, "smtpUsername"),
+                (&email.smtp_password, "smtpPassword"),
+            ] {
+                if value.trim().is_empty() {
+                    bail!("email channel is enabled but {field} is empty");
+                }
+            }
+        }
+    }
+
+    if let Some(section) = config.channels.section("slack") {
+        let slack: SlackConfig = serde_json::from_value(section.clone())
+            .map_err(|err| anyhow!("invalid slack channel config: {err}"))?;
+        if slack.enabled {
+            if slack.bot_token.trim().is_empty() {
+                bail!("slack channel is enabled but botToken is empty");
+            }
+            if slack.signing_secret.trim().is_empty() {
+                bail!("slack channel is enabled but signingSecret is empty");
+            }
+            let path = normalize_path(&slack.webhook_path);
+            if let Some(existing) = webhook_paths.insert(path.clone(), "slack".to_string()) {
+                bail!("duplicate webhook path '{path}' configured for {existing} and slack");
+            }
+        }
+    }
+
+    if let Some(section) = config.channels.section("telegram") {
+        let telegram: TelegramConfig = serde_json::from_value(section.clone())
+            .map_err(|err| anyhow!("invalid telegram channel config: {err}"))?;
+        if telegram.enabled {
+            if telegram.token.trim().is_empty() {
+                bail!("telegram channel is enabled but token is empty");
+            }
+            let path = normalize_path(&telegram.webhook_path);
+            if let Some(existing) = webhook_paths.insert(path.clone(), "telegram".to_string()) {
+                bail!("duplicate webhook path '{path}' configured for {existing} and telegram");
+            }
+        }
+    }
+
+    if let Some(section) = config.channels.section("feishu") {
+        let feishu: FeishuConfig = serde_json::from_value(section.clone())
+            .map_err(|err| anyhow!("invalid feishu channel config: {err}"))?;
+        if feishu.enabled {
+            if feishu.app_id.trim().is_empty() || feishu.app_secret.trim().is_empty() {
+                bail!("feishu channel is enabled but appId/appSecret is incomplete");
+            }
+            let path = normalize_path(&feishu.webhook_path);
+            if let Some(existing) = webhook_paths.insert(path.clone(), "feishu".to_string()) {
+                bail!("duplicate webhook path '{path}' configured for {existing} and feishu");
+            }
+        }
+    }
+
+    for (name, server) in &config.tools.mcp_servers {
+        if !server.enabled {
+            continue;
+        }
+        let transport = if server.transport.trim().is_empty() {
+            "stdio"
+        } else {
+            server.transport.as_str()
+        };
+        if transport != "stdio" {
+            bail!(
+                "MCP server '{name}' uses unsupported transport '{transport}'; only stdio is currently supported"
+            );
+        }
+        if server.command.trim().is_empty() {
+            bail!("MCP server '{name}' is enabled but command is empty");
+        }
+    }
+
+    Ok(())
+}
+
+pub fn build_provider_client(
+    provider_name: &str,
+    provider_cfg: &ProviderConfig,
+    model: &str,
+    resolved_api_base: Option<String>,
+    proxy: Option<&str>,
+) -> Result<SharedProvider> {
+    let spec = find_by_name(provider_name);
+    let api_base = resolved_api_base
+        .or_else(|| provider_cfg.api_base.clone())
+        .or_else(|| {
+            spec.and_then(|spec| {
+                (!spec.default_api_base.is_empty()).then(|| spec.default_api_base.to_string())
+            })
+        })
+        .or_else(|| (provider_name == "openai").then(|| "https://api.openai.com/v1".to_string()));
+    let requires_api_key = !spec.map(|spec| spec.is_local).unwrap_or(false)
+        && !api_base
+            .as_deref()
+            .map(api_base_looks_local)
+            .unwrap_or(false);
+    if requires_api_key && provider_cfg.api_key.trim().is_empty() {
+        bail!("provider '{provider_name}' is configured without an API key");
+    }
+    let generation = GenerationSettings {
+        temperature: 0.1,
+        max_tokens: 8192,
+    };
+
+    match provider_name {
+        "custom" => Ok(std::sync::Arc::new(CustomProvider::new(
+            provider_cfg.api_key.clone(),
+            api_base,
+            model.to_string(),
+            provider_cfg.extra_headers.clone(),
+            generation,
+            proxy,
+        )?)),
+        "azure_openai" => Ok(std::sync::Arc::new(AzureOpenAiProvider::new(
+            provider_cfg.api_key.clone(),
+            api_base.ok_or_else(|| anyhow!("provider 'azure_openai' requires api_base"))?,
+            model.to_string(),
+            generation,
+            proxy,
+        )?)),
+        _ => Ok(std::sync::Arc::new(OpenAiCompatibleProvider::new(
+            provider_cfg.api_key.clone(),
+            api_base,
+            model.to_string(),
+            provider_cfg.extra_headers.clone(),
+            generation,
+            proxy,
+        )?)),
+    }
+}
+
+fn api_base_looks_local(api_base: &str) -> bool {
+    let Ok(url) = Url::parse(api_base) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if matches!(host, "localhost" | "0.0.0.0") || host.ends_with(".local") {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private(),
+        Ok(IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unique_local(),
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_provider_client, validate_run_config};
+    use crate::config::{Config, ProviderConfig};
+    use serde_json::json;
+
+    #[test]
+    fn validate_run_config_rejects_missing_slack_secret() {
+        let config: Config = serde_json::from_value(json!({
+            "agents": {
+                "defaults": {
+                    "model": "openai/gpt-4.1-mini",
+                    "provider": "openai"
+                }
+            },
+            "providers": {
+                "openai": {
+                    "apiKey": "sk-test"
+                }
+            },
+            "channels": {
+                "slack": {
+                    "enabled": true,
+                    "allowFrom": ["*"],
+                    "botToken": "xoxb-test"
+                }
+            }
+        }))
+        .unwrap();
+
+        let err = validate_run_config(&config, "openai/gpt-4.1-mini").unwrap_err();
+        assert!(err.to_string().contains("signingSecret"));
+    }
+
+    #[test]
+    fn validate_run_config_rejects_duplicate_webhook_paths() {
+        let config: Config = serde_json::from_value(json!({
+            "agents": {
+                "defaults": {
+                    "model": "openai/gpt-4.1-mini",
+                    "provider": "openai"
+                }
+            },
+            "providers": {
+                "openai": {
+                    "apiKey": "sk-test"
+                }
+            },
+            "channels": {
+                "telegram": {
+                    "enabled": true,
+                    "allowFrom": ["*"],
+                    "token": "123:abc",
+                    "webhookPath": "/events"
+                },
+                "feishu": {
+                    "enabled": true,
+                    "allowFrom": ["*"],
+                    "appId": "cli_a",
+                    "appSecret": "secret",
+                    "webhookPath": "/events"
+                }
+            }
+        }))
+        .unwrap();
+
+        let err = validate_run_config(&config, "openai/gpt-4.1-mini").unwrap_err();
+        assert!(err.to_string().contains("duplicate webhook path"));
+    }
+
+    #[test]
+    fn validate_run_config_accepts_email_and_webhook_channels() {
+        let config: Config = serde_json::from_value(json!({
+            "agents": {
+                "defaults": {
+                    "model": "openai/gpt-4.1-mini",
+                    "provider": "openai"
+                }
+            },
+            "providers": {
+                "openai": {
+                    "apiKey": "sk-test"
+                }
+            },
+            "channels": {
+                "email": {
+                    "enabled": true,
+                    "allowFrom": ["*"],
+                    "consentGranted": true,
+                    "imapHost": "imap.example.com",
+                    "imapUsername": "bot@example.com",
+                    "imapPassword": "imap-secret",
+                    "smtpHost": "smtp.example.com",
+                    "smtpUsername": "bot@example.com",
+                    "smtpPassword": "smtp-secret"
+                },
+                "telegram": {
+                    "enabled": true,
+                    "allowFrom": ["*"],
+                    "token": "123:abc",
+                    "webhookPath": "/telegram/webhook"
+                }
+            }
+        }))
+        .unwrap();
+
+        validate_run_config(&config, "openai/gpt-4.1-mini").unwrap();
+    }
+
+    #[test]
+    fn build_provider_client_accepts_local_provider_without_api_key() {
+        let provider = build_provider_client(
+            "ollama",
+            &ProviderConfig {
+                api_key: String::new(),
+                api_base: Some("http://localhost:11434/v1".to_string()),
+                extra_headers: Default::default(),
+            },
+            "ollama/qwen2.5-coder:7b",
+            Some("http://localhost:11434/v1".to_string()),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(provider.default_model(), "ollama/qwen2.5-coder:7b");
+    }
+
+    #[test]
+    fn build_provider_client_accepts_private_api_base_without_api_key() {
+        let provider = build_provider_client(
+            "custom",
+            &ProviderConfig {
+                api_key: String::new(),
+                api_base: Some("http://192.168.1.3:8000/v1".to_string()),
+                extra_headers: Default::default(),
+            },
+            "Qwen3_5ForConditionalGeneration",
+            Some("http://192.168.1.3:8000/v1".to_string()),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(provider.default_model(), "Qwen3_5ForConditionalGeneration");
+    }
+
+    #[test]
+    fn validate_run_config_rejects_invalid_mcp_server() {
+        let config: Config = serde_json::from_value(json!({
+            "agents": {
+                "defaults": {
+                    "model": "openai/gpt-4.1-mini",
+                    "provider": "openai"
+                }
+            },
+            "providers": {
+                "openai": {
+                    "apiKey": "sk-test"
+                }
+            },
+            "channels": {
+                "email": {
+                    "enabled": true,
+                    "allowFrom": ["*"],
+                    "consentGranted": true,
+                    "imapHost": "imap.example.com",
+                    "imapUsername": "bot@example.com",
+                    "imapPassword": "imap-secret",
+                    "smtpHost": "smtp.example.com",
+                    "smtpUsername": "bot@example.com",
+                    "smtpPassword": "smtp-secret"
+                }
+            },
+            "tools": {
+                "mcpServers": {
+                    "github": {
+                        "enabled": true,
+                        "type": "streamableHttp",
+                        "url": "http://localhost:8001/mcp"
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        let err = validate_run_config(&config, "openai/gpt-4.1-mini").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only stdio is currently supported")
+        );
+    }
+}
