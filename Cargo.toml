@@ -37,6 +37,8 @@ url = "2.5"
 uuid = { version = "1.18", features = ["serde", "v4"] }
 walkdir = "2.5"
 rustyline = "15.0"
+inquire = "0.7"
+console = "0.15"
 
 [dev-dependencies]
 serial_test = "3.2"

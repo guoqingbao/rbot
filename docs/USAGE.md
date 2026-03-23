@@ -17,7 +17,35 @@ This creates:
 - workspace bootstrap files such as `.rbot/AGENTS.md`, `.rbot/SOUL.md`, `.rbot/USER.md`, `.rbot/TOOLS.md`, and memory files
 - starter workspace skills under `.rbot/skills/`, including a memory-hygiene skill and editable project templates
 
-## 2. Choose a Provider
+## 2. Interactive Configuration
+
+Instead of manually editing `~/.rbot/config.json`, you can use the interactive CLI:
+
+### 2.1 Provider Configuration
+
+Configure your LLM providers (OpenAI, Anthropic, OpenRouter, Ollama, vLLM, etc.):
+
+```bash
+cargo run --release -- config --provider
+```
+
+The CLI will guide you through:
+1. Selecting a provider from the list.
+2. Entering your API key (if required).
+3. Fetching and selecting from available models.
+4. Setting the default model and provider for the agent.
+
+### 2.2 Channel Configuration
+
+Configure communication channels (Telegram, Slack, Email, etc.):
+
+```bash
+cargo run --release -- config --channel
+```
+
+You can selectively enable channels, set permissions (`allowFrom`), and provide necessary tokens or secrets interactively.
+
+## 3. Choose a Provider (Manual)
 
 `rbot` talks to providers through an OpenAI-compatible chat interface.
 
@@ -523,9 +551,11 @@ cargo run -- chat --model ollama/qwen2.5-coder:7b "list the next implementation 
 Inspect runtime state without starting the daemon:
 
 ```bash
-cargo run -- status
-cargo run -- sessions
-cargo run -- jobs
+cargo run -- sessions            # List active chat sessions
+cargo run -- jobs                # List scheduled cron jobs
+cargo run -- print-config        # Print current resolved config
+cargo run -- config --provider   # Interactive provider setup
+cargo run -- config --channel    # Interactive channel setup
 ```
 
 ## 10. Operational Notes

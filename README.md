@@ -29,7 +29,7 @@ cargo run --release -- onboard
 This will generate:
 
 ```python
-# Revise this config file first
+# Default config file
 Config: /root/.rbot/config.json
 Workspace: /root/.rbot/workspace
 ```
@@ -37,15 +37,20 @@ Workspace: /root/.rbot/workspace
 ### Config Providers
 
 `rbot` supports both remote and local OpenAI-compatible backends. 🎯
+You can configure them interactively:
 
-**Examples:**
+```bash
+cargo run --release -- config --provider
+```
+
+Or manually edit `~/.rbot/config.json`. **Examples:**
 
 - 🌐 OpenAI API
 - 🐋 Ollama at `http://localhost:11434/v1`
 - 🚀 vLLM at `http://localhost:8000/v1`
 - 🛠️ LM Studio or any other OpenAI-compatible local server via `providers.custom.apiBase`
 
-See [Getting Started](./docs/USAGE.md) to configure local or remote providers in `/root/.rbot/config.json`.
+See [Getting Started](./docs/USAGE.md) for more configuration options.
 
 ### Run a one-shot prompt:
 

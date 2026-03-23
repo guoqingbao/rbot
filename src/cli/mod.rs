@@ -20,6 +20,9 @@ use serde_json::Value;
 use rbot::providers::TextStreamCallback;
 use rbot::util::{ensure_dir, workspace_state_dir};
 
+pub mod config_cli;
+
+pub use config_cli::{run_config_channel, run_config_provider};
 pub enum InputEvent {
     Prompt(String),
     Exit,

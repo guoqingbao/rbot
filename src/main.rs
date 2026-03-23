@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
-use cli::{CliOutput, CliShell, InputEvent, TurnSummary};
+use cli::{CliOutput, CliShell, InputEvent, TurnSummary, run_config_channel, run_config_provider};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use rbot::channels::ChannelManager;
@@ -64,6 +64,12 @@ enum Command {
     Sessions,
     Jobs,
     PrintConfig,
+    Config {
+        #[arg(long)]
+        provider: bool,
+        #[arg(long)]
+        channel: bool,
+    },
 }
 
 #[tokio::main]
@@ -82,7 +88,21 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&config)?);
             Ok(())
         }
+        Command::Config { provider, channel } => {
+            config_cmd(cli.config.as_deref(), provider, channel).await
+        }
     }
+}
+
+async fn config_cmd(config_path: Option<&Path>, provider: bool, channel: bool) -> Result<()> {
+    if provider {
+        run_config_provider(config_path).await?;
+    } else if channel {
+        run_config_channel(config_path).await?;
+    } else {
+        println!("Please specify either --provider or --channel");
+    }
+    Ok(())
 }
 
 fn onboard(config_path: Option<&Path>, workspace_override: Option<&Path>) -> Result<()> {
