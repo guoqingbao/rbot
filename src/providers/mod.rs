@@ -220,7 +220,7 @@ impl OpenAiCompatibleProvider {
         generation: GenerationSettings,
         proxy: Option<&str>,
     ) -> Result<Self> {
-        let mut builder = Client::builder().timeout(Duration::from_secs(60));
+        let mut builder = Client::builder().timeout(Duration::from_secs(600));
         if let Some(proxy) = proxy {
             builder = builder.proxy(reqwest::Proxy::all(proxy)?);
         }
@@ -324,7 +324,7 @@ impl AzureOpenAiProvider {
         if api_base.trim().is_empty() {
             return Err(anyhow!("Azure OpenAI api_base is required"));
         }
-        let mut builder = Client::builder().timeout(Duration::from_secs(60));
+        let mut builder = Client::builder().timeout(Duration::from_secs(600));
         if let Some(proxy) = proxy {
             builder = builder.proxy(reqwest::Proxy::all(proxy)?);
         }
