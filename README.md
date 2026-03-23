@@ -71,6 +71,11 @@ The CLI includes:
 cargo run --release -- run
 ```
 
+This starts the runtime and gateway even if no inbound channels are enabled yet.
+With zero channels configured, `rbot` still serves the admin/status surfaces; enable
+`email`, `slack`, `telegram`, or `feishu` in `/root/.rbot/config.json` when you want
+message ingress and delivery.
+
 ### Check runtime configuration and local state:
 
 ```bash

@@ -22,27 +22,7 @@ fn normalize_path(path: &str) -> String {
     }
 }
 
-fn enabled_channel_names(config: &Config) -> Vec<String> {
-    config
-        .channels
-        .sections
-        .iter()
-        .filter_map(|(name, section)| {
-            section
-                .get("enabled")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-                .then_some(name.clone())
-        })
-        .collect()
-}
-
 pub fn validate_run_config(config: &Config, model: &str) -> Result<()> {
-    let enabled_channels = enabled_channel_names(config);
-    if enabled_channels.is_empty() {
-        bail!("run requires at least one enabled channel");
-    }
-
     if config.provider_for_model(Some(model)).is_none() {
         bail!("no configured provider matched model '{model}'");
     }
@@ -78,12 +58,18 @@ pub fn validate_run_config(config: &Config, model: &str) -> Result<()> {
             if slack.bot_token.trim().is_empty() {
                 bail!("slack channel is enabled but botToken is empty");
             }
-            if slack.signing_secret.trim().is_empty() {
-                bail!("slack channel is enabled but signingSecret is empty");
-            }
-            let path = normalize_path(&slack.webhook_path);
-            if let Some(existing) = webhook_paths.insert(path.clone(), "slack".to_string()) {
-                bail!("duplicate webhook path '{path}' configured for {existing} and slack");
+            if slack.mode.eq_ignore_ascii_case("socket") {
+                if slack.app_token.trim().is_empty() {
+                    bail!("slack channel mode=socket but appToken is empty");
+                }
+            } else {
+                if slack.signing_secret.trim().is_empty() {
+                    bail!("slack channel is enabled but signingSecret is empty");
+                }
+                let path = normalize_path(&slack.webhook_path);
+                if let Some(existing) = webhook_paths.insert(path.clone(), "slack".to_string()) {
+                    bail!("duplicate webhook path '{path}' configured for {existing} and slack");
+                }
             }
         }
     }

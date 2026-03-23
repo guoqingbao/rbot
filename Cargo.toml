@@ -32,6 +32,7 @@ sha2 = "0.10"
 sysinfo = "0.33"
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["full"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 url = "2.5"
 uuid = { version = "1.18", features = ["serde", "v4"] }
 walkdir = "2.5"

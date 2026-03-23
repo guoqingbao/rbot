@@ -487,7 +487,14 @@ async fn run(config_path: Option<&Path>, model_override: Option<String>) -> Resu
     });
 
     let enabled = manager.enabled_channels();
-    println!("Enabled channels: {}", enabled.join(", "));
+    if enabled.is_empty() {
+        println!("Enabled channels: none");
+        println!(
+            "Runtime started without inbound channels; admin UI and gateway are still available."
+        );
+    } else {
+        println!("Enabled channels: {}", enabled.join(", "));
+    }
     println!("Press Ctrl-C to stop.");
 
     tokio::signal::ctrl_c().await?;

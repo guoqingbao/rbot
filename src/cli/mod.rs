@@ -815,6 +815,7 @@ impl CliOutput {
 
     pub fn show_idle_footer(&self) {
         self.footer.set_idle();
+        self.footer.render_current();
     }
 
     pub fn set_queue_depth(&self, queued: usize) {

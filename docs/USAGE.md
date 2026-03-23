@@ -6,7 +6,7 @@ From the project root:
 
 ```bash
 cd rbot
-cargo run -- onboard
+cargo run --release -- onboard
 ```
 
 This creates:
@@ -126,13 +126,13 @@ Notes:
 ### One-shot prompt
 
 ```bash
-cargo run -- chat "summarize the codebase"
+cargo run --release -- chat "summarize the codebase"
 ```
 
 ### Interactive shell
 
 ```bash
-cargo run -- repl
+cargo run --release -- repl
 ```
 
 The interactive shell is designed for day-to-day agent work:
@@ -191,6 +191,37 @@ cargo run -- run
 - the HTTP gateway
 - the admin API and UI
 - the metrics endpoint
+
+### Slack without a public webhook
+
+Slack supports two practical modes in `rbot`:
+
+- `webhook`: Slack sends Events API requests to your public HTTPS endpoint
+- `socket`: `rbot` opens an outbound WebSocket to Slack and does not require a public webhook URL
+
+Example Socket Mode config:
+
+```json
+{
+  "channels": {
+    "slack": {
+      "enabled": true,
+      "mode": "socket",
+      "allowFrom": ["*"],
+      "botToken": "xoxb-...",
+      "appToken": "xapp-...",
+      "replyInThread": true,
+      "groupPolicy": "mention"
+    }
+  }
+}
+```
+
+Notes:
+
+- `mode: "socket"` requires both `botToken` and `appToken`
+- you do not need `signingSecret` or a public `/slack/events` URL in socket mode
+- in webhook mode, you still need a public HTTPS URL configured in Slack Event Subscriptions
 
 ## 4. Gateway Endpoints
 
@@ -272,6 +303,8 @@ Slack is currently webhook-driven in `rbot`.
 ```json
 {
   "channels": {
+    "sendProgress": true,
+    "sendToolHints": true,
     "slack": {
       "enabled": true,
       "allowFrom": ["*"],
@@ -299,6 +332,8 @@ Telegram is currently webhook-driven in `rbot`.
 ```json
 {
   "channels": {
+    "sendProgress": true,
+    "sendToolHints": true,
     "telegram": {
       "enabled": true,
       "allowFrom": ["*"],
@@ -331,6 +366,8 @@ Feishu runs through the webhook gateway and supports inbound text, post, interac
 ```json
 {
   "channels": {
+    "sendProgress": true,
+    "sendToolHints": true,
     "feishu": {
       "enabled": true,
       "allowFrom": ["*"],

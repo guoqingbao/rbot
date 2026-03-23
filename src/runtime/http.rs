@@ -91,25 +91,31 @@ pub fn build_gateway_router(
     if let Some(channel) = manager.get_channel("slack") {
         if channel.as_any().downcast_ref::<SlackChannel>().is_some() {
             let section = config.channels.section("slack");
-            let path = normalize_path(
-                section
-                    .and_then(|section| section.get("webhookPath"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("/slack/events"),
-            );
-            let signing_secret = section
-                .and_then(|section| section.get("signingSecret"))
+            let mode = section
+                .and_then(|section| section.get("mode"))
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            insert_webhook_route(
-                &mut routes,
-                path,
-                WebhookTarget::Slack {
-                    channel,
-                    signing_secret,
-                },
-            )?;
+                .unwrap_or("webhook");
+            if !mode.eq_ignore_ascii_case("socket") {
+                let path = normalize_path(
+                    section
+                        .and_then(|section| section.get("webhookPath"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("/slack/events"),
+                );
+                let signing_secret = section
+                    .and_then(|section| section.get("signingSecret"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                insert_webhook_route(
+                    &mut routes,
+                    path,
+                    WebhookTarget::Slack {
+                        channel,
+                        signing_secret,
+                    },
+                )?;
+            }
         }
     }
     if let Some(channel) = manager.get_channel("telegram") {
@@ -450,6 +456,7 @@ async fn dispatch_webhook(
             signing_secret,
         } => {
             if !verify_slack_request(&signing_secret, headers, raw_body)? {
+                eprintln!("[slack] rejected webhook: invalid signature");
                 return Ok((StatusCode::UNAUTHORIZED, "invalid slack signature").into_response());
             }
             if payload.get("type").and_then(Value::as_str) == Some("url_verification") {
@@ -458,9 +465,17 @@ async fn dispatch_webhook(
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                eprintln!("[slack] received url_verification challenge");
                 return Ok((StatusCode::OK, challenge).into_response());
             }
             if let Some(event) = payload.get("event") {
+                eprintln!(
+                    "[slack] webhook received event type '{}'",
+                    event
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                );
                 let slack = channel
                     .as_any()
                     .downcast_ref::<SlackChannel>()
