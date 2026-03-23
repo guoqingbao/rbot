@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -358,14 +359,14 @@ impl FooterController {
         state.detail = None;
     }
 
-    fn set_waiting(&self) {
+    fn set_waiting(&self, detail: &str) {
         let mut state = self.state.lock().expect("footer state lock poisoned");
         state.hidden = false;
         state.mode = FooterMode::Waiting;
         state.overlay_suspended = false;
         state.active_since = Some(Instant::now());
         state.spinner_frame = 0;
-        state.detail = Some("awaiting model".to_string());
+        state.detail = Some(detail.to_string());
         state.exit_pending = false;
     }
 
@@ -755,7 +756,13 @@ impl CliShell {
     fn clear_screen(&self) {
         self.footer.reset_render_state();
         if self.style.ansi {
-            print!("\x1b[2J\x1b[H");
+            if is_vscode_terminal() {
+                // VS Code overlays a sticky terminal header at the top edge.
+                // Leave the cursor on the second row so the prompt is not hidden.
+                print!("\x1b[2J\x1b[3J\x1b[2;1H");
+            } else {
+                print!("\x1b[2J\x1b[3J\x1b[H");
+            }
             let _ = io::stdout().flush();
         } else {
             println!("\n\n");
@@ -779,6 +786,13 @@ impl CliShell {
         }
         Ok(current)
     }
+}
+
+fn is_vscode_terminal() -> bool {
+    env::var("TERM_PROGRAM")
+        .map(|value| value.eq_ignore_ascii_case("vscode"))
+        .unwrap_or(false)
+        || env::var_os("VSCODE_IPC_HOOK_CLI").is_some()
 }
 
 #[derive(Clone)]
@@ -897,22 +911,10 @@ impl StreamRenderer {
 
     pub fn start_waiting(&self) {
         let mut state = self.state.lock().expect("cli stream state lock poisoned");
-        if state.started {
+        if state.started || state.waiting_handle.is_some() {
             return;
         }
-        self.footer.set_waiting();
-        self.footer.render_current();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_flag = Arc::clone(&stop);
-        let footer = self.footer.clone();
-        let handle = thread::spawn(move || {
-            while !stop_flag.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_millis(90));
-                footer.tick();
-            }
-        });
-        state.waiting_stop = Some(stop);
-        state.waiting_handle = Some(handle);
+        start_waiting_indicator(&mut state, &self.footer, "awaiting model", Duration::ZERO);
     }
 
     pub fn callback(&self) -> TextStreamCallback {
@@ -946,10 +948,8 @@ impl StreamRenderer {
 
     pub fn tool_hint(&self, hint: &str, tool_name: Option<&str>, tool_args: Option<&Value>) {
         let mut state = self.state.lock().expect("cli stream state lock poisoned");
-        if !state.started {
-            stop_waiting_indicator(&mut state);
-            self.footer.hide();
-        }
+        stop_waiting_indicator(&mut state);
+        self.footer.hide();
         self.footer.set_working(&truncate_middle(hint.trim(), 36));
         if !state.started {
             self.write_with_footer_hidden("\n");
@@ -961,7 +961,7 @@ impl StreamRenderer {
         if state.trailing_newlines == 0 {
             prefix.push('\n');
         } else if state.trailing_newlines > 1 {
-            for _ in 1..state.trailing_newlines {
+            for _ in 2..=state.trailing_newlines {
                 prefix.push_str("\x1b[1A\x1b[2K");
             }
         }
@@ -973,6 +973,12 @@ impl StreamRenderer {
             .take_while(|ch| *ch == '\n')
             .count()
             .max(1);
+        start_waiting_indicator(
+            &mut state,
+            &self.footer,
+            &format!("waiting after {}", truncate_middle(hint.trim(), 20)),
+            Duration::from_secs(10),
+        );
         drop(state);
     }
 
@@ -1062,6 +1068,44 @@ fn stop_waiting_indicator(state: &mut StreamState) {
     if let Some(handle) = state.waiting_handle.take() {
         let _ = handle.join();
     }
+}
+
+fn start_waiting_indicator(
+    state: &mut StreamState,
+    footer: &FooterController,
+    detail: &str,
+    delay: Duration,
+) {
+    stop_waiting_indicator(state);
+    if delay.is_zero() {
+        footer.set_waiting(detail);
+        footer.render_current();
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop);
+    let footer = footer.clone();
+    let detail = detail.to_string();
+    let handle = thread::spawn(move || {
+        if !delay.is_zero() {
+            let mut delayed = Duration::ZERO;
+            while delayed < delay {
+                if stop_flag.load(Ordering::SeqCst) {
+                    return;
+                }
+                let step = Duration::from_millis(100).min(delay - delayed);
+                thread::sleep(step);
+                delayed += step;
+            }
+            footer.set_waiting(&detail);
+            footer.render_current();
+        }
+        while !stop_flag.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(90));
+            footer.tick();
+        }
+    });
+    state.waiting_stop = Some(stop);
+    state.waiting_handle = Some(handle);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
