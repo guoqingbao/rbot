@@ -159,6 +159,7 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
     let mut shell = CliShell::new(&workspace, &cwd, &model, &provider_name)?;
     shell.print_welcome();
     let output = shell.create_output()?;
+    output.show_idle_footer();
     let (tx, mut rx) = unbounded_channel::<ReplEvent>();
     let input_tx = tx.clone();
     std::thread::spawn(move || {
@@ -178,7 +179,15 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                     break;
                 }
                 Ok(InputEvent::Interrupt) => {
-                    if input_tx.send(ReplEvent::Input(InputEvent::Interrupt)).is_err() {
+                    if input_tx
+                        .send(ReplEvent::Input(InputEvent::Interrupt))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(InputEvent::Stop) => {
+                    if input_tx.send(ReplEvent::Input(InputEvent::Stop)).is_err() {
                         break;
                     }
                 }
@@ -202,6 +211,7 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                     pending.push_back(prompt.clone());
                     output.print_queue_notice(pending.len(), &prompt);
                 } else {
+                    output.set_queue_depth(0);
                     active_task = Some(spawn_repl_turn(
                         agent.clone(),
                         model.clone(),
@@ -219,10 +229,57 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                     if let Some(handle) = active_task.take() {
                         handle.abort();
                         agent.set_progress_sender(None);
-                        output.print_interrupt_notice();
+                        output.print_interrupt_notice(pending.len());
                         busy = false;
-                        pending.clear();
+                        if exit_requested {
+                            break;
+                        }
+                        if let Some(next) = pending.pop_front() {
+                            output.print_dequeue_notice(pending.len(), &next);
+                            active_task = Some(spawn_repl_turn(
+                                agent.clone(),
+                                model.clone(),
+                                session_key.clone(),
+                                chat_id.clone(),
+                                next,
+                                output.clone(),
+                                tx.clone(),
+                            ));
+                            busy = true;
+                        } else {
+                            output.show_idle_footer();
+                        }
                     }
+                }
+            }
+            ReplEvent::Input(InputEvent::Stop) => {
+                if busy {
+                    if let Some(handle) = active_task.take() {
+                        handle.abort();
+                        agent.set_progress_sender(None);
+                        output.print_interrupt_notice(pending.len());
+                        busy = false;
+                        if exit_requested {
+                            break;
+                        }
+                        if let Some(next) = pending.pop_front() {
+                            output.print_dequeue_notice(pending.len(), &next);
+                            active_task = Some(spawn_repl_turn(
+                                agent.clone(),
+                                model.clone(),
+                                session_key.clone(),
+                                chat_id.clone(),
+                                next,
+                                output.clone(),
+                                tx.clone(),
+                            ));
+                            busy = true;
+                        } else {
+                            output.show_idle_footer();
+                        }
+                    }
+                } else {
+                    output.print_interrupt_notice(0);
                 }
             }
             ReplEvent::Input(InputEvent::Exit) => {
@@ -251,6 +308,8 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                         tx.clone(),
                     ));
                     busy = true;
+                } else {
+                    output.show_idle_footer();
                 }
             }
         }
@@ -654,7 +713,13 @@ fn cli_progress_callback(stream: cli::StreamRenderer) -> MessageSendCallback {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
             {
-                stream.tool_hint(msg.content.trim());
+                stream.tool_hint(
+                    msg.content.trim(),
+                    msg.metadata
+                        .get("_tool_name")
+                        .and_then(serde_json::Value::as_str),
+                    msg.metadata.get("_tool_args"),
+                );
             }
             Ok(())
         })

@@ -551,6 +551,11 @@ impl AgentLoop {
         let mut metadata = target.metadata.clone();
         metadata.insert("_progress".to_string(), Value::Bool(true));
         metadata.insert("_tool_hint".to_string(), Value::Bool(true));
+        metadata.insert(
+            "_tool_name".to_string(),
+            Value::String(tool_call.name.clone()),
+        );
+        metadata.insert("_tool_args".to_string(), tool_call.arguments.clone());
         let outbound = OutboundMessage {
             channel: target.channel.clone(),
             chat_id: target.chat_id.clone(),

@@ -1,35 +1,33 @@
+use std::borrow::Cow;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use rustyline::error::ReadlineError;
-use rustyline::{Editor, ExternalPrinter as RustylineExternalPrinter};
-use rustyline::history::DefaultHistory;
-use rustyline::highlight::Highlighter;
-use rustyline::validate::{Validator, ValidationResult, ValidationContext};
-use rustyline::hint::Hinter;
 use rustyline::completion::Completer;
-use std::borrow::Cow;
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::history::DefaultHistory;
+use rustyline::validate::{ValidationContext, ValidationResult, Validator};
+use rustyline::{Editor, ExternalPrinter as RustylineExternalPrinter};
+use serde_json::Value;
 
 use rbot::providers::TextStreamCallback;
 use rbot::util::{ensure_dir, workspace_state_dir};
-
-
 
 pub enum InputEvent {
     Prompt(String),
     Exit,
     Interrupt,
+    Stop,
 }
 
 #[derive(Clone)]
-struct CliHelper {
-    style: Style,
-}
+struct CliHelper;
 
 impl rustyline::Helper for CliHelper {}
 
@@ -49,15 +47,16 @@ impl Validator for CliHelper {
 
 impl Highlighter for CliHelper {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
-        if self.style.ansi {
-            Cow::Owned(format!("\x1b[48;5;253;38;5;236m{line}\x1b[0m"))
-        } else {
-            Cow::Borrowed(line)
-        }
+        Cow::Borrowed(line)
     }
 
-    fn highlight_char(&self, _line: &str, _pos: usize, _forced: rustyline::highlight::CmdKind) -> bool {
-        self.style.ansi
+    fn highlight_char(
+        &self,
+        _line: &str,
+        _pos: usize,
+        _forced: rustyline::highlight::CmdKind,
+    ) -> bool {
+        false
     }
 }
 
@@ -118,6 +117,31 @@ impl Style {
         self.paint("38;5;244", text)
     }
 
+    fn bold(&self, text: impl AsRef<str>) -> String {
+        self.paint("1", text)
+    }
+
+    fn italic(&self, text: impl AsRef<str>) -> String {
+        self.paint("3", text)
+    }
+
+    fn strike(&self, text: impl AsRef<str>) -> String {
+        self.paint("9", text)
+    }
+
+    fn inline_code(&self, text: impl AsRef<str>) -> String {
+        let text = text.as_ref();
+        if self.ansi {
+            self.paint("48;5;236;38;5;223", format!(" {text} "))
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn link(&self, text: impl AsRef<str>) -> String {
+        self.paint("4;38;5;117", text)
+    }
+
     fn code_fence(&self, lang: &str, open: bool) -> String {
         let marker = if open { "┌" } else { "└" };
         let label = if lang.is_empty() { "code" } else { lang };
@@ -141,6 +165,35 @@ impl Style {
         }
     }
 
+    fn panel_line(&self, code: &str, text: impl AsRef<str>, width: usize) -> String {
+        let text = pad_to_width(text.as_ref(), width);
+        if self.ansi {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text
+        }
+    }
+
+    fn panel_header(&self, text: impl AsRef<str>, width: usize) -> String {
+        self.panel_line("48;5;250;38;5;236;1", text, width)
+    }
+
+    fn panel_meta(&self, text: impl AsRef<str>, width: usize) -> String {
+        self.panel_line("48;5;254;38;5;239", text, width)
+    }
+
+    fn panel_context(&self, text: impl AsRef<str>, width: usize) -> String {
+        self.panel_line("48;5;254;38;5;236", text, width)
+    }
+
+    fn panel_added(&self, text: impl AsRef<str>, width: usize) -> String {
+        self.panel_line("48;5;194;38;5;22", text, width)
+    }
+
+    fn panel_removed(&self, text: impl AsRef<str>, width: usize) -> String {
+        self.panel_line("48;5;224;38;5;52", text, width)
+    }
+
     fn queue_pill(&self, text: impl AsRef<str>) -> String {
         let text = text.as_ref();
         if self.ansi {
@@ -152,7 +205,7 @@ impl Style {
 
     fn primary_prompt(&self) -> String {
         if self.ansi {
-            format!("\n\x1b[48;5;253m\x1b[K\x1b[0m\n\x1b[48;5;253;38;5;236;1m\x1b[K   › \x1b[0m\x1b[48;5;253;38;5;236m")
+            format!("{} ", self.accent("›"))
         } else {
             "› ".to_string()
         }
@@ -160,7 +213,7 @@ impl Style {
 
     fn continuation_prompt(&self) -> String {
         if self.ansi {
-            format!("\x1b[48;5;253;38;5;245m\x1b[K  …› \x1b[0m\x1b[48;5;253;38;5;236m")
+            format!("{} ", self.subtle("…"))
         } else {
             "…› ".to_string()
         }
@@ -206,12 +259,12 @@ impl OutputTarget {
     }
 }
 
+type SharedPrinter = Arc<Mutex<Box<dyn RustylineExternalPrinter + Send>>>;
+
 fn write_stderr_raw(text: &str) {
     eprint!("{text}");
     let _ = io::stderr().flush();
 }
-
-type SharedPrinter = Arc<Mutex<Box<dyn RustylineExternalPrinter + Send>>>;
 
 pub struct TurnSummary<'a> {
     pub model: &'a str,
@@ -220,10 +273,305 @@ pub struct TurnSummary<'a> {
     pub elapsed: Duration,
 }
 
+#[derive(Clone)]
+struct FooterController {
+    style: Style,
+    state: Arc<Mutex<FooterState>>,
+}
+
+struct FooterState {
+    target: Option<OutputTarget>,
+    display: FooterDisplay,
+    overlay_suspended: bool,
+    mode: FooterMode,
+    model: String,
+    provider: String,
+    cwd_name: String,
+    queue_depth: usize,
+    last_prompt_tokens: usize,
+    last_completion_tokens: usize,
+    last_elapsed: Option<Duration>,
+    active_since: Option<Instant>,
+    spinner_frame: usize,
+    exit_pending: bool,
+    detail: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FooterMode {
+    Idle,
+    Waiting,
+    Working,
+    Interrupted,
+    Error,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FooterDisplay {
+    None,
+    Transcript,
+    Overlay,
+}
+
+impl FooterController {
+    fn new(style: Style, model: String, provider: String, cwd_name: String) -> Self {
+        Self {
+            style,
+            state: Arc::new(Mutex::new(FooterState {
+                target: None,
+                display: FooterDisplay::None,
+                overlay_suspended: false,
+                mode: FooterMode::Idle,
+                model,
+                provider,
+                cwd_name,
+                queue_depth: 0,
+                last_prompt_tokens: 0,
+                last_completion_tokens: 0,
+                last_elapsed: None,
+                active_since: None,
+                spinner_frame: 0,
+                exit_pending: false,
+                detail: None,
+            })),
+        }
+    }
+
+    fn attach_target(&self, target: OutputTarget) -> Self {
+        let mut state = self.state.lock().expect("footer state lock poisoned");
+        state.target = Some(target);
+        self.clone()
+    }
+
+    fn reset_render_state(&self) {
+        let mut state = self.state.lock().expect("footer state lock poisoned");
+        if state.display == FooterDisplay::Overlay {
+            clear_overlay_footer();
+        }
+        state.display = FooterDisplay::None;
+        state.overlay_suspended = false;
+    }
+
+    fn set_idle(&self) {
+        let mut state = self.state.lock().expect("footer state lock poisoned");
+        state.mode = FooterMode::Idle;
+        state.overlay_suspended = false;
+        state.active_since = None;
+        state.detail = None;
+        if !state.exit_pending {
+            state.spinner_frame = 0;
+        }
+    }
+
+    fn set_waiting(&self) {
+        let mut state = self.state.lock().expect("footer state lock poisoned");
+        state.mode = FooterMode::Waiting;
+        state.overlay_suspended = false;
+        state.active_since = Some(Instant::now());
+        state.spinner_frame = 0;
+        state.detail = Some("awaiting model".to_string());
+        state.exit_pending = false;
+    }
+
+    fn set_working(&self, detail: &str) {
+        let mut state = self.state.lock().expect("footer state lock poisoned");
+        state.mode = FooterMode::Working;
+        if state.active_since.is_none() {
+            state.active_since = Some(Instant::now());
+        }
+        state.detail = Some(detail.to_string());
+    }
+
+    fn complete(&self, summary: &TurnSummary<'_>) {
+        let mut state = self.state.lock().expect("footer state lock poisoned");
+        state.mode = FooterMode::Idle;
+        state.overlay_suspended = false;
+        state.active_since = None;
+        state.last_prompt_tokens = summary.prompt_tokens;
+        state.last_completion_tokens = summary.completion_tokens;
+        state.last_elapsed = Some(summary.elapsed);
+        state.detail = Some(format!(
+            "last {} · {:.1}s",
+            summary.model,
+            summary.elapsed.as_secs_f64()
+        ));
+        state.exit_pending = false;
+    }
+
+    fn set_interrupted(&self) {
+        let mut state = self.state.lock().expect("footer state lock poisoned");
+        state.mode = FooterMode::Interrupted;
+        state.overlay_suspended = false;
+        state.active_since = None;
+        state.last_elapsed = None;
+        state.detail = Some("turn interrupted".to_string());
+        state.exit_pending = false;
+    }
+
+    fn set_error(&self, detail: &str) {
+        let mut state = self.state.lock().expect("footer state lock poisoned");
+        state.mode = FooterMode::Error;
+        state.overlay_suspended = false;
+        state.active_since = None;
+        state.last_elapsed = None;
+        state.detail = Some(detail.to_string());
+        state.exit_pending = false;
+    }
+
+    fn set_queue_depth(&self, queued: usize) {
+        let mut state = self.state.lock().expect("footer state lock poisoned");
+        state.queue_depth = queued;
+    }
+
+    fn set_exit_pending(&self, exit_pending: bool) {
+        let mut state = self.state.lock().expect("footer state lock poisoned");
+        state.exit_pending = exit_pending;
+    }
+
+    fn tick(&self) {
+        let mut state = self.state.lock().expect("footer state lock poisoned");
+        if matches!(state.mode, FooterMode::Waiting | FooterMode::Working) {
+            state.spinner_frame = state.spinner_frame.wrapping_add(1);
+            render_footer_locked(&self.style, &mut state);
+        }
+    }
+
+    fn render_current(&self) {
+        let mut state = self.state.lock().expect("footer state lock poisoned");
+        render_footer_locked(&self.style, &mut state);
+    }
+
+    fn suspend_overlay(&self) {
+        let mut state = self.state.lock().expect("footer state lock poisoned");
+        state.overlay_suspended = true;
+        if state.display == FooterDisplay::Overlay {
+            clear_overlay_footer();
+            state.display = FooterDisplay::None;
+        }
+    }
+
+    fn resume_overlay(&self) {
+        let mut state = self.state.lock().expect("footer state lock poisoned");
+        state.overlay_suspended = false;
+        render_footer_locked(&self.style, &mut state);
+    }
+}
+
+fn render_footer_locked(style: &Style, state: &mut FooterState) {
+    let Some(target) = state.target.clone() else {
+        return;
+    };
+    let rendered = build_footer_line(style, state);
+    if style.ansi
+        && target.uses_external_printer()
+        && matches!(state.mode, FooterMode::Waiting | FooterMode::Working)
+    {
+        if state.overlay_suspended {
+            return;
+        }
+        write_overlay_footer(&rendered);
+        state.display = FooterDisplay::Overlay;
+        return;
+    }
+
+    if state.display == FooterDisplay::Overlay {
+        clear_overlay_footer();
+        state.display = FooterDisplay::None;
+    }
+
+    let text = format!("{rendered}\n");
+    if style.ansi && state.display == FooterDisplay::Transcript {
+        target.write_raw(format!("\x1b[1A\r\x1b[2K{text}"));
+    } else {
+        target.write_raw(&text);
+        state.display = FooterDisplay::Transcript;
+    }
+}
+
+fn write_overlay_footer(rendered: &str) {
+    write_stderr_raw(&format!("\x1b[s\r\n\x1b[2K{rendered}\x1b[u"));
+}
+
+fn clear_overlay_footer() {
+    write_stderr_raw("\x1b[s\r\n\x1b[2K\x1b[u");
+}
+
+fn build_footer_line(style: &Style, state: &FooterState) -> String {
+    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let status = match state.mode {
+        FooterMode::Idle => style.accent("ready"),
+        FooterMode::Waiting => style.accent(format!(
+            "{} waiting",
+            spinner[state.spinner_frame % spinner.len()]
+        )),
+        FooterMode::Working => style.accent(format!(
+            "{} working",
+            spinner[state.spinner_frame % spinner.len()]
+        )),
+        FooterMode::Interrupted => style.error("interrupted"),
+        FooterMode::Error => style.error("error"),
+    };
+    let elapsed = state
+        .active_since
+        .map(|started| started.elapsed())
+        .or(state.last_elapsed)
+        .map(|elapsed| format!("{:.1}s", elapsed.as_secs_f64()));
+    let tokens = if state.last_prompt_tokens == 0 && state.last_completion_tokens == 0 {
+        None
+    } else {
+        Some(format!(
+            "↑{} ↓{}",
+            state.last_prompt_tokens, state.last_completion_tokens
+        ))
+    };
+    let detail = state
+        .detail
+        .as_deref()
+        .filter(|detail| !detail.is_empty())
+        .map(|detail| truncate_middle(detail, 32));
+    let hint = match state.mode {
+        FooterMode::Waiting | FooterMode::Working => {
+            if state.exit_pending {
+                "Ctrl-C or /stop interrupt · /exit pending · type to queue"
+            } else {
+                "Ctrl-C or /stop interrupt · type to queue · /exit after turn"
+            }
+        }
+        FooterMode::Interrupted => "enter to continue · queued prompts are preserved",
+        FooterMode::Error => "enter to retry · /new resets session · /exit quits",
+        FooterMode::Idle => "enter sends · /new resets · /status shows session · /exit quits",
+    };
+
+    let mut parts = vec![
+        "╰".to_string(),
+        status,
+        style.dim(format!("{} · {}", state.model, state.provider)),
+        style.subtle(&state.cwd_name),
+    ];
+    if state.queue_depth > 0 {
+        parts.push(style.subtle(format!("queue {}", state.queue_depth)));
+    }
+    if let Some(tokens) = tokens {
+        parts.push(style.subtle(tokens));
+    }
+    if let Some(elapsed) = elapsed {
+        parts.push(style.subtle(elapsed));
+    }
+    if let Some(detail) = detail {
+        parts.push(style.subtle(detail));
+    }
+    if state.exit_pending && !matches!(state.mode, FooterMode::Waiting | FooterMode::Working) {
+        parts.push(style.subtle("exit pending"));
+    }
+    parts.push(style.dim(hint));
+    parts.join(" · ")
+}
+
 pub struct CliShell {
     editor: Editor<CliHelper, DefaultHistory>,
     history_path: PathBuf,
     style: Style,
+    footer: FooterController,
     workspace: PathBuf,
     cwd: PathBuf,
     model: String,
@@ -240,16 +588,29 @@ impl CliShell {
         let style = Style::detect();
         let history_path = history_file_path()?;
         let mut editor = Editor::<CliHelper, DefaultHistory>::new()?;
-        editor.set_helper(Some(CliHelper { style: style.clone() }));
+        editor.set_helper(Some(CliHelper));
         let _ = editor.load_history(&history_path);
+        let cwd_name = cwd
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| cwd.display().to_string());
+        let model = model.into();
+        let provider = provider.into();
+        let footer = FooterController::new(
+            style.clone(),
+            model.clone(),
+            provider.clone(),
+            truncate_middle(&cwd_name, 24),
+        );
         Ok(Self {
             editor,
             history_path,
             style,
+            footer,
             workspace: workspace.to_path_buf(),
             cwd: cwd.to_path_buf(),
-            model: model.into(),
-            provider: provider.into(),
+            model,
+            provider,
         })
     }
 
@@ -289,17 +650,19 @@ impl CliShell {
             .create_external_printer()
             .ok()
             .map(|printer| Arc::new(Mutex::new(Box::new(printer) as Box<_>)));
+        let target = printer
+            .map(|printer| OutputTarget::printer(self.style.clone(), printer))
+            .unwrap_or_else(|| OutputTarget::stdout(self.style.clone()));
         Ok(CliOutput {
             style: self.style.clone(),
-            target: printer
-                .map(|printer| OutputTarget::printer(self.style.clone(), printer))
-                .unwrap_or_else(|| OutputTarget::stdout(self.style.clone())),
+            footer: self.footer.attach_target(target.clone()),
+            target,
         })
     }
 
     pub fn read_event(&mut self) -> Result<InputEvent> {
         loop {
-            self.print_turn_header();
+            self.footer.render_current();
             let line = match self.editor.readline(&self.style.primary_prompt()) {
                 Ok(line) => line,
                 Err(ReadlineError::Interrupted) => return Ok(InputEvent::Interrupt),
@@ -308,9 +671,6 @@ impl CliShell {
             };
 
             let input = self.read_multiline(line)?;
-            if self.style.ansi {
-                println!("\x1b[48;5;253m\x1b[K\x1b[0m");
-            }
             let trimmed = input.trim();
             if trimmed.is_empty() {
                 continue;
@@ -318,12 +678,15 @@ impl CliShell {
 
             match parse_local_command(trimmed) {
                 Some(LocalCommand::Exit) => return Ok(InputEvent::Exit),
+                Some(LocalCommand::Stop) => return Ok(InputEvent::Stop),
                 Some(LocalCommand::Help) => {
                     self.print_help();
+                    self.footer.render_current();
                     continue;
                 }
                 Some(LocalCommand::Clear) => {
                     self.clear_screen();
+                    self.footer.render_current();
                     continue;
                 }
                 None => {}
@@ -336,7 +699,9 @@ impl CliShell {
     }
 
     pub fn stream_renderer(&self) -> StreamRenderer {
-        StreamRenderer::new(OutputTarget::stdout(self.style.clone()))
+        let target = OutputTarget::stdout(self.style.clone());
+        let footer = self.footer.attach_target(target.clone());
+        StreamRenderer::new(target, footer)
     }
 
     fn print_help(&self) {
@@ -344,13 +709,9 @@ impl CliShell {
         println!(
             "{} {}",
             self.style.dim("│ local    "),
-            "/help  /clear  /exit"
+            "/help  /clear  /exit  /stop"
         );
-        println!(
-            "{} {}",
-            self.style.dim("│ agent    "),
-            "/new  /status  /stop"
-        );
+        println!("{} {}", self.style.dim("│ agent    "), "/new  /status");
         println!(
             "{} {}",
             self.style.dim("│ input    "),
@@ -359,7 +720,7 @@ impl CliShell {
         println!(
             "{} {}",
             self.style.dim("│ queue    "),
-            "new prompts entered during a running turn are queued automatically"
+            "type while busy to queue the next prompt; /stop or Ctrl-C interrupts"
         );
         println!(
             "{} {}",
@@ -369,28 +730,13 @@ impl CliShell {
     }
 
     fn clear_screen(&self) {
+        self.footer.reset_render_state();
         if self.style.ansi {
             print!("\x1b[2J\x1b[H");
             let _ = io::stdout().flush();
         } else {
             println!("\n\n");
         }
-    }
-
-    fn print_turn_header(&self) {
-        let cwd_name = self
-            .cwd
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| self.cwd.display().to_string());
-        println!(
-            "{} {} {} {} {}",
-            self.style.dim("·"),
-            self.style.accent(&self.model),
-            self.style.dim("·"),
-            self.provider,
-            self.style.dim(format!("· {cwd_name}"))
-        );
     }
 
     fn read_multiline(&mut self, mut current: String) -> Result<String> {
@@ -416,16 +762,32 @@ impl CliShell {
 pub struct CliOutput {
     style: Style,
     target: OutputTarget,
+    footer: FooterController,
 }
 
 impl CliOutput {
+    fn write_with_footer_hidden(&self, text: impl AsRef<str>) {
+        self.footer.suspend_overlay();
+        self.target.write_raw(text);
+        self.footer.resume_overlay();
+    }
+
     pub fn stream_renderer(&self) -> StreamRenderer {
-        StreamRenderer::new(self.target.clone())
+        StreamRenderer::new(self.target.clone(), self.footer.clone())
+    }
+
+    pub fn show_idle_footer(&self) {
+        self.footer.set_idle();
+    }
+
+    pub fn set_queue_depth(&self, queued: usize) {
+        self.footer.set_queue_depth(queued);
     }
 
     pub fn print_queue_notice(&self, queued: usize, prompt: &str) {
+        self.footer.set_queue_depth(queued);
         let preview = truncate_middle(prompt.trim(), 64);
-        self.target.write_raw(format!(
+        self.write_with_footer_hidden(format!(
             "\n{}\n",
             self.style
                 .queue_pill(format!("queued #{queued} · {}", preview))
@@ -433,8 +795,9 @@ impl CliOutput {
     }
 
     pub fn print_dequeue_notice(&self, remaining: usize, prompt: &str) {
+        self.footer.set_queue_depth(remaining);
         let preview = truncate_middle(prompt.trim(), 64);
-        self.target.write_raw(format!(
+        self.write_with_footer_hidden(format!(
             "\n{}\n",
             self.style.queue_pill(format!(
                 "running queued turn · {}{}",
@@ -449,17 +812,24 @@ impl CliOutput {
     }
 
     pub fn print_exit_notice(&self) {
-        self.target.write_raw(format!(
+        self.footer.set_exit_pending(true);
+        self.write_with_footer_hidden(format!(
             "\n{}\n",
             self.style
                 .queue_pill("exit requested · finishing the current turn first")
         ));
     }
 
-    pub fn print_interrupt_notice(&self) {
-        self.target.write_raw(format!(
+    pub fn print_interrupt_notice(&self, queued: usize) {
+        self.footer.set_queue_depth(queued);
+        self.footer.set_interrupted();
+        self.write_with_footer_hidden(format!(
             "\n{}\n\n",
-            self.style.error("turn cancelled")
+            self.style.error(if queued == 0 {
+                "turn cancelled"
+            } else {
+                "turn cancelled · queued prompt preserved"
+            })
         ));
     }
 }
@@ -467,13 +837,14 @@ impl CliOutput {
 #[derive(Clone)]
 pub struct StreamRenderer {
     target: OutputTarget,
+    footer: FooterController,
     state: Arc<Mutex<StreamState>>,
 }
 
 #[derive(Default)]
 struct StreamState {
     started: bool,
-    waiting: bool,
+    indicator_running: bool,
     pending: String,
     code_language: Option<String>,
     trailing_newlines: usize,
@@ -488,51 +859,49 @@ impl Drop for StreamState {
 }
 
 impl StreamRenderer {
-    fn new(target: OutputTarget) -> Self {
+    fn write_with_footer_hidden(&self, text: impl AsRef<str>) {
+        self.footer.suspend_overlay();
+        self.target.write_raw(text);
+        self.footer.resume_overlay();
+    }
+
+    fn new(target: OutputTarget, footer: FooterController) -> Self {
         Self {
             target,
+            footer,
             state: Arc::new(Mutex::new(StreamState::default())),
         }
     }
 
     pub fn start_waiting(&self) {
         let mut state = self.state.lock().expect("cli stream state lock poisoned");
-        if state.started || state.waiting {
+        if state.started || state.indicator_running {
             return;
         }
+        self.footer.set_waiting();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = stop.clone();
-        let target = self.target.clone();
+        let footer = self.footer.clone();
         let handle = thread::spawn(move || {
-            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let mut idx = 0usize;
-            let ansi = target.style.ansi;
             while !stop_flag.load(Ordering::SeqCst) {
-                let frame = frames[idx % frames.len()];
-                if ansi {
-                    write_stderr_raw(&format!("\x1b[s \x1b[2m{frame}\x1b[22m \x1b[u"));
-                } else {
-                    write_stderr_raw(&format!("\x1b[s {frame} \x1b[u"));
-                }
-                idx += 1;
+                footer.tick();
                 thread::sleep(Duration::from_millis(90));
             }
         });
         state.spinner_stop = Some(stop);
         state.spinner_handle = Some(handle);
-        state.waiting = true;
+        state.indicator_running = true;
     }
 
     pub fn callback(&self) -> TextStreamCallback {
         let target = self.target.clone();
+        let footer = self.footer.clone();
         let state = self.state.clone();
         Arc::new(Mutex::new(Box::new(move |delta: String| {
             let mut state = state.lock().expect("cli stream state lock poisoned");
             if !state.started {
-                if state.waiting {
-                    stop_waiting_indicator(&mut state);
-                    state.waiting = false;
-                }
+                footer.set_working("streaming");
+                footer.suspend_overlay();
                 target.write_raw("\n".to_string());
                 state.started = true;
                 note_output(&mut state, "\n");
@@ -545,25 +914,22 @@ impl StreamRenderer {
                 target.uses_external_printer(),
             );
             if !rendered.is_empty() {
+                footer.suspend_overlay();
                 target.write_raw(&rendered);
                 note_output(&mut state, &rendered);
             }
         })))
     }
 
-    pub fn tool_hint(&self, hint: &str) {
+    pub fn tool_hint(&self, hint: &str, tool_name: Option<&str>, tool_args: Option<&Value>) {
         let mut state = self.state.lock().expect("cli stream state lock poisoned");
-        if state.waiting {
-            stop_waiting_indicator(&mut state);
-            state.waiting = false;
-            if !state.started {
-                self.target.write_raw("\n".to_string());
-                state.started = true;
-                note_output(&mut state, "\n");
-            }
+        self.footer.set_working(&truncate_middle(hint.trim(), 36));
+        if !state.started {
+            self.write_with_footer_hidden("\n");
+            state.started = true;
+            note_output(&mut state, "\n");
         }
-        let parts = parse_tool_hint(hint);
-        let pill = self.target.style.tool_hint_pill(&parts);
+        let rendered_hint = render_tool_hint(&self.target.style, hint, tool_name, tool_args);
         let mut prefix = String::new();
         if state.trailing_newlines == 0 {
             prefix.push('\n');
@@ -572,19 +938,24 @@ impl StreamRenderer {
                 prefix.push_str("\x1b[1A\x1b[2K");
             }
         }
-        let rendered = format!("{prefix}{pill}\n");
-        self.target.write_raw(&rendered);
-        state.trailing_newlines = 1;
+        let rendered = format!("{prefix}{rendered_hint}\n");
+        self.write_with_footer_hidden(&rendered);
+        state.trailing_newlines = rendered_hint
+            .chars()
+            .rev()
+            .take_while(|ch| *ch == '\n')
+            .count()
+            .max(1);
         drop(state);
-        self.start_waiting();
     }
 
     pub fn finish(&self, content: &str, summary: &TurnSummary<'_>) {
         let mut state = self.state.lock().expect("cli stream state lock poisoned");
-        if state.waiting {
+        if state.indicator_running {
             stop_waiting_indicator(&mut state);
-            state.waiting = false;
+            state.indicator_running = false;
         }
+        self.footer.suspend_overlay();
         if state.started {
             let tail = render_stream_delta(
                 &self.target.style,
@@ -609,25 +980,17 @@ impl StreamRenderer {
             self.target.write_raw(&rendered);
             note_output(&mut state, &rendered);
         }
-        let footer = format!(
-            "{}\n",
-            self.target.style.dim(format!(
-                "╰ {} · {} in · {} out · {:.1}s",
-                summary.model,
-                summary.prompt_tokens,
-                summary.completion_tokens,
-                summary.elapsed.as_secs_f64()
-            ))
-        );
-        self.target.write_raw(&footer);
+        self.footer.complete(summary);
+        self.footer.render_current();
     }
 
     pub fn finish_empty(&self, note: &str, summary: &TurnSummary<'_>) {
         let mut state = self.state.lock().expect("cli stream state lock poisoned");
-        if state.waiting {
+        if state.indicator_running {
             stop_waiting_indicator(&mut state);
-            state.waiting = false;
+            state.indicator_running = false;
         }
+        self.footer.suspend_overlay();
         let tail = render_stream_delta(
             &self.target.style,
             &mut state,
@@ -644,26 +1007,17 @@ impl StreamRenderer {
             self.target.write_raw(&rendered);
             note_output(&mut state, &rendered);
         }
-        let footer = format!(
-            "{}\n",
-            self.target.style.dim(format!(
-                "╰ {} · {} in · {} out · {:.1}s",
-                summary.model,
-                summary.prompt_tokens,
-                summary.completion_tokens,
-                summary.elapsed.as_secs_f64()
-            ))
-        );
-        self.target.write_raw(&footer);
-        note_output(&mut state, &footer);
+        self.footer.complete(summary);
+        self.footer.render_current();
     }
 
     pub fn finish_error(&self, err: &str) {
         let mut state = self.state.lock().expect("cli stream state lock poisoned");
-        if state.waiting {
+        if state.indicator_running {
             stop_waiting_indicator(&mut state);
-            state.waiting = false;
+            state.indicator_running = false;
         }
+        self.footer.suspend_overlay();
         let tail = render_stream_delta(
             &self.target.style,
             &mut state,
@@ -678,6 +1032,8 @@ impl StreamRenderer {
         let rendered = format!("\n{} {}\n", self.target.style.error("error:"), err);
         self.target.write_raw(&rendered);
         note_output(&mut state, &rendered);
+        self.footer.set_error(&truncate_middle(err, 40));
+        self.footer.render_current();
     }
 }
 
@@ -687,7 +1043,6 @@ fn stop_waiting_indicator(state: &mut StreamState) {
     }
     if let Some(handle) = state.spinner_handle.take() {
         let _ = handle.join();
-        write_stderr_raw("\x1b[s   \x1b[u");
     }
 }
 
@@ -696,12 +1051,14 @@ enum LocalCommand {
     Help,
     Clear,
     Exit,
+    Stop,
 }
 
 fn parse_local_command(input: &str) -> Option<LocalCommand> {
     match input.trim() {
         "/help" => Some(LocalCommand::Help),
         "/clear" => Some(LocalCommand::Clear),
+        "/stop" => Some(LocalCommand::Stop),
         "/exit" | "/quit" | "exit" | "quit" => Some(LocalCommand::Exit),
         _ => None,
     }
@@ -726,6 +1083,310 @@ fn parse_tool_hint(hint: &str) -> ToolHintParts<'_> {
         tool_name,
         detail,
     }
+}
+
+fn render_tool_hint(
+    style: &Style,
+    hint: &str,
+    tool_name: Option<&str>,
+    tool_args: Option<&Value>,
+) -> String {
+    if tool_name == Some("edit_file") {
+        if let Some(rendered) = render_edit_file_hint(style, hint, tool_args) {
+            return rendered;
+        }
+    }
+    let parts = parse_tool_hint(hint);
+    style.tool_hint_pill(&parts)
+}
+
+fn render_edit_file_hint(style: &Style, hint: &str, tool_args: Option<&Value>) -> Option<String> {
+    let args = tool_args?.as_object()?;
+    let path = args.get("path")?.as_str()?;
+    let old_text = args
+        .get("old_text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    let new_text = args
+        .get("new_text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    let replace_all = args
+        .get("replace_all")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let width = 100usize;
+    let diff = build_edit_diff(&old_text, &new_text);
+    let old_lines = count_lines(&old_text);
+    let new_lines = count_lines(&new_text);
+    let line_delta = new_lines as isize - old_lines as isize;
+    let char_delta = new_text.chars().count() as isize - old_text.chars().count() as isize;
+    let mut lines = Vec::new();
+    lines.push(style.panel_header(
+        format!(
+            " ✍ edit_file  {}",
+            truncate_middle(path, width.saturating_sub(14))
+        ),
+        width,
+    ));
+    lines.push(style.panel_meta(
+        format!(
+            " summary: {}",
+            truncate_middle(hint, width.saturating_sub(11))
+        ),
+        width,
+    ));
+    lines.push(style.panel_meta(
+        format!(
+            " revision: replace_all={} · old {}L/{}B · new {}L/{}B · {:+}L · {:+}B · {} add · {} del",
+            replace_all,
+            old_lines,
+            old_text.len(),
+            new_lines,
+            new_text.len(),
+            line_delta,
+            char_delta,
+            diff.added,
+            diff.removed,
+        ),
+        width,
+    ));
+    lines.push(style.panel_meta("   old   new | diff preview", width));
+    lines.extend(render_diff_lines(style, &diff.lines, width));
+    lines.push(style.panel_meta(
+        format!(
+            " blocks: {} · visible lines: {}{}",
+            diff.changed_blocks,
+            diff.lines.len(),
+            if diff.truncated { " · truncated" } else { "" }
+        ),
+        width,
+    ));
+    Some(lines.join("\n"))
+}
+
+fn render_diff_lines(style: &Style, lines: &[RenderedDiffLine], width: usize) -> Vec<String> {
+    lines
+        .iter()
+        .map(|line| {
+            let old = line
+                .old_lineno
+                .map(|value| format!("{value:>5}"))
+                .unwrap_or_else(|| "     ".to_string());
+            let new = line
+                .new_lineno
+                .map(|value| format!("{value:>5}"))
+                .unwrap_or_else(|| "     ".to_string());
+            let prefix = format!(" {old} {new} | {} ", line.marker);
+            let text_width = width.saturating_sub(char_width(&prefix));
+            let content = truncate_end(&line.text, text_width);
+            let formatted = format!("{prefix}{content}");
+            match line.kind {
+                DiffKind::Context => style.panel_context(formatted, width),
+                DiffKind::Added => style.panel_added(formatted, width),
+                DiffKind::Removed => style.panel_removed(formatted, width),
+                DiffKind::Omitted => style.panel_meta(formatted, width),
+            }
+        })
+        .collect()
+}
+
+struct EditDiff {
+    lines: Vec<RenderedDiffLine>,
+    added: usize,
+    removed: usize,
+    changed_blocks: usize,
+    truncated: bool,
+}
+
+#[derive(Clone)]
+struct RenderedDiffLine {
+    kind: DiffKind,
+    old_lineno: Option<usize>,
+    new_lineno: Option<usize>,
+    marker: char,
+    text: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiffKind {
+    Context,
+    Added,
+    Removed,
+    Omitted,
+}
+
+fn build_edit_diff(old_text: &str, new_text: &str) -> EditDiff {
+    let old_lines = split_lines_for_diff(old_text);
+    let new_lines = split_lines_for_diff(new_text);
+    let ops = diff_ops(&old_lines, &new_lines);
+    let (rendered, changed_blocks) = compress_diff_ops(ops, 2, 64);
+    EditDiff {
+        added: rendered
+            .iter()
+            .filter(|line| line.kind == DiffKind::Added)
+            .count(),
+        removed: rendered
+            .iter()
+            .filter(|line| line.kind == DiffKind::Removed)
+            .count(),
+        truncated: rendered.iter().any(|line| line.kind == DiffKind::Omitted),
+        lines: rendered,
+        changed_blocks,
+    }
+}
+
+fn split_lines_for_diff(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        text.lines().map(|line| line.to_string()).collect()
+    }
+}
+
+fn diff_ops(old_lines: &[String], new_lines: &[String]) -> Vec<RenderedDiffLine> {
+    let n = old_lines.len();
+    let m = new_lines.len();
+    if n.saturating_mul(m) > 40_000 {
+        let mut out = Vec::new();
+        for (idx, line) in old_lines.iter().enumerate() {
+            out.push(RenderedDiffLine {
+                kind: DiffKind::Removed,
+                old_lineno: Some(idx + 1),
+                new_lineno: None,
+                marker: '-',
+                text: line.clone(),
+            });
+        }
+        for (idx, line) in new_lines.iter().enumerate() {
+            out.push(RenderedDiffLine {
+                kind: DiffKind::Added,
+                old_lineno: None,
+                new_lineno: Some(idx + 1),
+                marker: '+',
+                text: line.clone(),
+            });
+        }
+        return out;
+    }
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if old_lines[i] == new_lines[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let mut out = Vec::new();
+    while i < n || j < m {
+        if i < n && j < m && old_lines[i] == new_lines[j] {
+            out.push(RenderedDiffLine {
+                kind: DiffKind::Context,
+                old_lineno: Some(i + 1),
+                new_lineno: Some(j + 1),
+                marker: ' ',
+                text: old_lines[i].clone(),
+            });
+            i += 1;
+            j += 1;
+        } else if j < m && (i == n || dp[i][j + 1] >= dp[i + 1][j]) {
+            out.push(RenderedDiffLine {
+                kind: DiffKind::Added,
+                old_lineno: None,
+                new_lineno: Some(j + 1),
+                marker: '+',
+                text: new_lines[j].clone(),
+            });
+            j += 1;
+        } else if i < n {
+            out.push(RenderedDiffLine {
+                kind: DiffKind::Removed,
+                old_lineno: Some(i + 1),
+                new_lineno: None,
+                marker: '-',
+                text: old_lines[i].clone(),
+            });
+            i += 1;
+        }
+    }
+    out
+}
+
+fn compress_diff_ops(
+    ops: Vec<RenderedDiffLine>,
+    context: usize,
+    max_lines: usize,
+) -> (Vec<RenderedDiffLine>, usize) {
+    let changed = ops
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| (line.kind != DiffKind::Context).then_some(idx))
+        .collect::<Vec<_>>();
+    if changed.is_empty() {
+        return (
+            vec![RenderedDiffLine {
+                kind: DiffKind::Context,
+                old_lineno: None,
+                new_lineno: None,
+                marker: ' ',
+                text: "(no textual changes)".to_string(),
+            }],
+            0,
+        );
+    }
+
+    let mut ranges = Vec::new();
+    let mut start = changed[0].saturating_sub(context);
+    let mut end = (changed[0] + context + 1).min(ops.len());
+    for &idx in changed.iter().skip(1) {
+        let next_start = idx.saturating_sub(context);
+        let next_end = (idx + context + 1).min(ops.len());
+        if next_start <= end {
+            end = end.max(next_end);
+        } else {
+            ranges.push((start, end));
+            start = next_start;
+            end = next_end;
+        }
+    }
+    ranges.push((start, end));
+
+    let changed_blocks = ranges.len();
+    let mut out = Vec::new();
+    let mut previous_end = 0usize;
+    for (range_index, (start, end)) in ranges.into_iter().enumerate() {
+        if range_index > 0 {
+            let skipped = start.saturating_sub(previous_end);
+            out.push(RenderedDiffLine {
+                kind: DiffKind::Omitted,
+                old_lineno: None,
+                new_lineno: None,
+                marker: '…',
+                text: format!("{} unchanged lines hidden", skipped.max(1)),
+            });
+        }
+        out.extend(ops[start..end].iter().cloned());
+        previous_end = end;
+        if out.len() >= max_lines {
+            out.truncate(max_lines.saturating_sub(1));
+            out.push(RenderedDiffLine {
+                kind: DiffKind::Omitted,
+                old_lineno: None,
+                new_lineno: None,
+                marker: '…',
+                text: "diff truncated for terminal preview".to_string(),
+            });
+            break;
+        }
+    }
+    (out, changed_blocks)
 }
 
 struct ToolHintParts<'a> {
@@ -832,7 +1493,12 @@ fn note_output(state: &mut StreamState, text: &str) {
     if text.is_empty() {
         return;
     }
-    let trailing = text.chars().rev().filter(|ch| *ch != '\r').take_while(|ch| *ch == '\n').count();
+    let trailing = text
+        .chars()
+        .rev()
+        .filter(|ch| *ch != '\r')
+        .take_while(|ch| *ch == '\n')
+        .count();
     if trailing > 0 {
         if text.chars().all(|ch| ch == '\n' || ch == '\r') {
             state.trailing_newlines += trailing;
@@ -863,82 +1529,263 @@ fn render_stream_line(style: &Style, state: &mut StreamState, line: &str) -> Str
             highlighted
         }
     } else {
-        let highlighted = highlight_markdown_line(style, normalized);
+        let rendered = render_markdown_line(style, normalized);
         if has_newline {
-            format!("{highlighted}\n")
+            format!("{rendered}\n")
         } else {
-            highlighted
+            rendered
         }
     }
 }
 
-fn highlight_markdown_line(style: &Style, line: &str) -> String {
-    if !style.ansi || line.is_empty() {
+fn render_markdown_line(style: &Style, line: &str) -> String {
+    if line.is_empty() {
         return line.to_string();
     }
-    
-    if line.starts_with('#') {
-        return style.accent(line);
-    }
-    
-    if line.starts_with('>') {
-        return style.dim(line);
+
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let trimmed = line.trim_start();
+
+    if let Some(content) = parse_heading(trimmed) {
+        return format!(
+            "{indent}{}",
+            style.accent(render_inline_markdown(style, content))
+        );
     }
 
-    let mut out = String::with_capacity(line.len() + 32);
-    let chars: Vec<char> = line.chars().collect();
-    let mut i = 0;
-    
-    let mut in_bold = false;
-    let mut in_italic = false;
-    let mut in_code = false;
-    
-    while i < chars.len() {
-        if chars[i] == '\\' && i + 1 < chars.len() {
-            out.push(chars[i]);
-            out.push(chars[i+1]);
-            i += 2;
-            continue;
-        }
-        if i + 1 < chars.len() && chars[i] == '*' && chars[i+1] == '*' && !in_code {
-            in_bold = !in_bold;
-            if in_bold {
-                out.push_str("\x1b[1m");
-            } else {
-                out.push_str("\x1b[0m");
-            }
-            i += 2;
-            continue;
-        }
-        if chars[i] == '*' && !in_code && !in_bold {
-            in_italic = !in_italic;
-            if in_italic {
-                out.push_str("\x1b[3m");
-            } else {
-                out.push_str("\x1b[0m");
-            }
-            i += 1;
-            continue;
-        }
-        if chars[i] == '`' {
-            in_code = !in_code;
-            if in_code {
-                out.push_str("\x1b[38;5;141m");
-            } else {
-                out.push_str("\x1b[0m");
-            }
-            i += 1;
-            continue;
-        }
-        out.push(chars[i]);
-        i += 1;
+    if is_horizontal_rule(trimmed) {
+        return format!("{indent}{}", style.dim("────────────────────────────────"));
     }
-    
-    if in_bold || in_italic || in_code {
-        out.push_str("\x1b[0m");
+
+    if let Some((depth, content)) = parse_blockquote(trimmed) {
+        let prefix = style.dim("│ ".repeat(depth.max(1)));
+        return format!(
+            "{indent}{prefix}{}",
+            style.dim(render_inline_markdown(style, content))
+        );
+    }
+
+    if let Some((checked, content)) = parse_task_item(trimmed) {
+        let marker = if checked { "[x]" } else { "[ ]" };
+        return format!(
+            "{indent}{} {}",
+            style.accent(marker),
+            render_inline_markdown(style, content)
+        );
+    }
+
+    if let Some((number, content)) = parse_ordered_item(trimmed) {
+        return format!(
+            "{indent}{} {}",
+            style.accent(format!("{number}.")),
+            render_inline_markdown(style, content)
+        );
+    }
+
+    if let Some(content) = parse_unordered_item(trimmed) {
+        return format!(
+            "{indent}{} {}",
+            style.accent("•"),
+            render_inline_markdown(style, content)
+        );
+    }
+
+    if trimmed.starts_with('|') && trimmed.ends_with('|') {
+        let cells = trimmed
+            .trim_matches('|')
+            .split('|')
+            .map(|cell| render_inline_markdown(style, cell.trim()))
+            .collect::<Vec<_>>()
+            .join(&style.dim(" │ "));
+        return format!("{indent}{cells}");
+    }
+
+    render_inline_markdown(style, line)
+}
+
+fn render_inline_markdown(style: &Style, text: &str) -> String {
+    let mut out = String::new();
+    let mut index = 0usize;
+    while index < text.len() {
+        let remaining = &text[index..];
+        if let Some(rest) = remaining.strip_prefix('\\') {
+            if let Some(ch) = rest.chars().next() {
+                out.push(ch);
+                index += 1 + ch.len_utf8();
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if let Some((consumed, rendered)) = parse_link(style, remaining) {
+            out.push_str(&rendered);
+            index += consumed;
+            continue;
+        }
+        if let Some((consumed, rendered)) =
+            parse_delimited_span(style, remaining, "`", |s, inner| s.inline_code(inner))
+        {
+            out.push_str(&rendered);
+            index += consumed;
+            continue;
+        }
+        if let Some((consumed, rendered)) =
+            parse_delimited_span(style, remaining, "**", |s, inner| s.bold(inner))
+        {
+            out.push_str(&rendered);
+            index += consumed;
+            continue;
+        }
+        if let Some((consumed, rendered)) =
+            parse_delimited_span(style, remaining, "__", |s, inner| s.bold(inner))
+        {
+            out.push_str(&rendered);
+            index += consumed;
+            continue;
+        }
+        if let Some((consumed, rendered)) =
+            parse_delimited_span(style, remaining, "~~", |s, inner| s.strike(inner))
+        {
+            out.push_str(&rendered);
+            index += consumed;
+            continue;
+        }
+        if let Some((consumed, rendered)) =
+            parse_delimited_span(style, remaining, "*", |s, inner| s.italic(inner))
+        {
+            out.push_str(&rendered);
+            index += consumed;
+            continue;
+        }
+        if let Some((consumed, rendered)) =
+            parse_delimited_span(style, remaining, "_", |s, inner| s.italic(inner))
+        {
+            out.push_str(&rendered);
+            index += consumed;
+            continue;
+        }
+
+        let ch = remaining.chars().next().expect("non-empty remaining");
+        out.push(ch);
+        index += ch.len_utf8();
     }
     out
+}
 
+fn parse_heading(line: &str) -> Option<&str> {
+    let level = line.chars().take_while(|ch| *ch == '#').count();
+    (1..=6)
+        .contains(&level)
+        .then_some(&line[level..])
+        .and_then(|rest| rest.strip_prefix(' '))
+}
+
+fn is_horizontal_rule(line: &str) -> bool {
+    let stripped = line.replace([' ', '\t'], "");
+    stripped.len() >= 3
+        && (stripped.chars().all(|ch| ch == '-')
+            || stripped.chars().all(|ch| ch == '*')
+            || stripped.chars().all(|ch| ch == '_'))
+}
+
+fn parse_blockquote(line: &str) -> Option<(usize, &str)> {
+    let mut rest = line;
+    let mut depth = 0usize;
+    while let Some(stripped) = rest.strip_prefix('>') {
+        depth += 1;
+        rest = stripped.strip_prefix(' ').unwrap_or(stripped);
+    }
+    (depth > 0).then_some((depth, rest.trim_start()))
+}
+
+fn parse_task_item(line: &str) -> Option<(bool, &str)> {
+    let rest = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))?;
+    if let Some(content) = rest.strip_prefix("[ ] ") {
+        return Some((false, content));
+    }
+    if let Some(content) = rest
+        .strip_prefix("[x] ")
+        .or_else(|| rest.strip_prefix("[X] "))
+    {
+        return Some((true, content));
+    }
+    None
+}
+
+fn parse_ordered_item(line: &str) -> Option<(usize, &str)> {
+    let digits = line.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digits == 0 || !line[digits..].starts_with(". ") {
+        return None;
+    }
+    let number = line[..digits].parse().ok()?;
+    Some((number, &line[digits + 2..]))
+}
+
+fn parse_unordered_item(line: &str) -> Option<&str> {
+    line.strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))
+}
+
+fn parse_link(style: &Style, text: &str) -> Option<(usize, String)> {
+    let closing_label = text.find("](")?;
+    let label = text.strip_prefix('[')?;
+    let label = &label[..closing_label - 1];
+    let url_start = closing_label + 2;
+    let closing_url = text[url_start..].find(')')?;
+    let url = &text[url_start..url_start + closing_url];
+    let consumed = url_start + closing_url + 1;
+    Some((
+        consumed,
+        format!(
+            "{}{}",
+            style.link(label),
+            style.subtle(format!(" ({})", truncate_middle(url, 48)))
+        ),
+    ))
+}
+
+fn parse_delimited_span<F>(
+    style: &Style,
+    text: &str,
+    delimiter: &str,
+    render: F,
+) -> Option<(usize, String)>
+where
+    F: Fn(&Style, &str) -> String,
+{
+    let inner = text.strip_prefix(delimiter)?;
+    let end = find_closing_delimiter(inner, delimiter)?;
+    let content = &inner[..end];
+    Some((delimiter.len() * 2 + end, render(style, content)))
+}
+
+fn find_closing_delimiter(text: &str, delimiter: &str) -> Option<usize> {
+    let mut escaped = false;
+    let mut index = 0usize;
+    while index < text.len() {
+        let remaining = &text[index..];
+        let ch = remaining.chars().next()?;
+        if escaped {
+            escaped = false;
+            index += ch.len_utf8();
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if remaining.starts_with(delimiter) {
+            return Some(index);
+        }
+        index += ch.len_utf8();
+    }
+    None
 }
 
 fn fence_language(line: &str) -> Option<&str> {
@@ -1138,6 +1985,42 @@ fn is_number_start(chars: &[char], index: usize) -> bool {
     true
 }
 
+fn count_lines(text: &str) -> usize {
+    if text.is_empty() {
+        0
+    } else {
+        text.lines().count()
+    }
+}
+
+fn char_width(text: &str) -> usize {
+    text.chars().count()
+}
+
+fn pad_to_width(text: &str, width: usize) -> String {
+    let len = char_width(text);
+    if len >= width {
+        return truncate_end(text, width);
+    }
+    let mut out = String::with_capacity(text.len() + width.saturating_sub(len));
+    out.push_str(text);
+    out.push_str(&" ".repeat(width - len));
+    out
+}
+
+fn truncate_end(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let mut out = text.chars().take(max_chars - 1).collect::<String>();
+    out.push('…');
+    out
+}
+
 fn truncate_middle(text: &str, max_chars: usize) -> String {
     let chars = text.chars().count();
     if chars <= max_chars {
@@ -1160,14 +2043,17 @@ fn truncate_middle(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        LocalCommand, StreamState, fence_language, highlight_code_line, line_requests_continuation,
-        parse_local_command, parse_tool_hint, sentence_flush_index, truncate_middle,
+        LocalCommand, fence_language, highlight_code_line, line_requests_continuation,
+        parse_local_command, parse_tool_hint, render_markdown_line, render_tool_hint,
+        sentence_flush_index, truncate_middle,
     };
+    use serde_json::json;
 
     #[test]
     fn parses_local_commands() {
         assert_eq!(parse_local_command("/help"), Some(LocalCommand::Help));
         assert_eq!(parse_local_command("/clear"), Some(LocalCommand::Clear));
+        assert_eq!(parse_local_command("/stop"), Some(LocalCommand::Stop));
         assert_eq!(parse_local_command("quit"), Some(LocalCommand::Exit));
         assert_eq!(parse_local_command("/status"), None);
     }
@@ -1215,4 +2101,33 @@ mod tests {
         assert_eq!(sentence_flush_index("path=src/main.rs"), None);
     }
 
+    #[test]
+    fn renders_markdown_blocks_without_markup_noise() {
+        let style = super::Style { ansi: false };
+        assert_eq!(render_markdown_line(&style, "# Heading"), "Heading");
+        assert_eq!(render_markdown_line(&style, "- item"), "• item");
+        assert_eq!(render_markdown_line(&style, "> note"), "│ note");
+        assert_eq!(render_markdown_line(&style, "`code`"), "code");
+    }
+
+    #[test]
+    fn renders_edit_file_hint_as_diff_panel() {
+        let style = super::Style { ansi: false };
+        let args = json!({
+            "path": "/root/rbot/src/cli/mod.rs",
+            "old_text": "a\nb\nc\n",
+            "new_text": "a\nbeta\nc\nd\n",
+            "replace_all": false
+        });
+        let rendered = render_tool_hint(
+            &style,
+            "edit_file · path=/root/rbot/src/cli/mod.rs · old_text=a... · new_text=beta...",
+            Some("edit_file"),
+            Some(&args),
+        );
+        assert!(rendered.contains("edit_file"));
+        assert!(rendered.contains("revision:"));
+        assert!(rendered.contains("beta"));
+        assert!(rendered.contains("old   new | diff preview"));
+    }
 }
