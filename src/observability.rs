@@ -380,6 +380,7 @@ pub struct ProviderModelSnapshot {
     pub model_id: String,
     pub model_path: Option<String>,
     pub model_size_bytes: Option<u64>,
+    pub context_window_tokens: Option<usize>,
     pub available_models: Vec<String>,
     pub raw_details: BTreeMap<String, String>,
 }
@@ -446,6 +447,8 @@ async fn collect_ollama_snapshot(
                         .get("size")
                         .and_then(Value::as_u64)
                         .or(snapshot.model_size_bytes);
+                    snapshot.context_window_tokens =
+                        extract_context_window_tokens(found).or(snapshot.context_window_tokens);
                     if let Some(details) = found.get("details").and_then(Value::as_object) {
                         for (key, value) in details {
                             snapshot
@@ -465,6 +468,8 @@ async fn collect_ollama_snapshot(
         .await
     {
         if let Ok(payload) = response.json::<Value>().await {
+            snapshot.context_window_tokens =
+                extract_context_window_tokens(&payload).or(snapshot.context_window_tokens);
             snapshot.model_path = payload
                 .get("modelfile")
                 .and_then(Value::as_str)
@@ -513,6 +518,8 @@ async fn collect_openai_compatible_snapshot(
                         .and_then(Value::as_str)
                         .unwrap_or(snapshot.model_name.as_str())
                         .to_string();
+                    snapshot.context_window_tokens =
+                        extract_context_window_tokens(found).or(snapshot.context_window_tokens);
                     if let Some(root) = found.as_object() {
                         for (key, value) in root {
                             if key == "id" || key == "object" {
@@ -526,6 +533,50 @@ async fn collect_openai_compatible_snapshot(
                 }
             }
         }
+    }
+}
+
+fn extract_context_window_tokens(value: &Value) -> Option<usize> {
+    const KEYS: &[&str] = &[
+        "context_length",
+        "max_context_length",
+        "max_model_len",
+        "max_sequence_length",
+        "max_seq_len",
+        "context_window",
+        "num_ctx",
+        "n_ctx",
+    ];
+    match value {
+        Value::Object(map) => {
+            for key in KEYS {
+                if let Some(parsed) = map.get(*key).and_then(parse_context_value) {
+                    return Some(parsed);
+                }
+            }
+            for child in map.values() {
+                if let Some(parsed) = extract_context_window_tokens(child) {
+                    return Some(parsed);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items.iter().find_map(extract_context_window_tokens),
+        _ => None,
+    }
+}
+
+fn parse_context_value(value: &Value) -> Option<usize> {
+    match value {
+        Value::Number(number) => number.as_u64().map(|value| value as usize),
+        Value::String(text) => {
+            let digits = text
+                .chars()
+                .filter(|ch| ch.is_ascii_digit())
+                .collect::<String>();
+            digits.parse::<usize>().ok().filter(|value| *value > 0)
+        }
+        _ => None,
     }
 }
 

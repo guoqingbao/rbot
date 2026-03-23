@@ -3,6 +3,7 @@ mod cli;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use std::{
     collections::hash_map::DefaultHasher,
@@ -138,7 +139,7 @@ async fn chat(
         )
         .await?
     {
-        let summary = turn_summary(&built.agent, &built.model, started.elapsed())?;
+        let summary = turn_summary(&built.agent, started.elapsed())?;
         stream.finish(&response.content, &summary);
     }
     Ok(())
@@ -162,6 +163,8 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
     output.show_idle_footer();
     let (tx, mut rx) = unbounded_channel::<ReplEvent>();
     let input_tx = tx.clone();
+    let busy_flag = Arc::new(AtomicBool::new(false));
+    let input_busy_flag = Arc::clone(&busy_flag);
     std::thread::spawn(move || {
         let mut shell = shell;
         loop {
@@ -179,10 +182,15 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                     break;
                 }
                 Ok(InputEvent::Interrupt) => {
-                    if input_tx
-                        .send(ReplEvent::Input(InputEvent::Interrupt))
-                        .is_err()
-                    {
+                    if input_busy_flag.load(Ordering::SeqCst) {
+                        if input_tx
+                            .send(ReplEvent::Input(InputEvent::Interrupt))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    } else {
+                        let _ = input_tx.send(ReplEvent::Input(InputEvent::Exit));
                         break;
                     }
                 }
@@ -214,7 +222,6 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                     output.set_queue_depth(0);
                     active_task = Some(spawn_repl_turn(
                         agent.clone(),
-                        model.clone(),
                         session_key.clone(),
                         chat_id.clone(),
                         prompt,
@@ -222,6 +229,7 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                         tx.clone(),
                     ));
                     busy = true;
+                    busy_flag.store(true, Ordering::SeqCst);
                 }
             }
             ReplEvent::Input(InputEvent::Interrupt) => {
@@ -231,6 +239,7 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                         agent.set_progress_sender(None);
                         output.print_interrupt_notice(pending.len());
                         busy = false;
+                        busy_flag.store(false, Ordering::SeqCst);
                         if exit_requested {
                             break;
                         }
@@ -238,7 +247,6 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                             output.print_dequeue_notice(pending.len(), &next);
                             active_task = Some(spawn_repl_turn(
                                 agent.clone(),
-                                model.clone(),
                                 session_key.clone(),
                                 chat_id.clone(),
                                 next,
@@ -246,10 +254,13 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                                 tx.clone(),
                             ));
                             busy = true;
+                            busy_flag.store(true, Ordering::SeqCst);
                         } else {
                             output.show_idle_footer();
                         }
                     }
+                } else {
+                    break;
                 }
             }
             ReplEvent::Input(InputEvent::Stop) => {
@@ -259,6 +270,7 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                         agent.set_progress_sender(None);
                         output.print_interrupt_notice(pending.len());
                         busy = false;
+                        busy_flag.store(false, Ordering::SeqCst);
                         if exit_requested {
                             break;
                         }
@@ -266,7 +278,6 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                             output.print_dequeue_notice(pending.len(), &next);
                             active_task = Some(spawn_repl_turn(
                                 agent.clone(),
-                                model.clone(),
                                 session_key.clone(),
                                 chat_id.clone(),
                                 next,
@@ -274,6 +285,7 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                                 tx.clone(),
                             ));
                             busy = true;
+                            busy_flag.store(true, Ordering::SeqCst);
                         } else {
                             output.show_idle_footer();
                         }
@@ -293,6 +305,7 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
             }
             ReplEvent::TurnFinished => {
                 busy = false;
+                busy_flag.store(false, Ordering::SeqCst);
                 if exit_requested {
                     break;
                 }
@@ -300,7 +313,6 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                     output.print_dequeue_notice(pending.len(), &next);
                     active_task = Some(spawn_repl_turn(
                         agent.clone(),
-                        model.clone(),
                         session_key.clone(),
                         chat_id.clone(),
                         next,
@@ -308,6 +320,7 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                         tx.clone(),
                     ));
                     busy = true;
+                    busy_flag.store(true, Ordering::SeqCst);
                 } else {
                     output.show_idle_footer();
                 }
@@ -319,7 +332,6 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
 
 fn spawn_repl_turn(
     agent: Arc<AgentLoop>,
-    model: String,
     session_key: String,
     chat_id: String,
     prompt: String,
@@ -341,11 +353,11 @@ fn spawn_repl_turn(
             )
             .await
         {
-            Ok(Some(response)) => match turn_summary(&agent, &model, started.elapsed()) {
+            Ok(Some(response)) => match turn_summary(&agent, started.elapsed()) {
                 Ok(summary) => stream.finish(&response.content, &summary),
                 Err(err) => stream.finish_error(&err.to_string()),
             },
-            Ok(None) => match turn_summary(&agent, &model, started.elapsed()) {
+            Ok(None) => match turn_summary(&agent, started.elapsed()) {
                 Ok(summary) => stream.finish_empty("no direct reply", &summary),
                 Err(err) => stream.finish_error(&err.to_string()),
             },
@@ -676,14 +688,9 @@ async fn build_agent_for_workspace(
     .await
 }
 
-fn turn_summary<'a>(
-    agent: &'a AgentLoop,
-    model: &'a str,
-    elapsed: std::time::Duration,
-) -> Result<TurnSummary<'a>> {
+fn turn_summary(agent: &AgentLoop, elapsed: std::time::Duration) -> Result<TurnSummary> {
     let snapshot = agent.snapshot()?;
     Ok(TurnSummary {
-        model,
         prompt_tokens: snapshot.last_prompt_tokens,
         completion_tokens: snapshot.last_completion_tokens,
         elapsed,
