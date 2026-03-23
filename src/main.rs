@@ -170,6 +170,7 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
         loop {
             match shell.read_event() {
                 Ok(InputEvent::Prompt(prompt)) => {
+                    shell.hide_footer();
                     if input_tx
                         .send(ReplEvent::Input(InputEvent::Prompt(prompt)))
                         .is_err()
@@ -178,6 +179,7 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                     }
                 }
                 Ok(InputEvent::Exit) => {
+                    shell.hide_footer();
                     let _ = input_tx.send(ReplEvent::Input(InputEvent::Exit));
                     break;
                 }
@@ -190,6 +192,7 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                             break;
                         }
                     } else {
+                        shell.hide_footer();
                         let _ = input_tx.send(ReplEvent::Input(InputEvent::Exit));
                         break;
                     }

@@ -1,7 +1,9 @@
 use std::borrow::Cow;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -279,6 +281,7 @@ struct FooterController {
 struct FooterState {
     target: Option<OutputTarget>,
     display: FooterDisplay,
+    hidden: bool,
     overlay_suspended: bool,
     mode: FooterMode,
     queue_depth: usize,
@@ -286,6 +289,7 @@ struct FooterState {
     last_completion_tokens: usize,
     last_elapsed: Option<Duration>,
     active_since: Option<Instant>,
+    spinner_frame: usize,
     exit_pending: bool,
     detail: Option<String>,
 }
@@ -314,6 +318,7 @@ impl FooterController {
             state: Arc::new(Mutex::new(FooterState {
                 target: None,
                 display: FooterDisplay::None,
+                hidden: false,
                 overlay_suspended: false,
                 mode: FooterMode::Idle,
                 queue_depth: 0,
@@ -321,6 +326,7 @@ impl FooterController {
                 last_completion_tokens: 0,
                 last_elapsed: None,
                 active_since: None,
+                spinner_frame: 0,
                 exit_pending: false,
                 detail: None,
             })),
@@ -339,11 +345,13 @@ impl FooterController {
             clear_overlay_footer();
         }
         state.display = FooterDisplay::None;
+        state.hidden = false;
         state.overlay_suspended = false;
     }
 
     fn set_idle(&self) {
         let mut state = self.state.lock().expect("footer state lock poisoned");
+        state.hidden = false;
         state.mode = FooterMode::Idle;
         state.overlay_suspended = false;
         state.active_since = None;
@@ -352,9 +360,11 @@ impl FooterController {
 
     fn set_waiting(&self) {
         let mut state = self.state.lock().expect("footer state lock poisoned");
+        state.hidden = false;
         state.mode = FooterMode::Waiting;
         state.overlay_suspended = false;
         state.active_since = Some(Instant::now());
+        state.spinner_frame = 0;
         state.detail = Some("awaiting model".to_string());
         state.exit_pending = false;
     }
@@ -370,6 +380,7 @@ impl FooterController {
 
     fn complete(&self, summary: &TurnSummary) {
         let mut state = self.state.lock().expect("footer state lock poisoned");
+        state.hidden = false;
         state.mode = FooterMode::Idle;
         state.overlay_suspended = false;
         state.active_since = None;
@@ -382,6 +393,7 @@ impl FooterController {
 
     fn set_interrupted(&self) {
         let mut state = self.state.lock().expect("footer state lock poisoned");
+        state.hidden = false;
         state.mode = FooterMode::Interrupted;
         state.overlay_suspended = false;
         state.active_since = None;
@@ -392,6 +404,7 @@ impl FooterController {
 
     fn set_error(&self, detail: &str) {
         let mut state = self.state.lock().expect("footer state lock poisoned");
+        state.hidden = false;
         state.mode = FooterMode::Error;
         state.overlay_suspended = false;
         state.active_since = None;
@@ -410,9 +423,27 @@ impl FooterController {
         state.exit_pending = exit_pending;
     }
 
+    fn tick(&self) {
+        let mut state = self.state.lock().expect("footer state lock poisoned");
+        if matches!(state.mode, FooterMode::Waiting) && !state.hidden {
+            state.spinner_frame = state.spinner_frame.wrapping_add(1);
+            render_footer_locked(&self.style, &mut state);
+        }
+    }
+
     fn render_current(&self) {
         let mut state = self.state.lock().expect("footer state lock poisoned");
         render_footer_locked(&self.style, &mut state);
+    }
+
+    fn hide(&self) {
+        let mut state = self.state.lock().expect("footer state lock poisoned");
+        state.hidden = true;
+        state.overlay_suspended = false;
+        if state.display == FooterDisplay::Overlay {
+            clear_overlay_footer();
+        }
+        state.display = FooterDisplay::None;
     }
 
     fn suspend_overlay(&self) {
@@ -435,6 +466,13 @@ fn render_footer_locked(style: &Style, state: &mut FooterState) {
     let Some(target) = state.target.clone() else {
         return;
     };
+    if state.hidden {
+        if state.display == FooterDisplay::Overlay {
+            clear_overlay_footer();
+        }
+        state.display = FooterDisplay::None;
+        return;
+    }
     let rendered = build_footer_line(style, state);
     if style.ansi && target.uses_external_printer() {
         if state.overlay_suspended {
@@ -468,9 +506,13 @@ fn clear_overlay_footer() {
 }
 
 fn build_footer_line(style: &Style, state: &FooterState) -> String {
+    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let status = match state.mode {
         FooterMode::Idle => style.accent("ready"),
-        FooterMode::Waiting => style.accent("waiting"),
+        FooterMode::Waiting => style.accent(format!(
+            "› {} waiting",
+            spinner[state.spinner_frame % spinner.len()]
+        )),
         FooterMode::Working => style.accent("working"),
         FooterMode::Interrupted => style.error("interrupted"),
         FooterMode::Error => style.error("error"),
@@ -502,7 +544,14 @@ fn build_footer_line(style: &Style, state: &FooterState) -> String {
         FooterMode::Idle => "enter sends · Ctrl-C exits · /new · /status",
     };
 
-    let mut parts = vec!["╰".to_string(), status];
+    let mut parts = vec![
+        if matches!(state.mode, FooterMode::Waiting) {
+            String::new()
+        } else {
+            "╰".to_string()
+        },
+        status,
+    ];
     if state.queue_depth > 0 {
         parts.push(style.subtle(format!("queue {}", state.queue_depth)));
     }
@@ -519,7 +568,11 @@ fn build_footer_line(style: &Style, state: &FooterState) -> String {
         parts.push(style.subtle("exit pending"));
     }
     parts.push(style.dim(hint));
-    parts.join(" · ")
+    parts
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn format_elapsed_short(elapsed: Duration) -> String {
@@ -670,6 +723,10 @@ impl CliShell {
         StreamRenderer::new(target, footer)
     }
 
+    pub fn hide_footer(&self) {
+        self.footer.hide();
+    }
+
     fn print_help(&self) {
         println!("{}", self.style.accent("╭─ CLI Help"));
         println!(
@@ -813,6 +870,14 @@ struct StreamState {
     pending: String,
     code_language: Option<String>,
     trailing_newlines: usize,
+    waiting_stop: Option<Arc<AtomicBool>>,
+    waiting_handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for StreamState {
+    fn drop(&mut self) {
+        stop_waiting_indicator(self);
+    }
 }
 
 impl StreamRenderer {
@@ -831,12 +896,23 @@ impl StreamRenderer {
     }
 
     pub fn start_waiting(&self) {
-        let state = self.state.lock().expect("cli stream state lock poisoned");
+        let mut state = self.state.lock().expect("cli stream state lock poisoned");
         if state.started {
             return;
         }
         self.footer.set_waiting();
         self.footer.render_current();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let footer = self.footer.clone();
+        let handle = thread::spawn(move || {
+            while !stop_flag.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(90));
+                footer.tick();
+            }
+        });
+        state.waiting_stop = Some(stop);
+        state.waiting_handle = Some(handle);
     }
 
     pub fn callback(&self) -> TextStreamCallback {
@@ -846,8 +922,9 @@ impl StreamRenderer {
         Arc::new(Mutex::new(Box::new(move |delta: String| {
             let mut state = state.lock().expect("cli stream state lock poisoned");
             if !state.started {
+                stop_waiting_indicator(&mut state);
+                footer.hide();
                 footer.set_working("streaming");
-                footer.suspend_overlay();
                 target.write_raw("\n".to_string());
                 state.started = true;
                 note_output(&mut state, "\n");
@@ -869,6 +946,10 @@ impl StreamRenderer {
 
     pub fn tool_hint(&self, hint: &str, tool_name: Option<&str>, tool_args: Option<&Value>) {
         let mut state = self.state.lock().expect("cli stream state lock poisoned");
+        if !state.started {
+            stop_waiting_indicator(&mut state);
+            self.footer.hide();
+        }
         self.footer.set_working(&truncate_middle(hint.trim(), 36));
         if !state.started {
             self.write_with_footer_hidden("\n");
@@ -897,6 +978,7 @@ impl StreamRenderer {
 
     pub fn finish(&self, content: &str, summary: &TurnSummary) {
         let mut state = self.state.lock().expect("cli stream state lock poisoned");
+        stop_waiting_indicator(&mut state);
         self.footer.suspend_overlay();
         if state.started {
             let tail = render_stream_delta(
@@ -928,6 +1010,7 @@ impl StreamRenderer {
 
     pub fn finish_empty(&self, note: &str, summary: &TurnSummary) {
         let mut state = self.state.lock().expect("cli stream state lock poisoned");
+        stop_waiting_indicator(&mut state);
         self.footer.suspend_overlay();
         let tail = render_stream_delta(
             &self.target.style,
@@ -951,6 +1034,7 @@ impl StreamRenderer {
 
     pub fn finish_error(&self, err: &str) {
         let mut state = self.state.lock().expect("cli stream state lock poisoned");
+        stop_waiting_indicator(&mut state);
         self.footer.suspend_overlay();
         let tail = render_stream_delta(
             &self.target.style,
@@ -968,6 +1052,15 @@ impl StreamRenderer {
         note_output(&mut state, &rendered);
         self.footer.set_error(&truncate_middle(err, 40));
         self.footer.render_current();
+    }
+}
+
+fn stop_waiting_indicator(state: &mut StreamState) {
+    if let Some(stop) = state.waiting_stop.take() {
+        stop.store(true, Ordering::SeqCst);
+    }
+    if let Some(handle) = state.waiting_handle.take() {
+        let _ = handle.join();
     }
 }
 
