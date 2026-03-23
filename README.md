@@ -1,92 +1,120 @@
-# rbot
+# 🤖 rbot
 
-`rbot` is a Rust-native autonomous bot runtime for persistent chat automation, tool execution, scheduled work, and multi-channel message delivery.
+`rbot` is a Rust-native autonomous bot runtime for persistent chat automation, tool execution, scheduled work, and multi-channel message delivery. 🚀
 
-It provides:
+## ✨ Features
 
-- A long-running agent runtime with persistent sessions and memory files
-- Filesystem, shell, web fetch, web search, messaging, cron, and background-task tools
-- OpenAI-compatible provider integration, including local engines that expose OpenAI-style APIs
-- MCP stdio tool integration for external tool servers
-- Built-in skills for software engineering, research/reporting, GitHub/CI, and scheduled operations
-- Channel backends for `email`, `slack`, `telegram`, and `feishu`
-- A gateway process with webhook ingress, health checks, readiness checks, Prometheus metrics, and a web admin UI
+- 🧠 **Persistent Agent Runtime** - Long-running agent runtime with persistent sessions and memory files
+- 🛠️ **Rich Toolset** - Filesystem, shell, web fetch, web search, messaging, cron, and background-task tools
+- 🌐 **Provider Integration** - OpenAI-compatible provider integration, including local engines that expose OpenAI-style APIs
+- 🔌 **MCP Support** - MCP stdio tool integration for external tool servers
+- 🧩 **Built-in Skills** - Software engineering, research/reporting, GitHub/CI, and scheduled operations
+- 📬 **Multi-Channel** - Channel backends for `email`, `slack`, `telegram`, and `feishu`
+- 🌐 **Gateway Process** - Webhook ingress, health checks, readiness checks, Prometheus metrics, and a web admin UI
 
-## Docs
+## 📚 Documentation
 
-- [Getting Started](./docs/USAGE.md)
-- [Architecture](./docs/ARCHITECTURE.md)
-- [Operations Guide](./docs/OPERATIONS.md)
+- [🚀 Getting Started](./docs/USAGE.md)
+- [🏗️ Architecture](./docs/ARCHITECTURE.md)
+- [⚙️ Operations Guide](./docs/OPERATIONS.md)
 
-## Quick Start
+## ⚡ Quick Start
 
-Initialize config and workspace:
-
-```bash
-cargo run -- onboard
-```
-
-Start the backend:
+### Initialize config and workspace:
 
 ```bash
-cargo run -- run
+cargo run --release -- onboard
 ```
 
-Check runtime configuration and local state:
+This will generate:
+
+```python
+# Revise this config file first
+Config: /root/.rbot/config.json
+Workspace: /root/.rbot/workspace
+```
+
+### Config Providers
+
+`rbot` supports both remote and local OpenAI-compatible backends. 🎯
+
+**Examples:**
+
+- 🌐 OpenAI API
+- 🐋 Ollama at `http://localhost:11434/v1`
+- 🚀 vLLM at `http://localhost:8000/v1`
+- 🛠️ LM Studio or any other OpenAI-compatible local server via `providers.custom.apiBase`
+
+See [Getting Started](./docs/USAGE.md) to configure local or remote providers in `/root/.rbot/config.json`.
+
+### Run a one-shot prompt:
 
 ```bash
-cargo run -- status
-cargo run -- sessions
-cargo run -- jobs
+cargo run --release -- chat "summarize the repository structure"
 ```
 
-Run a one-shot prompt:
+### Open the interactive shell for vibe coding:
 
 ```bash
-cargo run -- chat "summarize the repository structure"
+cargo run --release -- repl
 ```
 
-Open the interactive shell:
+The CLI includes:
+- 📡 Streamed responses
+- 📜 Persistent history
+- 💻 Local shell commands such as `/help` and `/clear`
+- 🤖 Agent commands such as `/new`, `/status`, and `/stop`
+
+### Start the backend (Personal AI Assistant):
 
 ```bash
-cargo run -- repl
+cargo run --release -- run
 ```
 
-The CLI includes streamed responses, persistent history, local shell commands such as `/help` and `/clear`, and agent commands such as `/new`, `/status`, and `/stop`.
+### Check runtime configuration and local state:
 
-## Provider Modes
+```bash
+cargo run --release -- status
+cargo run --release -- sessions
+cargo run --release -- jobs
+```
 
-`rbot` supports both remote and local OpenAI-compatible backends.
+## 📡 Runtime Surfaces
 
-Examples:
+### Channel Backends
 
-- OpenAI API
-- Ollama at `http://localhost:11434/v1`
-- vLLM at `http://localhost:8000/v1`
-- LM Studio or any other OpenAI-compatible local server via `providers.custom.apiBase`
+- 📧 **email**: IMAP polling + SMTP send
+- 💬 **slack**: webhook ingress + send
+- ✈️ **telegram**: webhook ingress + send
+- 🦘 **feishu**: webhook ingress + send, including inbound media/resource handling
+- 🔌 **mcp**: stdio-based external tool servers exposed as native tools
 
-See [Getting Started](./docs/USAGE.md) for full config examples.
-
-## Runtime Surfaces
-
-- `email`: IMAP polling + SMTP send
-- `slack`: webhook ingress + send
-- `telegram`: webhook ingress + send
-- `feishu`: webhook ingress + send, including inbound media/resource handling
-- `mcp`: stdio-based external tool servers exposed as native tools
+### Gateway Endpoints
 
 The gateway exposes:
 
-- `GET /healthz`
-- `GET /readyz`
-- `GET /status`
-- `GET /metrics`
-- `GET /admin`
-- `GET /api/admin/*`
+- ✅ `GET /healthz` - Health check
+- 🟢 `GET /readyz` - Readiness check
+- 📊 `GET /status` - Runtime status
+- 📈 `GET /metrics` - Prometheus metrics
+- 🎛️ `GET /admin` - Web admin UI
+- 🔧 `GET /api/admin/*` - Admin API
 
-## Verification
+## ✅ Verification
 
 ```bash
 cargo fmt
 cargo test
 ```
+
+## 🎯 Use Cases
+
+- 🤖 **Personal AI Assistant** - Always-on AI assistant across your communication channels
+- 📊 **Automated Monitoring** - Scheduled tasks and webhook-based monitoring
+- 🔧 **DevOps Automation** - Tool execution, file operations, and system management
+- 📝 **Research & Reporting** - Web search, analysis, and report generation
+- 🔄 **CI/CD Integration** - GitHub/CI automation and status updates
+
+---
+
+**Built with ❤️ in Rust** 🦀
