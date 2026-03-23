@@ -1,4 +1,4 @@
-# 🤖 rbot
+# 🤖 rbot: A Minimal AI Agent in Rust for Automation and Development
 
 `rbot` is a Rust-native autonomous bot runtime for persistent chat automation, tool execution, scheduled work, and multi-channel message delivery. 🚀
 

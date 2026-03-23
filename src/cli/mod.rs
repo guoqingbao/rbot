@@ -7,17 +7,58 @@ use std::time::Duration;
 
 use anyhow::Result;
 use rustyline::error::ReadlineError;
-use rustyline::{DefaultEditor, ExternalPrinter as RustylineExternalPrinter};
+use rustyline::{Editor, ExternalPrinter as RustylineExternalPrinter};
+use rustyline::history::DefaultHistory;
+use rustyline::highlight::Highlighter;
+use rustyline::validate::{Validator, ValidationResult, ValidationContext};
+use rustyline::hint::Hinter;
+use rustyline::completion::Completer;
+use std::borrow::Cow;
 
 use rbot::providers::TextStreamCallback;
 use rbot::util::{ensure_dir, workspace_state_dir};
 
-const USER_EMOJI: &str = "🙂";
-const BOT_EMOJI: &str = "🤖";
+
 
 pub enum InputEvent {
     Prompt(String),
     Exit,
+    Interrupt,
+}
+
+#[derive(Clone)]
+struct CliHelper {
+    style: Style,
+}
+
+impl rustyline::Helper for CliHelper {}
+
+impl Completer for CliHelper {
+    type Candidate = String;
+}
+
+impl Hinter for CliHelper {
+    type Hint = String;
+}
+
+impl Validator for CliHelper {
+    fn validate(&self, _ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
+        Ok(ValidationResult::Valid(None))
+    }
+}
+
+impl Highlighter for CliHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        if self.style.ansi {
+            Cow::Owned(format!("\x1b[48;5;253;38;5;236m{line}\x1b[0m"))
+        } else {
+            Cow::Borrowed(line)
+        }
+    }
+
+    fn highlight_char(&self, _line: &str, _pos: usize, _forced: rustyline::highlight::CmdKind) -> bool {
+        self.style.ansi
+    }
 }
 
 #[derive(Clone)]
@@ -81,13 +122,7 @@ impl Style {
         let marker = if open { "┌" } else { "└" };
         let label = if lang.is_empty() { "code" } else { lang };
         if self.ansi {
-            format!(
-                "{} {}",
-                self.paint("48;5;236;38;5;255", format!(" {marker} {label} ")),
-                self.dim(if open { "" } else { "" })
-            )
-            .trim_end()
-            .to_string()
+            self.dim(format!("{marker} {label}"))
         } else {
             format!("{marker} {label}")
         }
@@ -95,12 +130,12 @@ impl Style {
 
     fn tool_hint_pill(&self, parts: &ToolHintParts<'_>) -> String {
         let text = if parts.detail.is_empty() {
-            format!("{} {}", parts.emoji, parts.tool_name)
+            format!("[ {} {} ]", parts.emoji, parts.tool_name)
         } else {
-            format!("{} {}  {}", parts.emoji, parts.tool_name, parts.detail)
+            format!("[ {} {}  {} ]", parts.emoji, parts.tool_name, parts.detail)
         };
         if self.ansi {
-            self.paint("48;5;254;38;5;240", format!(" {text} "))
+            self.paint("48;5;253;38;5;236", text)
         } else {
             text
         }
@@ -116,11 +151,19 @@ impl Style {
     }
 
     fn primary_prompt(&self) -> String {
-        format!("{} ", self.accent(format!("{USER_EMOJI}›")))
+        if self.ansi {
+            format!("\n\x1b[48;5;253m\x1b[K\x1b[0m\n\x1b[48;5;253;38;5;236;1m\x1b[K   › \x1b[0m\x1b[48;5;253;38;5;236m")
+        } else {
+            "› ".to_string()
+        }
     }
 
     fn continuation_prompt(&self) -> String {
-        format!("{} ", self.dim("…›"))
+        if self.ansi {
+            format!("\x1b[48;5;253;38;5;245m\x1b[K  …› \x1b[0m\x1b[48;5;253;38;5;236m")
+        } else {
+            "…› ".to_string()
+        }
     }
 }
 
@@ -178,7 +221,7 @@ pub struct TurnSummary<'a> {
 }
 
 pub struct CliShell {
-    editor: DefaultEditor,
+    editor: Editor<CliHelper, DefaultHistory>,
     history_path: PathBuf,
     style: Style,
     workspace: PathBuf,
@@ -196,7 +239,8 @@ impl CliShell {
     ) -> Result<Self> {
         let style = Style::detect();
         let history_path = history_file_path()?;
-        let mut editor = DefaultEditor::new()?;
+        let mut editor = Editor::<CliHelper, DefaultHistory>::new()?;
+        editor.set_helper(Some(CliHelper { style: style.clone() }));
         let _ = editor.load_history(&history_path);
         Ok(Self {
             editor,
@@ -258,15 +302,15 @@ impl CliShell {
             self.print_turn_header();
             let line = match self.editor.readline(&self.style.primary_prompt()) {
                 Ok(line) => line,
-                Err(ReadlineError::Interrupted) => {
-                    println!();
-                    continue;
-                }
+                Err(ReadlineError::Interrupted) => return Ok(InputEvent::Interrupt),
                 Err(ReadlineError::Eof) => return Ok(InputEvent::Exit),
                 Err(err) => return Err(err.into()),
             };
 
             let input = self.read_multiline(line)?;
+            if self.style.ansi {
+                println!("\x1b[48;5;253m\x1b[K\x1b[0m");
+            }
             let trimmed = input.trim();
             if trimmed.is_empty() {
                 continue;
@@ -411,6 +455,13 @@ impl CliOutput {
                 .queue_pill("exit requested · finishing the current turn first")
         ));
     }
+
+    pub fn print_interrupt_notice(&self) {
+        self.target.write_raw(format!(
+            "\n{}\n\n",
+            self.style.error("turn cancelled")
+        ));
+    }
 }
 
 #[derive(Clone)]
@@ -430,6 +481,12 @@ struct StreamState {
     spinner_handle: Option<JoinHandle<()>>,
 }
 
+impl Drop for StreamState {
+    fn drop(&mut self) {
+        stop_waiting_indicator(self);
+    }
+}
+
 impl StreamRenderer {
     fn new(target: OutputTarget) -> Self {
         Self {
@@ -446,18 +503,16 @@ impl StreamRenderer {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = stop.clone();
         let target = self.target.clone();
-        let use_stderr = target.uses_external_printer();
         let handle = thread::spawn(move || {
             let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             let mut idx = 0usize;
+            let ansi = target.style.ansi;
             while !stop_flag.load(Ordering::SeqCst) {
-                let frame = target
-                    .style
-                    .dim(format!("{BOT_EMOJI} {}", frames[idx % frames.len()]));
-                if use_stderr {
-                    write_stderr_raw(&format!("\r\x1b[2K{frame}"));
+                let frame = frames[idx % frames.len()];
+                if ansi {
+                    write_stderr_raw(&format!("\x1b[s \x1b[2m{frame}\x1b[22m \x1b[u"));
                 } else {
-                    target.write_raw(format!("\r\x1b[2K{frame}"));
+                    write_stderr_raw(&format!("\x1b[s {frame} \x1b[u"));
                 }
                 idx += 1;
                 thread::sleep(Duration::from_millis(90));
@@ -475,10 +530,10 @@ impl StreamRenderer {
             let mut state = state.lock().expect("cli stream state lock poisoned");
             if !state.started {
                 if state.waiting {
-                    stop_waiting_indicator(&target, &mut state);
+                    stop_waiting_indicator(&mut state);
                     state.waiting = false;
                 }
-                target.write_raw(format!("\n{} ", target.style.accent(BOT_EMOJI)));
+                target.write_raw("\n".to_string());
                 state.started = true;
                 note_output(&mut state, "\n");
             }
@@ -499,31 +554,35 @@ impl StreamRenderer {
     pub fn tool_hint(&self, hint: &str) {
         let mut state = self.state.lock().expect("cli stream state lock poisoned");
         if state.waiting {
-            stop_waiting_indicator(&self.target, &mut state);
+            stop_waiting_indicator(&mut state);
             state.waiting = false;
             if !state.started {
-                self.target
-                    .write_raw(format!("\n{} ", self.target.style.accent(BOT_EMOJI)));
+                self.target.write_raw("\n".to_string());
                 state.started = true;
                 note_output(&mut state, "\n");
             }
         }
         let parts = parse_tool_hint(hint);
         let pill = self.target.style.tool_hint_pill(&parts);
-        let prefix = if state.trailing_newlines == 0 {
-            "\n"
-        } else {
-            ""
-        };
+        let mut prefix = String::new();
+        if state.trailing_newlines == 0 {
+            prefix.push('\n');
+        } else if state.trailing_newlines > 1 {
+            for _ in 1..state.trailing_newlines {
+                prefix.push_str("\x1b[1A\x1b[2K");
+            }
+        }
         let rendered = format!("{prefix}{pill}\n");
         self.target.write_raw(&rendered);
-        note_output(&mut state, &rendered);
+        state.trailing_newlines = 1;
+        drop(state);
+        self.start_waiting();
     }
 
     pub fn finish(&self, content: &str, summary: &TurnSummary<'_>) {
         let mut state = self.state.lock().expect("cli stream state lock poisoned");
         if state.waiting {
-            stop_waiting_indicator(&self.target, &mut state);
+            stop_waiting_indicator(&mut state);
             state.waiting = false;
         }
         if state.started {
@@ -538,11 +597,15 @@ impl StreamRenderer {
                 self.target.write_raw(&tail);
                 note_output(&mut state, &tail);
             }
-            self.target.write_raw("\n\n");
-            note_output(&mut state, "\n\n");
+            if state.trailing_newlines == 0 {
+                self.target.write_raw("\n\n");
+            } else if state.trailing_newlines == 1 {
+                self.target.write_raw("\n");
+            }
+            state.trailing_newlines = 2;
         } else {
             let rendered = render_markdown_response(&self.target.style, content);
-            let rendered = format!("\n{} {}\n\n", self.target.style.accent(BOT_EMOJI), rendered);
+            let rendered = format!("\n{}\n\n", rendered);
             self.target.write_raw(&rendered);
             note_output(&mut state, &rendered);
         }
@@ -557,13 +620,12 @@ impl StreamRenderer {
             ))
         );
         self.target.write_raw(&footer);
-        note_output(&mut state, &footer);
     }
 
     pub fn finish_empty(&self, note: &str, summary: &TurnSummary<'_>) {
         let mut state = self.state.lock().expect("cli stream state lock poisoned");
         if state.waiting {
-            stop_waiting_indicator(&self.target, &mut state);
+            stop_waiting_indicator(&mut state);
             state.waiting = false;
         }
         let tail = render_stream_delta(
@@ -599,7 +661,7 @@ impl StreamRenderer {
     pub fn finish_error(&self, err: &str) {
         let mut state = self.state.lock().expect("cli stream state lock poisoned");
         if state.waiting {
-            stop_waiting_indicator(&self.target, &mut state);
+            stop_waiting_indicator(&mut state);
             state.waiting = false;
         }
         let tail = render_stream_delta(
@@ -619,17 +681,13 @@ impl StreamRenderer {
     }
 }
 
-fn stop_waiting_indicator(target: &OutputTarget, state: &mut StreamState) {
+fn stop_waiting_indicator(state: &mut StreamState) {
     if let Some(stop) = state.spinner_stop.take() {
         stop.store(true, Ordering::SeqCst);
     }
     if let Some(handle) = state.spinner_handle.take() {
         let _ = handle.join();
-    }
-    if target.uses_external_printer() {
-        write_stderr_raw("\r\x1b[2K");
-    } else {
-        target.write_raw("\r\x1b[2K");
+        write_stderr_raw("\x1b[s   \x1b[u");
     }
 }
 
@@ -774,9 +832,13 @@ fn note_output(state: &mut StreamState, text: &str) {
     if text.is_empty() {
         return;
     }
-    let trailing = text.chars().rev().take_while(|ch| *ch == '\n').count();
+    let trailing = text.chars().rev().filter(|ch| *ch != '\r').take_while(|ch| *ch == '\n').count();
     if trailing > 0 {
-        state.trailing_newlines = trailing;
+        if text.chars().all(|ch| ch == '\n' || ch == '\r') {
+            state.trailing_newlines += trailing;
+        } else {
+            state.trailing_newlines = trailing;
+        }
     } else {
         state.trailing_newlines = 0;
     }
@@ -801,8 +863,82 @@ fn render_stream_line(style: &Style, state: &mut StreamState, line: &str) -> Str
             highlighted
         }
     } else {
-        line.to_string()
+        let highlighted = highlight_markdown_line(style, normalized);
+        if has_newline {
+            format!("{highlighted}\n")
+        } else {
+            highlighted
+        }
     }
+}
+
+fn highlight_markdown_line(style: &Style, line: &str) -> String {
+    if !style.ansi || line.is_empty() {
+        return line.to_string();
+    }
+    
+    if line.starts_with('#') {
+        return style.accent(line);
+    }
+    
+    if line.starts_with('>') {
+        return style.dim(line);
+    }
+
+    let mut out = String::with_capacity(line.len() + 32);
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    
+    let mut in_bold = false;
+    let mut in_italic = false;
+    let mut in_code = false;
+    
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            out.push(chars[i]);
+            out.push(chars[i+1]);
+            i += 2;
+            continue;
+        }
+        if i + 1 < chars.len() && chars[i] == '*' && chars[i+1] == '*' && !in_code {
+            in_bold = !in_bold;
+            if in_bold {
+                out.push_str("\x1b[1m");
+            } else {
+                out.push_str("\x1b[0m");
+            }
+            i += 2;
+            continue;
+        }
+        if chars[i] == '*' && !in_code && !in_bold {
+            in_italic = !in_italic;
+            if in_italic {
+                out.push_str("\x1b[3m");
+            } else {
+                out.push_str("\x1b[0m");
+            }
+            i += 1;
+            continue;
+        }
+        if chars[i] == '`' {
+            in_code = !in_code;
+            if in_code {
+                out.push_str("\x1b[38;5;141m");
+            } else {
+                out.push_str("\x1b[0m");
+            }
+            i += 1;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    
+    if in_bold || in_italic || in_code {
+        out.push_str("\x1b[0m");
+    }
+    out
+
 }
 
 fn fence_language(line: &str) -> Option<&str> {
@@ -1025,7 +1161,7 @@ fn truncate_middle(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         LocalCommand, StreamState, fence_language, highlight_code_line, line_requests_continuation,
-        note_output, parse_local_command, parse_tool_hint, sentence_flush_index, truncate_middle,
+        parse_local_command, parse_tool_hint, sentence_flush_index, truncate_middle,
     };
 
     #[test]
@@ -1079,12 +1215,4 @@ mod tests {
         assert_eq!(sentence_flush_index("path=src/main.rs"), None);
     }
 
-    #[test]
-    fn note_output_tracks_trailing_newlines() {
-        let mut state = StreamState::default();
-        note_output(&mut state, "hello\n\n");
-        assert_eq!(state.trailing_newlines, 2);
-        note_output(&mut state, "world");
-        assert_eq!(state.trailing_newlines, 0);
-    }
 }

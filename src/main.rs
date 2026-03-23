@@ -177,6 +177,11 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                     let _ = input_tx.send(ReplEvent::Input(InputEvent::Exit));
                     break;
                 }
+                Ok(InputEvent::Interrupt) => {
+                    if input_tx.send(ReplEvent::Input(InputEvent::Interrupt)).is_err() {
+                        break;
+                    }
+                }
                 Err(err) => {
                     eprintln!("error: {err}");
                     let _ = input_tx.send(ReplEvent::Input(InputEvent::Exit));
@@ -189,6 +194,7 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
     let mut pending = VecDeque::new();
     let mut busy = false;
     let mut exit_requested = false;
+    let mut active_task = None::<tokio::task::JoinHandle<()>>;
     while let Some(event) = rx.recv().await {
         match event {
             ReplEvent::Input(InputEvent::Prompt(prompt)) => {
@@ -196,7 +202,7 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                     pending.push_back(prompt.clone());
                     output.print_queue_notice(pending.len(), &prompt);
                 } else {
-                    spawn_repl_turn(
+                    active_task = Some(spawn_repl_turn(
                         agent.clone(),
                         model.clone(),
                         session_key.clone(),
@@ -204,8 +210,19 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                         prompt,
                         output.clone(),
                         tx.clone(),
-                    );
+                    ));
                     busy = true;
+                }
+            }
+            ReplEvent::Input(InputEvent::Interrupt) => {
+                if busy {
+                    if let Some(handle) = active_task.take() {
+                        handle.abort();
+                        agent.set_progress_sender(None);
+                        output.print_interrupt_notice();
+                        busy = false;
+                        pending.clear();
+                    }
                 }
             }
             ReplEvent::Input(InputEvent::Exit) => {
@@ -224,7 +241,7 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                 }
                 if let Some(next) = pending.pop_front() {
                     output.print_dequeue_notice(pending.len(), &next);
-                    spawn_repl_turn(
+                    active_task = Some(spawn_repl_turn(
                         agent.clone(),
                         model.clone(),
                         session_key.clone(),
@@ -232,7 +249,7 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                         next,
                         output.clone(),
                         tx.clone(),
-                    );
+                    ));
                     busy = true;
                 }
             }
@@ -249,7 +266,7 @@ fn spawn_repl_turn(
     prompt: String,
     output: CliOutput,
     tx: UnboundedSender<ReplEvent>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let stream = output.stream_renderer();
         agent.set_progress_sender(Some(cli_progress_callback(stream.clone())));
@@ -276,7 +293,7 @@ fn spawn_repl_turn(
             Err(err) => stream.finish_error(&err.to_string()),
         }
         let _ = tx.send(ReplEvent::TurnFinished);
-    });
+    })
 }
 
 async fn run(config_path: Option<&Path>, model_override: Option<String>) -> Result<()> {

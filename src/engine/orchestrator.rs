@@ -398,6 +398,7 @@ impl AgentLoop {
         text_stream: Option<TextStreamCallback>,
         progress_target: Option<ProgressTarget>,
     ) -> Result<(Option<String>, Vec<ChatMessage>)> {
+        *self.last_usage.lock().expect("usage lock poisoned") = (0, 0);
         let mut final_content = None;
         let think_re = Regex::new(r"(?s)<think>.*?</think>").expect("valid think regex");
         let mut last_tool_fingerprint: Option<String> = None;
@@ -585,10 +586,9 @@ impl AgentLoop {
     }
 
     fn record_usage(&self, response: &LlmResponse) {
-        *self.last_usage.lock().expect("usage lock poisoned") = (
-            response.usage.prompt_tokens,
-            response.usage.completion_tokens,
-        );
+        let mut usage = self.last_usage.lock().expect("usage lock poisoned");
+        usage.0 = usage.0.max(response.usage.prompt_tokens);
+        usage.1 += response.usage.completion_tokens;
     }
 
     fn save_turn(&self, session: &mut Session, messages: &[ChatMessage]) -> Result<()> {
