@@ -10,3 +10,4 @@ CLAUDE.md
 *.nsys-rep
 *.sqlite
 .rbot/
+openrouter_models.json

@@ -181,6 +181,7 @@ impl SlackApi for ReqwestSlackApi {
     }
 
     async fn files_upload(&self, channel: &str, file: &str, thread_ts: Option<&str>) -> Result<()> {
+        eprintln!("[slack] uploading file to {channel}: {file}");
         let form = if file.starts_with("http://") || file.starts_with("https://") {
             reqwest::multipart::Form::new()
                 .text("channels", channel.to_string())
@@ -409,6 +410,11 @@ impl SlackChannel {
                             .and_then(Value::as_str)
                             .unwrap_or("unknown")
                     );
+                    if let Some(text) = event.get("text").and_then(Value::as_str) {
+                        let summary = text.chars().take(60).collect::<String>().replace('\n', " ");
+                        let ellipsis = if text.chars().count() > 60 { "..." } else { "" };
+                        eprintln!("[slack] received message: {summary}{ellipsis}");
+                    }
                     self.handle_event(event).await?;
                 }
             }
@@ -672,13 +678,11 @@ impl Channel for SlackChannel {
             };
             api.chat_post_message(&msg.chat_id, &text, thread_ts)
                 .await?;
-            eprintln!(
-                "[slack] sent message to {}{}",
-                msg.chat_id,
-                thread_ts
-                    .map(|ts| format!(" (thread {ts})"))
-                    .unwrap_or_default()
-            );
+
+            let summary = text.chars().take(60).collect::<String>().replace('\n', " ");
+            let ellipsis = if text.chars().count() > 60 { "..." } else { "" };
+            let channel = msg.chat_id.clone();
+            eprintln!("[slack] sending message to {channel}: {summary}{ellipsis}");
         }
         for media_path in &msg.media {
             let _ = api.files_upload(&msg.chat_id, media_path, thread_ts).await;

@@ -27,6 +27,25 @@ Supported practical modes:
 - Local engines such as Ollama and vLLM
 - Custom local or remote OpenAI-compatible servers
 
+### Openrouter example
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": "minimax/minimax-m2.7",
+      "provider": "openrouter"
+    }
+  },
+  "providers": {
+    "openrouter": {
+      "apiKey": "sk-or-v1-...",
+      "extraHeaders": {}
+    }
+  }
+}
+```
+
 ### OpenAI-compatible remote example
 
 ```json
@@ -197,7 +216,7 @@ cargo run -- run
 Slack supports two practical modes in `rbot`:
 
 - `webhook`: Slack sends Events API requests to your public HTTPS endpoint
-- `socket`: `rbot` opens an outbound WebSocket to Slack and does not require a public webhook URL
+- `socket`: `rbot` opens an outbound WebSocket to Slack and does not require a public webhook URL (Public)
 
 Example Socket Mode config:
 

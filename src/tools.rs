@@ -626,8 +626,11 @@ pub fn find_match(content: &str, old_text: &str) -> (Option<String>, usize) {
         .map(|line| line.trim().to_string())
         .collect();
     let content_lines: Vec<&str> = content.lines().collect();
+    if content_lines.len() < stripped_old.len() {
+        return (None, 0);
+    }
     let mut candidates = Vec::new();
-    for index in 0..=content_lines.len().saturating_sub(stripped_old.len()) {
+    for index in 0..=content_lines.len() - stripped_old.len() {
         let window = &content_lines[index..index + stripped_old.len()];
         let stripped_window = window
             .iter()
