@@ -60,7 +60,8 @@ cargo run --release -- config --channel
 This tool helps you selectively enable channels, set permissions, and provide required tokens or secrets. For manual configuration or detailed channel options, see [Getting Started](./docs/USAGE.md#5-channel-configuration).
 
 > [!TIP]
-> **Slack Users:** To set up your Slack App for use with `rbot` (including Webhook and Socket Mode instructions), refer to the [OpenClaw Slack Manual](https://www.meta-intelligence.tech/en/insight-openclaw-slack).
+> **Slack Users:** Set up Slack App for Agents [Slack Manual](https://www.meta-intelligence.tech/en/insight-openclaw-slack).
+> **Telegram Users:** Set up Telegram App for Agents [Telegram Manual](https://www.meta-intelligence.tech/en/insight-openclaw-telegram).
 
 
 ## 🧾Usage
