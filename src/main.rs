@@ -708,6 +708,7 @@ async fn build_agent_for_workspace(
         model,
         config.agents.defaults.max_tool_iterations,
         config.agents.defaults.context_window_tokens,
+        config.agents.defaults.memory_max_bytes,
         config.tools.web.search.clone(),
         config.tools.web.proxy.clone(),
         config.tools.exec.clone(),

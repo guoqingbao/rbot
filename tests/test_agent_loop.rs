@@ -9,6 +9,7 @@ use rbot::engine::AgentLoop;
 use rbot::providers::{LlmProvider, LlmResponse, LlmUsage, QueuedProvider, ToolCallRequest};
 use rbot::runtime::AgentRuntime;
 use rbot::storage::{ChatMessage, InboundMessage, MessageBus, SessionManager};
+use rbot::util::{DEFAULT_HISTORY_TEMPLATE, workspace_state_dir};
 use serde_json::Value;
 use serde_json::json;
 use tempfile::tempdir;
@@ -49,6 +50,7 @@ async fn agent_loop_executes_tool_then_returns_final_answer() {
         Some("test-model".to_string()),
         8,
         8_000,
+        32 * 1024,
         Default::default(),
         None,
         ExecToolConfig {
@@ -114,6 +116,7 @@ async fn zero_max_tool_iterations_means_unbounded_until_completion() {
         Some("test-model".to_string()),
         0,
         8_000,
+        32 * 1024,
         Default::default(),
         None,
         ExecToolConfig {
@@ -164,6 +167,7 @@ async fn provider_errors_still_persist_the_user_turn() {
         Some("test-model".to_string()),
         0,
         8_000,
+        32 * 1024,
         Default::default(),
         None,
         ExecToolConfig {
@@ -198,29 +202,29 @@ async fn provider_errors_still_persist_the_user_turn() {
 #[tokio::test]
 async fn agent_loop_stops_on_repeated_tool_calls() {
     let dir = tempdir().unwrap();
+    let repeated_response = LlmResponse {
+        content: None,
+        tool_calls: vec![ToolCallRequest {
+            id: "call_1".to_string(),
+            name: "list_dir".to_string(),
+            arguments: json!({"path": "."}),
+        }],
+        finish_reason: "tool_calls".to_string(),
+        usage: LlmUsage::default(),
+        reasoning_content: None,
+        thinking_blocks: None,
+    };
     let provider = Arc::new(QueuedProvider::new(
         "test-model",
-        vec![
-            LlmResponse {
-                content: None,
-                tool_calls: vec![ToolCallRequest {
-                    id: "call_1".to_string(),
-                    name: "list_dir".to_string(),
-                    arguments: json!({"path": "."}),
-                }],
-                finish_reason: "tool_calls".to_string(),
-                usage: LlmUsage::default(),
-                reasoning_content: None,
-                thinking_blocks: None,
-            }; 4 // Repeat 4 times
-        ],
+        vec![repeated_response; 30],
     ));
     let agent = AgentLoop::new(
         provider,
         dir.path(),
         Some("test-model".to_string()),
-        10,
+        40,
         8_000,
+        32 * 1024,
         Default::default(),
         None,
         ExecToolConfig {
@@ -240,6 +244,112 @@ async fn agent_loop_stops_on_repeated_tool_calls() {
         .unwrap()
         .unwrap();
     assert!(response.content.contains("pattern repeated"));
+}
+
+#[tokio::test]
+async fn agent_loop_stops_on_repeated_tool_calls_even_with_new_ids() {
+    let dir = tempdir().unwrap();
+    let responses = (1..=30)
+        .map(|idx| LlmResponse {
+            content: None,
+            tool_calls: vec![ToolCallRequest {
+                id: format!("call_{idx}"),
+                name: "exec".to_string(),
+                arguments: json!({"command": "find /root -maxdepth 3 -name Cargo.toml"}),
+            }],
+            finish_reason: "tool_calls".to_string(),
+            usage: LlmUsage::default(),
+            reasoning_content: None,
+            thinking_blocks: None,
+        })
+        .collect();
+    let provider = Arc::new(QueuedProvider::new("test-model", responses));
+    let agent = AgentLoop::new(
+        provider,
+        dir.path(),
+        Some("test-model".to_string()),
+        40,
+        8_000,
+        32 * 1024,
+        Default::default(),
+        None,
+        ExecToolConfig {
+            enable: false,
+            timeout: 60,
+            path_append: String::new(),
+        },
+        false,
+        None,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+
+    let response = agent
+        .process_direct("find cargo manifests", "cli:direct", "cli", "direct")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(response.content.contains("pattern repeated"));
+    assert!(response.content.contains("30 times"));
+}
+
+#[tokio::test]
+async fn agent_loop_does_not_stop_when_tool_arguments_change() {
+    let dir = tempdir().unwrap();
+    let mut responses = (1..=12)
+        .map(|idx| LlmResponse {
+            content: None,
+            tool_calls: vec![ToolCallRequest {
+                id: format!("call_{idx}"),
+                name: "exec".to_string(),
+                arguments: json!({"command": format!("find /root -maxdepth {idx} -name Cargo.toml")}),
+            }],
+            finish_reason: "tool_calls".to_string(),
+            usage: LlmUsage::default(),
+            reasoning_content: None,
+            thinking_blocks: None,
+        })
+        .collect::<Vec<_>>();
+    responses.push(LlmResponse {
+        content: Some("Finished reviewing varying search attempts.".to_string()),
+        tool_calls: Vec::new(),
+        finish_reason: "stop".to_string(),
+        usage: LlmUsage::default(),
+        reasoning_content: None,
+        thinking_blocks: None,
+    });
+    let provider = Arc::new(QueuedProvider::new("test-model", responses));
+    let agent = AgentLoop::new(
+        provider,
+        dir.path(),
+        Some("test-model".to_string()),
+        40,
+        8_000,
+        32 * 1024,
+        Default::default(),
+        None,
+        ExecToolConfig {
+            enable: false,
+            timeout: 60,
+            path_append: String::new(),
+        },
+        false,
+        None,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+
+    let response = agent
+        .process_direct("find cargo manifests", "cli:direct", "cli", "direct")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        response.content,
+        "Finished reviewing varying search attempts."
+    );
 }
 
 struct SlowQueuedProvider {
@@ -299,6 +409,7 @@ async fn agent_loop_honors_stop_command() {
             Some("test-model".to_string()),
             200, // Many iterations
             8_000,
+            32 * 1024,
             Default::default(),
             None,
             ExecToolConfig {
@@ -368,6 +479,7 @@ async fn stop_command_does_not_block_the_next_prompt() {
             Some("test-model".to_string()),
             8,
             8_000,
+            32 * 1024,
             Default::default(),
             None,
             ExecToolConfig {
@@ -431,6 +543,7 @@ async fn runtime_stop_command_sends_threaded_ack_and_completion() {
             Some("test-model".to_string()),
             8,
             8_000,
+            32 * 1024,
             Default::default(),
             None,
             ExecToolConfig {
@@ -504,6 +617,190 @@ async fn runtime_stop_command_sends_threaded_ack_and_completion() {
 }
 
 #[tokio::test]
+async fn clear_command_resets_history_template() {
+    let dir = tempdir().unwrap();
+    let provider = Arc::new(QueuedProvider::new(
+        "test-model",
+        vec![LlmResponse {
+            content: Some("Task finished.".to_string()),
+            tool_calls: Vec::new(),
+            finish_reason: "stop".to_string(),
+            usage: LlmUsage::default(),
+            reasoning_content: None,
+            thinking_blocks: None,
+        }],
+    ));
+    let agent = AgentLoop::new(
+        provider,
+        dir.path(),
+        Some("test-model".to_string()),
+        8,
+        8_000,
+        32 * 1024,
+        Default::default(),
+        None,
+        ExecToolConfig {
+            enable: false,
+            timeout: 60,
+            path_append: String::new(),
+        },
+        false,
+        None,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+
+    agent
+        .process_direct("finish something", "cli:direct", "cli", "direct")
+        .await
+        .unwrap();
+
+    let history_path = workspace_state_dir(dir.path())
+        .join("memory")
+        .join("HISTORY.md");
+    std::fs::write(&history_path, "junk history").unwrap();
+
+    let response = agent
+        .process_direct("/clear", "cli:direct", "cli", "direct")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        response.content,
+        "New session started. Session cleared and history reset."
+    );
+    assert_eq!(
+        std::fs::read_to_string(history_path).unwrap(),
+        DEFAULT_HISTORY_TEMPLATE
+    );
+}
+
+#[tokio::test]
+async fn completed_tasks_append_task_summary_to_memory() {
+    let dir = tempdir().unwrap();
+    let provider = Arc::new(QueuedProvider::new(
+        "test-model",
+        vec![
+            LlmResponse {
+                content: Some(
+                    "Implemented the stop acknowledgement flow. Added runtime replies, wired session cancellation cleanup, and covered the path with regression tests.".to_string(),
+                ),
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: LlmUsage::default(),
+                reasoning_content: None,
+                thinking_blocks: None,
+            },
+            LlmResponse {
+                content: Some(
+                    r#"{"title":"Stop acknowledgement flow","summary":"Added immediate stop acknowledgement and completion replies, with cancellation cleanup and regression coverage.","attention_points":["Keep threaded channel metadata on both replies."]}"#
+                        .to_string(),
+                ),
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: LlmUsage::default(),
+                reasoning_content: None,
+                thinking_blocks: None,
+            },
+        ],
+    ));
+    let agent = AgentLoop::new(
+        provider,
+        dir.path(),
+        Some("test-model".to_string()),
+        8,
+        8_000,
+        32 * 1024,
+        Default::default(),
+        None,
+        ExecToolConfig {
+            enable: false,
+            timeout: 60,
+            path_append: String::new(),
+        },
+        false,
+        None,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+
+    agent
+        .process_direct(
+            "Implement stop acknowledgement flow",
+            "cli:direct",
+            "cli",
+            "direct",
+        )
+        .await
+        .unwrap();
+
+    let memory =
+        std::fs::read_to_string(workspace_state_dir(dir.path()).join("memory/MEMORY.md")).unwrap();
+    assert!(memory.contains("Task Summary"));
+    assert!(memory.contains("Stop acknowledgement flow"));
+    assert!(memory.contains("Added immediate stop acknowledgement and completion replies"));
+    assert!(memory.contains("Keep threaded channel metadata on both replies."));
+}
+
+#[tokio::test]
+async fn memorize_command_appends_user_memory_entry() {
+    let dir = tempdir().unwrap();
+    let agent = AgentLoop::new(
+        Arc::new(QueuedProvider::new(
+            "test-model",
+            vec![LlmResponse {
+                content: Some(
+                    r#"{"title":"User prefers concise delivery","summary":"Keep responses concise and include documentation updates when feature work changes behavior.","attention_points":["Docs should stay in sync with shipped changes."]}"#
+                        .to_string(),
+                ),
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: LlmUsage::default(),
+                reasoning_content: None,
+                thinking_blocks: None,
+            }],
+        )),
+        dir.path(),
+        Some("test-model".to_string()),
+        8,
+        8_000,
+        32 * 1024,
+        Default::default(),
+        None,
+        ExecToolConfig {
+            enable: false,
+            timeout: 60,
+            path_append: String::new(),
+        },
+        false,
+        None,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+
+    let response = agent
+        .process_direct(
+            "/memorize User prefers concise delivery and wants docs updated with feature work.",
+            "cli:direct",
+            "cli",
+            "direct",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(response.content.contains("Memorized into permanent memory"));
+
+    let memory =
+        std::fs::read_to_string(workspace_state_dir(dir.path()).join("memory/MEMORY.md")).unwrap();
+    assert!(memory.contains("User Instructed Memory"));
+    assert!(memory.contains("User prefers concise delivery"));
+    assert!(memory.contains("Docs should stay in sync with shipped changes."));
+}
+
+#[tokio::test]
 async fn help_command_preserves_inbound_metadata() {
     let dir = tempdir().unwrap();
     let agent = AgentLoop::new(
@@ -512,6 +809,7 @@ async fn help_command_preserves_inbound_metadata() {
         Some("test-model".to_string()),
         8,
         8_000,
+        32 * 1024,
         Default::default(),
         None,
         ExecToolConfig {
@@ -549,5 +847,8 @@ async fn help_command_preserves_inbound_metadata() {
         .unwrap();
 
     assert_eq!(response.metadata, metadata);
-    assert_eq!(response.content, "/new (or clear)\n/stop\n/status\n/help");
+    assert_eq!(
+        response.content,
+        "/new (or clear)\n/stop\n/memorize <text>\n/status\n/help"
+    );
 }

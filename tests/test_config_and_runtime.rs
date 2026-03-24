@@ -18,6 +18,7 @@ fn load_config_keeps_max_tokens_and_ignores_legacy_memory_window() {
             "agents": {
                 "defaults": {
                     "maxTokens": 1234,
+                    "memoryMaxBytes": 4096,
                     "memoryWindow": 42
                 }
             }
@@ -28,12 +29,14 @@ fn load_config_keeps_max_tokens_and_ignores_legacy_memory_window() {
 
     let config = Config::load(Some(&config_path)).unwrap();
     assert_eq!(config.agents.defaults.max_tokens, 1234);
+    assert_eq!(config.agents.defaults.memory_max_bytes, 4096);
     assert_eq!(config.agents.defaults.context_window_tokens, 65_536);
     let saved_path = config.save(Some(&config_path)).unwrap();
     let saved: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(saved_path).unwrap()).unwrap();
     let defaults = &saved["agents"]["defaults"];
     assert!(defaults.get("memoryWindow").is_none());
+    assert_eq!(defaults["memoryMaxBytes"], json!(4096));
 }
 
 #[test]
@@ -104,6 +107,7 @@ async fn runtime_processes_bus_messages_and_message_tool_delivers_outbound() {
             Some("test-model".to_string()),
             4,
             8_000,
+            32 * 1024,
             Default::default(),
             None,
             ExecToolConfig {

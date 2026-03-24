@@ -22,6 +22,13 @@ The runtime already includes the main components required for unattended operati
 - OpenAI-compatible local or remote providers
 - admin API/UI and metrics
 
+Memory behavior:
+
+- `MEMORY.md` is permanent memory and is trimmed to `agents.defaults.memoryMaxBytes`
+- finished user tasks are summarized into `MEMORY.md`
+- `memorize` / `/memorize <text>` writes user-directed durable memory
+- `clear` / `/clear` restores `HISTORY.md` to the default template for the workspace
+
 ## Built-in Skills
 
 Built-in skills live under `rbot/skills/` and are loaded by the runtime automatically.
@@ -161,3 +168,4 @@ Recommended pattern:
 - Local providers can run without API keys when recognized as local.
 - MCP configuration errors fail fast at startup.
 - The admin API redacts secrets from the exposed config payload.
+- Durable memory writes use the `memory-entry-writer` skill plus a short model summarization pass, with heuristic fallback if the provider summary fails.

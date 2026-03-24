@@ -212,15 +212,29 @@ For project-local development, set:
 
 `rbot` uses two memory files inside `workspace/.rbot/`:
 
-- `.rbot/memory/MEMORY.md`: active long-term context loaded into the prompt
-- `.rbot/memory/HISTORY.md`: append-only history log for later search and consolidation
+- `.rbot/memory/MEMORY.md`: permanent memory store, capped at `agents.defaults.memoryMaxBytes` bytes
+- `.rbot/memory/HISTORY.md`: resettable history log for later search and consolidation
 
 Operational rule:
 
-- durable facts belong in `MEMORY.md`
-- past events, experiments, and transcripts belong in `HISTORY.md`
+- completed user tasks are summarized into `MEMORY.md` with title, summary, attention points, and finish time through the `memory-entry-writer` skill
+- explicit `memorize` or `/memorize <text>` requests are summarized through the same skill and stored in `MEMORY.md` as user instructed memory
+- new tasks load only topic-relevant slices from `MEMORY.md`, not the entire file
+- `clear` / `/clear` / `new` / `/new` resets the current session and restores `HISTORY.md` to the default template
 
-New workspaces now include starter guidance and an always-on memory skill so the agent is explicitly instructed to promote durable context into `MEMORY.md`.
+New workspaces now include starter guidance, an always-on memory skill, and a dedicated `memory-entry-writer` skill so memory writes stay compact instead of copying large reply fragments.
+
+Example config:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "memoryMaxBytes": 32768
+    }
+  }
+}
+```
 
 ### Long-running backend
 
@@ -515,6 +529,7 @@ Built-in skills ship with the repository under `rbot/skills/`.
 Current built-in set:
 
 - `memory-hygiene`
+- `memory-entry-writer`
 - `workspace-operator`
 - `software-engineer`
 - `data-analyst`

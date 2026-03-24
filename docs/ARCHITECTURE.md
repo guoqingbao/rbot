@@ -18,9 +18,9 @@ This keeps transport, orchestration, and model execution separate.
 | Module | Responsibility |
 | --- | --- |
 | `src/engine/orchestrator.rs` | Agent turn loop, session commands, tool iteration |
-| `src/engine/context.rs` | Runtime context assembly from workspace files and media |
+| `src/engine/context.rs` | Runtime context assembly from workspace files, media, and topic-relevant memory |
 | `src/storage/session_store.rs` | JSONL-backed session storage |
-| `src/engine/memory.rs` | Long-term memory archiving and consolidation policy |
+| `src/engine/memory.rs` | Permanent memory storage, history reset, relevance filtering, and consolidation policy |
 | `src/tools.rs` | Tool registry and built-in tool implementations |
 | `src/runtime/worker.rs` | Bus worker that connects inbound messages to the agent |
 | `src/channels/` | Transport adapters and channel manager |
@@ -59,6 +59,8 @@ The bus is the seam between transport and reasoning. Channels do not call the ag
 ### Persistent workspace state
 
 Sessions, memory files, cron jobs, and skills are stored on disk so the runtime can be restarted without losing state.
+
+`MEMORY.md` is the permanent store for durable facts and structured task summaries, while `HISTORY.md` is a resettable event log. The context builder reads only memory slices relevant to the current task instead of injecting the whole file. Completed tasks and `/memorize` requests are condensed into structured memory entries through the `memory-entry-writer` skill before they are appended.
 
 ### OpenAI-compatible provider contract
 

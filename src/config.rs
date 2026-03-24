@@ -21,6 +21,8 @@ pub struct AgentDefaults {
     pub temperature: f32,
     #[serde(alias = "maxToolIterations")]
     pub max_tool_iterations: usize,
+    #[serde(alias = "memoryMaxBytes")]
+    pub memory_max_bytes: usize,
 }
 
 impl Default for AgentDefaults {
@@ -33,6 +35,7 @@ impl Default for AgentDefaults {
             context_window_tokens: 65_536,
             temperature: 0.1,
             max_tool_iterations: 0,
+            memory_max_bytes: 32 * 1024,
         }
     }
 }
@@ -350,6 +353,7 @@ impl Config {
                     "contextWindowTokens": self.agents.defaults.context_window_tokens,
                     "temperature": self.agents.defaults.temperature,
                     "maxToolIterations": self.agents.defaults.max_tool_iterations,
+                    "memoryMaxBytes": self.agents.defaults.memory_max_bytes,
                 }
             },
             "providers": providers,

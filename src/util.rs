@@ -6,6 +6,59 @@ use base64::Engine;
 use chrono::Local;
 use serde_json::{Value, json};
 
+pub const DEFAULT_MEMORY_TEMPLATE: &str = r#"# Long-Term Memory
+
+This file is the agent's permanent memory. Keep it concise, current, and durable.
+
+## What Belongs Here
+
+- Stable project architecture facts
+- Repository conventions and workflows
+- User preferences that affect future work
+- Important decisions that should survive conversation resets
+- Structured task summaries worth recalling later
+
+## What Does Not Belong Here
+
+- Full chat transcripts
+- Temporary debugging notes
+- Large logs or raw command output
+
+## Suggested Sections
+
+### Project
+
+- Purpose:
+- Important directories:
+- Build/test commands:
+
+### Conventions
+
+- Code style:
+- Review expectations:
+- Release rules:
+
+### User
+
+- Preferences:
+- Communication style:
+- Important standing requests:
+
+## Memory Entries
+
+Add durable entries below. Keep the newest relevant entries near the end.
+"#;
+
+pub const DEFAULT_HISTORY_TEMPLATE: &str = r#"# History Log
+
+Append-only event log for conversation and memory consolidation.
+
+- Search this file when you need to recall past events.
+- Do not rely on this file as active context.
+- Promote durable facts from here into `MEMORY.md` when they matter long term.
+
+"#;
+
 pub fn ensure_dir(path: impl AsRef<Path>) -> Result<PathBuf> {
     let path = path.as_ref();
     fs::create_dir_all(path)?;
@@ -267,55 +320,11 @@ Document project-specific commands, wrappers, and operational caveats here.
         ),
         (
             state_dir.join("memory").join("MEMORY.md"),
-            r#"# Long-Term Memory
-
-This file is loaded into the agent context. Keep it concise, current, and durable.
-
-## What Belongs Here
-
-- Stable project architecture facts
-- Repository conventions and workflows
-- User preferences that affect future work
-- Important decisions that should survive conversation resets
-
-## What Does Not Belong Here
-
-- Full chat transcripts
-- Temporary debugging notes
-- Large logs or raw command output
-
-## Suggested Sections
-
-### Project
-
-- Purpose:
-- Important directories:
-- Build/test commands:
-
-### Conventions
-
-- Code style:
-- Review expectations:
-- Release rules:
-
-### User
-
-- Preferences:
-- Communication style:
-- Important standing requests:
-"#,
+            DEFAULT_MEMORY_TEMPLATE,
         ),
         (
             state_dir.join("memory").join("HISTORY.md"),
-            r#"# History Log
-
-Append-only event log for conversation and memory consolidation.
-
-- Search this file when you need to recall past events.
-- Do not rely on this file as active context.
-- Promote durable facts from here into `MEMORY.md` when they matter long term.
-
-"#,
+            DEFAULT_HISTORY_TEMPLATE,
         ),
         (
             state_dir
@@ -409,6 +418,38 @@ Use this file to document how work should be delivered in this project.
 - If a rule becomes universal for the workspace, also capture it in `memory/MEMORY.md`.
 "#,
         ),
+        (
+            state_dir
+                .join("skills")
+                .join("memory-entry-writer")
+                .join("SKILL.md"),
+            r#"---
+description: "Summarize durable memory entries for MEMORY.md after task completion or explicit memorize requests."
+metadata: {"rbot":{"triggers":["memory entry","task summary","memorize","durable memory"]}}
+---
+
+# Memory Entry Writer
+
+Use this skill when converting raw task output or user-provided durable facts into a compact `memory/MEMORY.md` entry.
+
+## Output Shape
+
+Return JSON only:
+
+```json
+{"title":"...","summary":"...","attention_points":["..."]}
+```
+
+## Rules
+
+- `title`: plain text, short, specific, no markdown, under 80 characters
+- `summary`: plain text, 1-2 short sentences, under 240 characters
+- `attention_points`: short durable cautions, follow-ups, or constraints; use `[]` when empty
+- Keep only durable facts worth remembering across sessions
+- Do not copy code blocks, long quotes, raw logs, transcript filler, or markdown headings
+- Prefer the repository, workflow, bug, decision, or user preference that will matter later
+"#,
+        ),
     ];
     ensure_dir(workspace)?;
     ensure_dir(state_dir.join("skills"))?;
@@ -471,6 +512,11 @@ mod tests {
         assert!(state_dir.join("skills/memory-hygiene/SKILL.md").is_file());
         assert!(state_dir.join("skills/project-context/SKILL.md").is_file());
         assert!(state_dir.join("skills/delivery-rules/SKILL.md").is_file());
+        assert!(
+            state_dir
+                .join("skills/memory-entry-writer/SKILL.md")
+                .is_file()
+        );
         assert!(
             created
                 .iter()

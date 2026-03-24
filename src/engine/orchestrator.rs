@@ -3,14 +3,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use regex::Regex;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::{ExecToolConfig, WebSearchConfig};
 use crate::cron::CronService;
-use crate::engine::{ContextBuilder, MemoryConsolidator, SubagentManager};
+use crate::engine::{
+    ContextBuilder, MemoryConsolidator, MemoryEntry, MemoryEntryKind, SkillsLoader, SubagentManager,
+};
 use crate::integrations::mcp::register_mcp_tools;
 use crate::providers::{LlmResponse, SharedProvider, TextStreamCallback};
 use crate::storage::{
@@ -64,6 +67,7 @@ impl AgentLoop {
         model: Option<String>,
         max_iterations: usize,
         context_window_tokens: usize,
+        max_memory_bytes: usize,
         web_search: WebSearchConfig,
         web_proxy: Option<String>,
         exec: ExecToolConfig,
@@ -72,9 +76,9 @@ impl AgentLoop {
         mcp_servers: &BTreeMap<String, crate::config::McpServerConfig>,
     ) -> Result<Self> {
         let workspace = workspace.as_ref().to_path_buf();
-        let context = ContextBuilder::new(&workspace)?;
+        let context = ContextBuilder::new(&workspace, max_memory_bytes)?;
         let sessions = SessionManager::new(&workspace)?;
-        let memory = MemoryConsolidator::new(&workspace, context_window_tokens)?;
+        let memory = MemoryConsolidator::new(&workspace, context_window_tokens, max_memory_bytes)?;
         let resolved_model = model
             .clone()
             .unwrap_or_else(|| provider.default_model().to_string());
@@ -217,6 +221,14 @@ impl AgentLoop {
         if trimmed == "/stop" || trimmed == "stop" || trimmed == "[stop]" {
             return self.handle_stop_signal(&msg, &target).await;
         }
+        if let Some(memory_input) = parse_memorize_command(&msg.content) {
+            return match self.handle_memorize_signal(&target, &memory_input).await {
+                Ok(response) => Ok(response),
+                Err(err) => Ok(Some(
+                    target.outbound(format!("Unable to memorize input: {err}")),
+                )),
+            };
+        }
 
         let session_key = msg.session_key();
 
@@ -234,23 +246,20 @@ impl AgentLoop {
 
             match trimmed.as_str() {
                 "/new" | "new" | "/clear" | "clear" | "[clear]" => {
-                    let snapshot = session.messages[session.last_consolidated..].to_vec();
                     session.clear();
                     sessions.save(&session)?;
-                    if !snapshot.is_empty() {
-                        self.memory.archive_messages(&snapshot)?;
-                    }
-                    return Ok(Some(
-                        target.outbound("New session started. Memory cleared."),
-                    ));
+                    self.memory.store().reset_history()?;
+                    return Ok(Some(target.outbound(
+                        "New session started. Session cleared and history reset.",
+                    )));
                 }
                 "/status" | "status" => {
                     return Ok(Some(self.status_response(&msg, &session)));
                 }
                 "/help" | "help" => {
-                    return Ok(Some(
-                        target.outbound("/new (or clear)\n/stop\n/status\n/help"),
-                    ));
+                    return Ok(Some(target.outbound(
+                        "/new (or clear)\n/stop\n/memorize <text>\n/status\n/help",
+                    )));
                 }
                 _ => {}
             }
@@ -344,6 +353,8 @@ impl AgentLoop {
             ),
         )
         .await;
+        self.record_completed_task_memory(&msg.content, final_content.as_deref(), &all_messages)
+            .await;
 
         if self.message_tool.sent_in_turn() {
             return Ok(None);
@@ -466,7 +477,8 @@ impl AgentLoop {
         *self.last_usage.lock().expect("usage lock poisoned") = (0, 0);
         let mut final_content = None;
         let think_re = Regex::new(r"(?s)<think>.*?</think>").expect("valid think regex");
-        let mut tool_fingerprint_history: Vec<String> = Vec::new();
+        let mut last_tool_call_fingerprint: Option<String> = None;
+        let mut repeated_tool_call_streak = 0_usize;
         let mut last_assistant_content: Option<String> = None;
 
         let mut iteration = 0_usize;
@@ -514,17 +526,12 @@ impl AgentLoop {
             }
 
             if response.has_tool_calls() {
-                // Improve repeated tool detection: check for identical fingerprint anywhere in recent history
-                let tool_call_fingerprint = serde_json::to_string(&response.tool_calls)
-                    .unwrap_or_else(|_| format!("{:?}", response.tool_calls));
-
-                let repeated = tool_fingerprint_history
-                    .iter()
-                    .any(|h| h == &tool_call_fingerprint);
-
-                tool_fingerprint_history.push(tool_call_fingerprint);
-                if tool_fingerprint_history.len() > 10 {
-                    tool_fingerprint_history.remove(0);
+                let tool_call_fingerprint = normalize_tool_call_fingerprint(&response.tool_calls);
+                if last_tool_call_fingerprint.as_deref() == Some(tool_call_fingerprint.as_str()) {
+                    repeated_tool_call_streak += 1;
+                } else {
+                    repeated_tool_call_streak = 1;
+                    last_tool_call_fingerprint = Some(tool_call_fingerprint);
                 }
 
                 let tool_calls = response
@@ -586,20 +593,13 @@ impl AgentLoop {
                     }
                 }
 
-                if repeated {
-                    // Check if we've seen this exact same pattern multiple times in this turn
-                    let count = tool_fingerprint_history
-                        .iter()
-                        .filter(|h| h.as_str() == tool_fingerprint_history.last().unwrap().as_str())
-                        .count();
-                    if count >= 3 {
-                        final_content = Some(build_repeated_tool_loop_message(
-                            count,
-                            &messages,
-                            last_assistant_content.as_deref(),
-                        ));
-                        break;
-                    }
+                if repeated_tool_call_streak >= 30 {
+                    final_content = Some(build_repeated_tool_loop_message(
+                        repeated_tool_call_streak,
+                        &messages,
+                        last_assistant_content.as_deref(),
+                    ));
+                    break;
                 }
             } else {
                 let content = response
@@ -766,6 +766,38 @@ impl AgentLoop {
         ))
     }
 
+    async fn handle_memorize_signal(
+        &self,
+        target: &ProgressTarget,
+        memory_input: &str,
+    ) -> Result<Option<OutboundMessage>> {
+        if memory_input.trim().is_empty() {
+            return Ok(Some(
+                target.outbound("Usage: /memorize <durable information to remember>"),
+            ));
+        }
+        let entry = self
+            .build_memory_entry_with_skill(
+                MemoryEntryKind::UserInstructed,
+                memory_input,
+                Some(memory_input),
+            )
+            .await
+            .unwrap_or_else(|err| {
+                eprintln!("failed to summarize user memory entry with skill: {err}");
+                build_memory_entry(
+                    MemoryEntryKind::UserInstructed,
+                    memory_input,
+                    Some(memory_input),
+                )
+            });
+        self.memory.store().append_memory_entry(&entry)?;
+        Ok(Some(target.outbound(format!(
+            "Memorized into permanent memory: {}",
+            entry.title
+        ))))
+    }
+
     fn runtime_reply_sender(&self) -> Option<MessageSendCallback> {
         self.progress_sender
             .lock()
@@ -862,6 +894,86 @@ impl AgentLoop {
             let message = failure_message.unwrap_or_else(|| "Unable to stop task.".to_string());
             self.send_runtime_reply(&notification.target, message).await;
         }
+    }
+
+    async fn record_completed_task_memory(
+        &self,
+        task_text: &str,
+        final_content: Option<&str>,
+        messages: &[ChatMessage],
+    ) {
+        let summary_source = final_content
+            .map(ToOwned::to_owned)
+            .or_else(|| latest_assistant_text(messages))
+            .unwrap_or_else(|| task_text.to_string());
+        let entry = self
+            .build_memory_entry_with_skill(
+                MemoryEntryKind::TaskSummary,
+                task_text,
+                Some(&summary_source),
+            )
+            .await
+            .unwrap_or_else(|err| {
+                eprintln!("failed to summarize task memory entry with skill: {err}");
+                build_memory_entry(
+                    MemoryEntryKind::TaskSummary,
+                    task_text,
+                    Some(&summary_source),
+                )
+            });
+        if let Err(err) = self.memory.store().append_memory_entry(&entry) {
+            eprintln!("failed to append task summary to memory: {err}");
+        }
+    }
+
+    async fn build_memory_entry_with_skill(
+        &self,
+        kind: MemoryEntryKind,
+        task_text: &str,
+        summary_source: Option<&str>,
+    ) -> Result<MemoryEntry> {
+        let source = summary_source.unwrap_or(task_text);
+        let skill = SkillsLoader::new(&self.workspace, None)
+            .load_skills_for_context(&["memory-entry-writer".to_string()]);
+        let system_prompt = if skill.trim().is_empty() {
+            default_memory_entry_writer_prompt().to_string()
+        } else {
+            format!(
+                "{skill}\n\nReturn only valid JSON with keys `title`, `summary`, and `attention_points`."
+            )
+        };
+        let user_prompt = format!(
+            "Memory entry type: {}\n\nPrimary input:\n{}\n\nSource material to summarize:\n{}",
+            memory_entry_kind_label(kind),
+            task_text.trim(),
+            source.trim()
+        );
+        let response = self
+            .provider
+            .chat_with_retry(
+                &[
+                    ChatMessage::text("system", system_prompt),
+                    ChatMessage::text("user", user_prompt),
+                ],
+                None,
+                Some(&self.model),
+                Some(400),
+                Some(0.1),
+            )
+            .await
+            .context("memory summary request failed")?;
+        let content = response
+            .content
+            .filter(|text| !text.trim().is_empty())
+            .context("memory summary response was empty")?;
+        let parsed = parse_memory_entry_response(&content)?;
+        Ok(MemoryEntry {
+            kind,
+            title: sanitize_memory_title(&parsed.title, task_text),
+            summary: sanitize_memory_summary(&parsed.summary, source),
+            attention_points: sanitize_attention_points(parsed.attention_points),
+            recorded_at: crate::util::now_iso(),
+        })
     }
 
     fn status_response(&self, msg: &InboundMessage, session: &Session) -> OutboundMessage {
@@ -1033,6 +1145,237 @@ fn special_command_action(trimmed: &str) -> Option<&'static str> {
         "/help" | "help" => Some("show help"),
         _ => None,
     }
+}
+
+fn parse_memorize_command(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    for prefix in ["/memorize", "memorize", "[memorize]"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                return Some(rest.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn build_memory_entry(
+    kind: MemoryEntryKind,
+    task_text: &str,
+    summary_source: Option<&str>,
+) -> MemoryEntry {
+    let title = summarize_title(task_text);
+    let summary = summarize_body(summary_source.unwrap_or(task_text));
+    let attention_points = extract_attention_points(summary_source.unwrap_or(task_text));
+    MemoryEntry {
+        kind,
+        title,
+        summary,
+        attention_points,
+        recorded_at: crate::util::now_iso(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryEntrySummary {
+    title: String,
+    summary: String,
+    #[serde(default)]
+    attention_points: Vec<String>,
+}
+
+fn summarize_title(text: &str) -> String {
+    let candidate = text
+        .split(['\n', '.', '!', '?'])
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("Task");
+    truncate_plain(candidate, 80)
+}
+
+fn summarize_body(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = if collapsed.is_empty() {
+        "No summary recorded.".to_string()
+    } else {
+        collapsed
+    };
+    truncate_plain(&normalized, 320)
+}
+
+fn sanitize_memory_title(title: &str, fallback: &str) -> String {
+    let collapsed = collapse_plain_text(title);
+    if collapsed.is_empty() {
+        summarize_title(fallback)
+    } else {
+        truncate_plain(&collapsed, 80)
+    }
+}
+
+fn sanitize_memory_summary(summary: &str, fallback: &str) -> String {
+    let collapsed = collapse_plain_text(summary);
+    if collapsed.is_empty() {
+        summarize_body(fallback)
+    } else {
+        truncate_plain(&collapsed, 240)
+    }
+}
+
+fn sanitize_attention_points(points: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+    for point in points {
+        let collapsed = collapse_plain_text(&point);
+        if collapsed.is_empty() {
+            continue;
+        }
+        let shortened = truncate_plain(&collapsed, 140);
+        let key = shortened.to_ascii_lowercase();
+        if seen.insert(key) {
+            normalized.push(shortened);
+        }
+        if normalized.len() >= 5 {
+            break;
+        }
+    }
+    normalized
+}
+
+fn extract_attention_points(text: &str) -> Vec<String> {
+    let mut points = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.starts_with("- ")
+                || line.starts_with("* ")
+                || line
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_digit() && line.contains('.'))
+                || line.to_ascii_lowercase().contains("attention")
+                || line.to_ascii_lowercase().contains("warning")
+                || line.to_ascii_lowercase().contains("follow up")
+                || line.to_ascii_lowercase().contains("next step")
+        })
+        .map(|line| {
+            line.trim_start_matches(|ch: char| {
+                ch == '-' || ch == '*' || ch.is_ascii_digit() || ch == '.' || ch == ' '
+            })
+            .trim()
+            .to_string()
+        })
+        .filter(|line| !line.is_empty())
+        .take(5)
+        .collect::<Vec<_>>();
+    points.sort();
+    points.dedup();
+    points
+}
+
+fn parse_memory_entry_response(content: &str) -> Result<MemoryEntrySummary> {
+    for candidate in extract_json_candidates(content) {
+        if let Ok(parsed) = serde_json::from_str::<MemoryEntrySummary>(&candidate) {
+            return Ok(parsed);
+        }
+    }
+    Err(anyhow::anyhow!(
+        "memory summary response was not valid JSON: {}",
+        truncate_plain(content, 160)
+    ))
+}
+
+fn extract_json_candidates(content: &str) -> Vec<String> {
+    let trimmed = content.trim();
+    let mut candidates = Vec::new();
+    if !trimmed.is_empty() {
+        candidates.push(trimmed.to_string());
+    }
+    if let Some(stripped) = strip_code_fence(trimmed) {
+        candidates.push(stripped);
+    }
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if end >= start {
+            candidates.push(trimmed[start..=end].to_string());
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn strip_code_fence(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if !trimmed.starts_with("```") || !trimmed.ends_with("```") {
+        return None;
+    }
+    let body = trimmed
+        .trim_start_matches("```json")
+        .trim_start_matches("```JSON")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    (!body.is_empty()).then_some(body.to_string())
+}
+
+fn latest_assistant_text(messages: &[ChatMessage]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+        .and_then(ChatMessage::content_as_text)
+}
+
+fn truncate_plain(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut shortened = trimmed.chars().take(max_chars).collect::<String>();
+    shortened.push_str("...");
+    shortened
+}
+
+fn collapse_plain_text(text: &str) -> String {
+    text.replace('\n', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn memory_entry_kind_label(kind: MemoryEntryKind) -> &'static str {
+    match kind {
+        MemoryEntryKind::TaskSummary => "Task Summary",
+        MemoryEntryKind::UserInstructed => "User Instructed Memory",
+    }
+}
+
+fn default_memory_entry_writer_prompt() -> &'static str {
+    "You write concise durable memory entries for MEMORY.md.\n\
+\n\
+Summarize the provided material into a compact JSON object for long-term memory.\n\
+\n\
+Rules:\n\
+- Title: plain text, short, specific, under 80 characters.\n\
+- Summary: plain text, 1-2 short sentences, under 240 characters.\n\
+- attention_points: array of short plain-text bullets. Include only durable cautions, follow-ups, or constraints. Use an empty array when there is nothing important.\n\
+- Do not copy raw markdown sections, code blocks, URLs, transcripts, or large excerpts.\n\
+- Prefer durable facts over narration.\n\
+\n\
+Return only JSON with this shape:\n\
+{\"title\":\"...\",\"summary\":\"...\",\"attention_points\":[\"...\"]}"
+}
+
+fn normalize_tool_call_fingerprint(tool_calls: &[crate::providers::ToolCallRequest]) -> String {
+    let normalized = tool_calls
+        .iter()
+        .map(|call| {
+            serde_json::json!({
+                "name": call.name,
+                "arguments": call.arguments,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&normalized).unwrap_or_else(|_| format!("{normalized:?}"))
 }
 
 fn format_tool_hint(tool_call: &crate::providers::ToolCallRequest) -> String {

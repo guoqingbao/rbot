@@ -663,7 +663,8 @@ impl CliShell {
         println!(
             "{} {}",
             self.style.dim("╰ commands  "),
-            self.style.dim("/help  /clear  /exit  /new  /status  /stop")
+            self.style
+                .dim("/help  /clear  /exit  /new  /memorize <text>  /status  /stop")
         );
     }
 
@@ -709,8 +710,7 @@ impl CliShell {
                 }
                 Some(LocalCommand::Clear) => {
                     self.clear_screen();
-                    self.footer.render_current();
-                    continue;
+                    return Ok(InputEvent::Prompt(trimmed.to_string()));
                 }
                 None => {}
             }
@@ -736,9 +736,13 @@ impl CliShell {
         println!(
             "{} {}",
             self.style.dim("│ local    "),
-            "/help  /clear  /exit  /stop"
+            "/help  /clear(screen+reset)  /exit  /stop"
         );
-        println!("{} {}", self.style.dim("│ agent    "), "/new  /status");
+        println!(
+            "{} {}",
+            self.style.dim("│ agent    "),
+            "/new  /memorize <text>  /status"
+        );
         println!(
             "{} {}",
             self.style.dim("│ input    "),

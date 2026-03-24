@@ -371,6 +371,7 @@ async fn admin_gateway_exposes_overview_and_metrics() {
             Some("ollama/qwen2.5-coder:7b".to_string()),
             4,
             8_000,
+            32 * 1024,
             Default::default(),
             None,
             ExecToolConfig::default(),

@@ -5,6 +5,7 @@
 ## ✨ Features
 
 - 🧠 **Persistent Agent Runtime** - Long-running agent runtime with persistent sessions and memory files
+- 📝 **Permanent Memory Capture** - Automatic task summaries, explicit `/memorize` support, and topic-relevant memory lookup
 - 🛠️ **Rich Toolset** - Filesystem, shell, web fetch, web search, messaging, cron, and background-task tools
 - 🌐 **Provider Integration** - OpenAI-compatible provider integration, including local engines that expose OpenAI-style APIs
 - 🔌 **MCP Support** - MCP stdio tool integration for external tool servers
@@ -29,9 +30,10 @@ cargo run --release -- onboard
 This will generate:
 
 ```python
-# Default config file
-Config: /root/.rbot/config.json
-Workspace: /root/.rbot/workspace
+# Global config file
+Config: ~/.rbot/config.json
+# Global workspace
+Workspace: ~/.rbot/workspace
 ```
 
 ### Config Providers
@@ -43,12 +45,7 @@ You can configure them interactively:
 cargo run --release -- config --provider
 ```
 
-Or manually edit `~/.rbot/config.json`. **Examples:**
-
-- 🌐 OpenAI API
-- 🐋 Ollama at `http://localhost:11434/v1`
-- 🚀 vLLM at `http://localhost:8000/v1`
-- 🛠️ LM Studio or any other OpenAI-compatible local server via `providers.custom.apiBase`
+Or manually edit `~/.rbot/config.json`. Refer to: [Getting Started](./docs/USAGE.md)
 
 ### Config Communication Channels
 
@@ -65,13 +62,18 @@ This tool helps you selectively enable channels, set permissions, and provide re
 > [!TIP]
 > **Slack Users:** To set up your Slack App for use with `rbot` (including Webhook and Socket Mode instructions), refer to the [OpenClaw Slack Manual](https://www.meta-intelligence.tech/en/insight-openclaw-slack).
 
-### Run a one-shot prompt:
+
+## 🧾Usage
+
+## CLI usage
+
+### One-shot prompt:
 
 ```bash
 cargo run --release -- chat "summarize the repository structure"
 ```
 
-### Open the interactive shell for vibe coding:
+### Interactive shell:
 
 ```bash
 cargo run --release -- repl
@@ -81,18 +83,16 @@ The CLI includes:
 - 📡 Streamed responses
 - 📜 Persistent history
 - 💻 Local shell commands such as `/help` and `/clear`
-- 🤖 Agent commands such as `/new`, `/clear`, `/status`, and `/stop`
+- 🤖 Agent commands such as `/new`, `/clear`, `/memorize <text>`, `/status`, and `/stop`
 
+## ⚡ Backend Bot
 ### Start the backend (Personal AI Assistant):
 
 ```bash
 cargo run --release -- run
 ```
 
-This starts the runtime and gateway even if no inbound channels are enabled yet.
-With zero channels configured, `rbot` still serves the admin/status surfaces; enable
-`email`, `slack`, `telegram`, or `feishu` in `/root/.rbot/config.json` when you want
-message ingress and delivery.
+Sending task(s) to `rbot` using configured channels (such as Slack APP).
 
 ### Check runtime configuration and local state:
 
@@ -117,7 +117,8 @@ cargo run --release -- jobs
 When messaging the bot through Slack, Telegram, or other channels, you can send these signals as standalone messages:
 
 - `stop` or `/stop` - Immediately stop the current agent task and cancel running subagents.
-- `clear`, `new`, `/clear`, or `/new` - Reset the bot's memory for the current session.
+- `clear`, `new`, `/clear`, or `/new` - Start a new session and restore `.rbot/memory/HISTORY.md` to the default template.
+- `memorize <text>` or `/memorize <text>` - Store durable user-directed memory in `.rbot/memory/MEMORY.md` through the `memory-entry-writer` summarization skill.
 - `status` or `/status` - Get the current version and runtime usage stats.
 - `help` or `/help` - Show available commands.
 

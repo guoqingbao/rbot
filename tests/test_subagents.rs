@@ -120,6 +120,7 @@ async fn runtime_routes_completed_subagent_back_to_origin_chat() {
             Some("test-model".to_string()),
             6,
             8_000,
+            32 * 1024,
             Default::default(),
             None,
             ExecToolConfig {
@@ -180,6 +181,7 @@ async fn stop_command_cancels_active_subagent_tasks() {
         Some("test-model".to_string()),
         6,
         8_000,
+        32 * 1024,
         Default::default(),
         None,
         ExecToolConfig {
@@ -227,6 +229,7 @@ async fn runtime_stop_command_acknowledges_and_confirms_subagent_cancellation() 
             Some("test-model".to_string()),
             6,
             8_000,
+            32 * 1024,
             Default::default(),
             None,
             ExecToolConfig {
