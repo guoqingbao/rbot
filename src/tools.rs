@@ -1499,12 +1499,12 @@ impl SpawnTool {
         }
     }
 
-    pub fn set_context(&self, channel: &str, chat_id: &str) {
+    pub fn set_context(&self, channel: &str, chat_id: &str, session_key: &str) {
         let mut origin = self.origin.lock().expect("spawn context lock poisoned");
         *origin = (
             channel.to_string(),
             chat_id.to_string(),
-            format!("{channel}:{chat_id}"),
+            session_key.to_string(),
         );
     }
 }

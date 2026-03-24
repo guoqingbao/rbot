@@ -1,11 +1,14 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use rbot::config::ExecToolConfig;
 use rbot::engine::AgentLoop;
 use rbot::providers::{LlmProvider, LlmResponse, LlmUsage, QueuedProvider, ToolCallRequest};
-use rbot::storage::{ChatMessage, SessionManager};
+use rbot::runtime::AgentRuntime;
+use rbot::storage::{ChatMessage, InboundMessage, MessageBus, SessionManager};
 use serde_json::Value;
 use serde_json::json;
 use tempfile::tempdir;
@@ -329,4 +332,222 @@ async fn agent_loop_honors_stop_command() {
 
     let result = handle.await.unwrap().unwrap();
     assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn stop_command_does_not_block_the_next_prompt() {
+    let dir = tempdir().unwrap();
+    let provider = Arc::new(SlowQueuedProvider {
+        inner: QueuedProvider::new(
+            "test-model",
+            vec![
+                LlmResponse {
+                    content: Some("first response".to_string()),
+                    tool_calls: Vec::new(),
+                    finish_reason: "stop".to_string(),
+                    usage: LlmUsage::default(),
+                    reasoning_content: None,
+                    thinking_blocks: None,
+                },
+                LlmResponse {
+                    content: Some("second response".to_string()),
+                    tool_calls: Vec::new(),
+                    finish_reason: "stop".to_string(),
+                    usage: LlmUsage::default(),
+                    reasoning_content: None,
+                    thinking_blocks: None,
+                },
+            ],
+        ),
+        delay: Duration::from_millis(50),
+    });
+    let agent = Arc::new(
+        AgentLoop::new(
+            provider,
+            dir.path(),
+            Some("test-model".to_string()),
+            8,
+            8_000,
+            Default::default(),
+            None,
+            ExecToolConfig {
+                enable: false,
+                timeout: 60,
+                path_append: String::new(),
+            },
+            false,
+            None,
+            &Default::default(),
+        )
+        .await
+        .unwrap(),
+    );
+
+    let agent_clone = agent.clone();
+    let handle = tokio::spawn(async move {
+        agent_clone
+            .process_direct("first prompt", "cli:direct", "cli", "direct")
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let stop_response = agent
+        .process_direct("/stop", "cli:direct", "cli", "direct")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stop_response.content, "Stopping current turn...");
+    assert!(handle.await.unwrap().unwrap().is_none());
+
+    let next = agent
+        .process_direct("second prompt", "cli:direct", "cli", "direct")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.content, "second response");
+}
+
+#[tokio::test]
+async fn runtime_stop_command_sends_threaded_ack_and_completion() {
+    let dir = tempdir().unwrap();
+    let provider = Arc::new(SlowQueuedProvider {
+        inner: QueuedProvider::new(
+            "test-model",
+            vec![LlmResponse {
+                content: Some("should not be delivered".to_string()),
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: LlmUsage::default(),
+                reasoning_content: None,
+                thinking_blocks: None,
+            }],
+        ),
+        delay: Duration::from_millis(75),
+    });
+    let agent = Arc::new(
+        AgentLoop::new(
+            provider,
+            dir.path(),
+            Some("test-model".to_string()),
+            8,
+            8_000,
+            Default::default(),
+            None,
+            ExecToolConfig {
+                enable: false,
+                timeout: 60,
+                path_append: String::new(),
+            },
+            false,
+            None,
+            &Default::default(),
+        )
+        .await
+        .unwrap(),
+    );
+    let bus = MessageBus::new(16);
+    let runtime = AgentRuntime::new(agent, bus.clone());
+    runtime.start().await.unwrap();
+
+    let session_key = "slack:C123:1700000000.000100".to_string();
+    let slack_metadata = BTreeMap::from([(
+        "slack".to_string(),
+        json!({
+            "thread_ts": "1700000000.000100",
+            "channel_type": "channel",
+        }),
+    )]);
+
+    bus.publish_inbound(InboundMessage {
+        channel: "slack".to_string(),
+        sender_id: "u1".to_string(),
+        chat_id: "C123".to_string(),
+        content: "work on this".to_string(),
+        timestamp: chrono::Utc::now(),
+        media: Vec::new(),
+        metadata: slack_metadata.clone(),
+        session_key_override: Some(session_key.clone()),
+    })
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    bus.publish_inbound(InboundMessage {
+        channel: "slack".to_string(),
+        sender_id: "u1".to_string(),
+        chat_id: "C123".to_string(),
+        content: "/stop".to_string(),
+        timestamp: chrono::Utc::now(),
+        media: Vec::new(),
+        metadata: slack_metadata.clone(),
+        session_key_override: Some(session_key),
+    })
+    .await
+    .unwrap();
+
+    let ack = tokio::time::timeout(Duration::from_secs(1), bus.consume_outbound())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ack.content, "Stopping current turn...");
+    assert_eq!(ack.metadata, slack_metadata);
+
+    let completion = tokio::time::timeout(Duration::from_secs(1), bus.consume_outbound())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completion.content, "Task stopped by user.");
+    assert_eq!(completion.metadata, ack.metadata);
+
+    runtime.stop().await;
+}
+
+#[tokio::test]
+async fn help_command_preserves_inbound_metadata() {
+    let dir = tempdir().unwrap();
+    let agent = AgentLoop::new(
+        Arc::new(QueuedProvider::new("test-model", Vec::new())),
+        dir.path(),
+        Some("test-model".to_string()),
+        8,
+        8_000,
+        Default::default(),
+        None,
+        ExecToolConfig {
+            enable: false,
+            timeout: 60,
+            path_append: String::new(),
+        },
+        false,
+        None,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+    let metadata = BTreeMap::from([(
+        "slack".to_string(),
+        json!({
+            "thread_ts": "1700000000.000100",
+            "channel_type": "channel",
+        }),
+    )]);
+
+    let response = agent
+        .process_inbound(InboundMessage {
+            channel: "slack".to_string(),
+            sender_id: "u1".to_string(),
+            chat_id: "C123".to_string(),
+            content: "/help".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: Vec::new(),
+            metadata: metadata.clone(),
+            session_key_override: Some("slack:C123:1700000000.000100".to_string()),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(response.metadata, metadata);
+    assert_eq!(response.content, "/new (or clear)\n/stop\n/status\n/help");
 }

@@ -53,7 +53,8 @@ pub struct AgentLoop {
     start_time: Instant,
     last_usage: Mutex<(usize, usize)>,
     cancellations: Arc<Mutex<HashSet<String>>>,
-    active_turns: Arc<Mutex<HashSet<String>>>,
+    active_turns: Arc<Mutex<BTreeMap<String, usize>>>,
+    stop_notifications: Arc<Mutex<BTreeMap<String, StopNotification>>>,
 }
 
 impl AgentLoop {
@@ -144,7 +145,8 @@ impl AgentLoop {
             start_time: Instant::now(),
             last_usage: Mutex::new((0, 0)),
             cancellations: Arc::new(Mutex::new(HashSet::new())),
-            active_turns: Arc::new(Mutex::new(HashSet::new())),
+            active_turns: Arc::new(Mutex::new(BTreeMap::new())),
+            stop_notifications: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -210,53 +212,23 @@ impl AgentLoop {
         if msg.channel == "system" {
             return self.process_system_inbound(msg).await;
         }
+        let target = ProgressTarget::from_inbound(&msg);
         let trimmed = msg.content.trim().to_lowercase();
         if trimmed == "/stop" || trimmed == "stop" || trimmed == "[stop]" {
-            let session_key = msg.session_key();
-            self.cancellations
-                .lock()
-                .expect("cancellations lock poisoned")
-                .insert(session_key.clone());
-            let cancelled = self.subagents.cancel_by_session(&session_key).await;
-            let is_active = self
-                .active_turns
-                .lock()
-                .expect("active turns lock poisoned")
-                .contains(&session_key);
-
-            return Ok(Some(OutboundMessage {
-                channel: msg.channel,
-                chat_id: msg.chat_id,
-                content: if cancelled == 0 && !is_active {
-                    "No active task to stop.".to_string()
-                } else if cancelled > 0 && is_active {
-                    format!("Stopped {cancelled} task(s) and current turn.")
-                } else if cancelled > 0 {
-                    format!("Stopped {cancelled} task(s).")
-                } else {
-                    "Stopping current turn...".to_string()
-                },
-                reply_to: None,
-                media: Vec::new(),
-                metadata: BTreeMap::new(),
-            }));
+            return self.handle_stop_signal(&msg, &target).await;
         }
 
         let session_key = msg.session_key();
 
         // Immediate cancellation check: if user just sent a stop command, don't start a new turn
-        {
-            if self
-                .cancellations
-                .lock()
-                .expect("cancellations lock poisoned")
-                .contains(&session_key)
-            {
+        if self.is_cancellation_pending(&session_key) {
+            if self.has_active_turn(&session_key) {
                 return Ok(None);
             }
+            self.clear_cancellation(&session_key);
         }
 
-        {
+        let session_setup = (|| -> Result<Option<OutboundMessage>> {
             let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
             let mut session = sessions.get_or_create(&session_key)?;
 
@@ -268,33 +240,34 @@ impl AgentLoop {
                     if !snapshot.is_empty() {
                         self.memory.archive_messages(&snapshot)?;
                     }
-                    return Ok(Some(OutboundMessage {
-                        channel: msg.channel,
-                        chat_id: msg.chat_id,
-                        content: "New session started. Memory cleared.".to_string(),
-                        reply_to: None,
-                        media: Vec::new(),
-                        metadata: BTreeMap::new(),
-                    }));
+                    return Ok(Some(
+                        target.outbound("New session started. Memory cleared."),
+                    ));
                 }
                 "/status" | "status" => {
                     return Ok(Some(self.status_response(&msg, &session)));
                 }
                 "/help" | "help" => {
-                    return Ok(Some(OutboundMessage {
-                        channel: msg.channel,
-                        chat_id: msg.chat_id,
-                        content: "/new (or clear)\n/stop\n/status\n/help".to_string(),
-                        reply_to: None,
-                        media: Vec::new(),
-                        metadata: BTreeMap::new(),
-                    }));
+                    return Ok(Some(
+                        target.outbound("/new (or clear)\n/stop\n/status\n/help"),
+                    ));
                 }
                 _ => {}
             }
 
             self.memory.maybe_consolidate_by_tokens(&mut session)?;
             sessions.put(session);
+            Ok(None)
+        })();
+        match session_setup {
+            Ok(Some(response)) => return Ok(Some(response)),
+            Ok(None) => {}
+            Err(err) => {
+                if let Some(action) = special_command_action(&trimmed) {
+                    return Ok(Some(target.outbound(format!("Unable to {action}: {err}"))));
+                }
+                return Err(err);
+            }
         }
 
         self.message_tool.set_context(
@@ -306,7 +279,8 @@ impl AgentLoop {
                 .map(ToOwned::to_owned),
         );
         self.message_tool.start_turn();
-        self.spawn_tool.set_context(&msg.channel, &msg.chat_id);
+        self.spawn_tool
+            .set_context(&msg.channel, &msg.chat_id, &session_key);
         if let Some(cron_tool) = &self.cron_tool {
             cron_tool.set_context(&msg.channel, &msg.chat_id);
         }
@@ -325,32 +299,51 @@ impl AgentLoop {
             "user",
         )?;
 
-        let _guard = ActiveTurnGuard::new(self.active_turns.clone(), session_key.clone());
-        let (final_content, all_messages, interrupted) = match self
-            .run_agent_loop(
+        let loop_result = {
+            let _guard = ActiveTurnGuard::new(self.active_turns.clone(), session_key.clone());
+            self.run_agent_loop(
                 &session_key,
                 initial_messages.clone(),
                 text_stream,
-                Some(ProgressTarget::from_inbound(&msg)),
+                Some(target.clone()),
             )
             .await
-        {
+        };
+        let (final_content, all_messages, interrupted) = match loop_result {
             Ok(result) => result,
             Err(err) => {
                 self.persist_session_messages(&session_key, &initial_messages)?;
+                self.finalize_stop_state(
+                    &session_key,
+                    false,
+                    Some(format!("Unable to stop task: {err}")),
+                )
+                .await;
                 return Err(err);
             }
         };
 
-        let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
-        let mut session = sessions.get_or_create(&session_key)?;
-        self.save_turn(&mut session, &all_messages)?;
-        self.memory.maybe_consolidate_by_tokens(&mut session)?;
-        sessions.save(&session)?;
+        {
+            let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
+            let mut session = sessions.get_or_create(&session_key)?;
+            self.save_turn(&mut session, &all_messages)?;
+            self.memory.maybe_consolidate_by_tokens(&mut session)?;
+            sessions.save(&session)?;
+        }
 
         if interrupted {
+            self.finalize_stop_state(&session_key, true, None).await;
             return Ok(None);
         }
+        self.finalize_stop_state(
+            &session_key,
+            false,
+            Some(
+                "Unable to stop task: task already completed before cancellation took effect."
+                    .to_string(),
+            ),
+        )
+        .await;
 
         if self.message_tool.sent_in_turn() {
             return Ok(None);
@@ -384,6 +377,8 @@ impl AgentLoop {
 
         self.message_tool.set_context(&channel, &chat_id, None);
         self.message_tool.start_turn();
+        self.spawn_tool
+            .set_context(&channel, &chat_id, &session_key);
         let history = {
             let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
             sessions.get_or_create(&session_key)?.get_history(0)
@@ -401,9 +396,9 @@ impl AgentLoop {
             },
         )?;
 
-        let _guard = ActiveTurnGuard::new(self.active_turns.clone(), session_key.clone());
-        let (final_content, all_messages, interrupted) = match self
-            .run_agent_loop(
+        let loop_result = {
+            let _guard = ActiveTurnGuard::new(self.active_turns.clone(), session_key.clone());
+            self.run_agent_loop(
                 &session_key,
                 initial_messages.clone(),
                 None,
@@ -414,23 +409,42 @@ impl AgentLoop {
                 }),
             )
             .await
-        {
+        };
+        let (final_content, all_messages, interrupted) = match loop_result {
             Ok(result) => result,
             Err(err) => {
                 self.persist_session_messages(&session_key, &initial_messages)?;
+                self.finalize_stop_state(
+                    &session_key,
+                    false,
+                    Some(format!("Unable to stop task: {err}")),
+                )
+                .await;
                 return Err(err);
             }
         };
 
-        let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
-        let mut session = sessions.get_or_create(&session_key)?;
-        self.save_turn(&mut session, &all_messages)?;
-        self.memory.maybe_consolidate_by_tokens(&mut session)?;
-        sessions.save(&session)?;
+        {
+            let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
+            let mut session = sessions.get_or_create(&session_key)?;
+            self.save_turn(&mut session, &all_messages)?;
+            self.memory.maybe_consolidate_by_tokens(&mut session)?;
+            sessions.save(&session)?;
+        }
 
         if interrupted {
+            self.finalize_stop_state(&session_key, true, None).await;
             return Ok(None);
         }
+        self.finalize_stop_state(
+            &session_key,
+            false,
+            Some(
+                "Unable to stop task: task already completed before cancellation took effect."
+                    .to_string(),
+            ),
+        )
+        .await;
 
         Ok(Some(OutboundMessage {
             channel,
@@ -449,14 +463,6 @@ impl AgentLoop {
         text_stream: Option<TextStreamCallback>,
         progress_target: Option<ProgressTarget>,
     ) -> Result<(Option<String>, Vec<ChatMessage>, bool)> {
-        // Clear any existing cancellation for this session at the start of a turn
-        {
-            self.cancellations
-                .lock()
-                .expect("cancellations lock poisoned")
-                .remove(session_key);
-        }
-
         *self.last_usage.lock().expect("usage lock poisoned") = (0, 0);
         let mut final_content = None;
         let think_re = Regex::new(r"(?s)<think>.*?</think>").expect("valid think regex");
@@ -698,6 +704,166 @@ impl AgentLoop {
         let _ = callback(outbound).await;
     }
 
+    async fn handle_stop_signal(
+        &self,
+        msg: &InboundMessage,
+        target: &ProgressTarget,
+    ) -> Result<Option<OutboundMessage>> {
+        let session_key = msg.session_key();
+        self.cancellations
+            .lock()
+            .expect("cancellations lock poisoned")
+            .insert(session_key.clone());
+        let cancelled = self.subagents.cancel_by_session(&session_key).await;
+        let is_active = self.has_active_turn(&session_key);
+
+        if cancelled == 0 && !is_active {
+            self.clear_cancellation(&session_key);
+            self.stop_notifications
+                .lock()
+                .expect("stop notifications lock poisoned")
+                .remove(&session_key);
+            return Ok(Some(target.outbound("No active task to stop.")));
+        }
+
+        if is_active {
+            if self.runtime_reply_sender().is_some() {
+                let completion_message = if cancelled > 0 {
+                    format!("Task stopped by user. Cancelled {cancelled} background task(s).")
+                } else {
+                    "Task stopped by user.".to_string()
+                };
+                self.stop_notifications
+                    .lock()
+                    .expect("stop notifications lock poisoned")
+                    .insert(
+                        session_key,
+                        StopNotification {
+                            target: target.clone(),
+                            completion_message,
+                            cancellation_observed: false,
+                        },
+                    );
+            }
+            let content = if cancelled > 0 {
+                format!("Stopping current turn and {cancelled} task(s)...")
+            } else {
+                "Stopping current turn...".to_string()
+            };
+            return Ok(Some(target.outbound(content)));
+        }
+
+        self.clear_cancellation(&session_key);
+        let stopped_message = format!("Stopped {cancelled} task(s) by user request.");
+        if self.runtime_reply_sender().is_some() {
+            self.schedule_runtime_reply(target.clone(), stopped_message);
+            return Ok(Some(
+                target.outbound(format!("Stopping {cancelled} task(s)...")),
+            ));
+        }
+        Ok(Some(
+            target.outbound(format!("Stopped {cancelled} task(s).")),
+        ))
+    }
+
+    fn runtime_reply_sender(&self) -> Option<MessageSendCallback> {
+        self.progress_sender
+            .lock()
+            .expect("progress callback lock poisoned")
+            .clone()
+    }
+
+    fn has_active_turn(&self, session_key: &str) -> bool {
+        self.active_turns
+            .lock()
+            .expect("active turns lock poisoned")
+            .get(session_key)
+            .copied()
+            .unwrap_or(0)
+            > 0
+    }
+
+    fn is_cancellation_pending(&self, session_key: &str) -> bool {
+        self.cancellations
+            .lock()
+            .expect("cancellations lock poisoned")
+            .contains(session_key)
+    }
+
+    fn clear_cancellation(&self, session_key: &str) -> bool {
+        self.cancellations
+            .lock()
+            .expect("cancellations lock poisoned")
+            .remove(session_key)
+    }
+
+    fn schedule_runtime_reply(&self, target: ProgressTarget, content: String) {
+        let Some(callback) = self.runtime_reply_sender() else {
+            return;
+        };
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let outbound = target.outbound(content);
+            if let Err(err) = callback(outbound).await {
+                eprintln!("failed to send runtime reply: {err}");
+            }
+        });
+    }
+
+    async fn send_runtime_reply(&self, target: &ProgressTarget, content: String) {
+        let Some(callback) = self.runtime_reply_sender() else {
+            return;
+        };
+        let outbound = target.outbound(content);
+        if let Err(err) = callback(outbound).await {
+            eprintln!("failed to send runtime reply: {err}");
+        }
+    }
+
+    async fn finalize_stop_state(
+        &self,
+        session_key: &str,
+        interrupted: bool,
+        failure_message: Option<String>,
+    ) {
+        if interrupted {
+            if let Some(notification) = self
+                .stop_notifications
+                .lock()
+                .expect("stop notifications lock poisoned")
+                .get_mut(session_key)
+            {
+                notification.cancellation_observed = true;
+            }
+        }
+
+        if self.has_active_turn(session_key) {
+            return;
+        }
+
+        let had_cancellation = self.clear_cancellation(session_key);
+        let notification = self
+            .stop_notifications
+            .lock()
+            .expect("stop notifications lock poisoned")
+            .remove(session_key);
+
+        let Some(notification) = notification else {
+            return;
+        };
+
+        if interrupted || notification.cancellation_observed {
+            self.send_runtime_reply(&notification.target, notification.completion_message)
+                .await;
+            return;
+        }
+
+        if had_cancellation {
+            let message = failure_message.unwrap_or_else(|| "Unable to stop task.".to_string());
+            self.send_runtime_reply(&notification.target, message).await;
+        }
+    }
+
     fn status_response(&self, msg: &InboundMessage, session: &Session) -> OutboundMessage {
         let (prompt_tokens, completion_tokens) =
             *self.last_usage.lock().expect("usage lock poisoned");
@@ -717,7 +883,7 @@ impl AgentLoop {
             ),
             reply_to: None,
             media: Vec::new(),
-            metadata: BTreeMap::new(),
+            metadata: msg.metadata.clone(),
         }
     }
 
@@ -799,21 +965,37 @@ impl AgentLoop {
 }
 
 struct ActiveTurnGuard {
-    set: Arc<Mutex<HashSet<String>>>,
+    set: Arc<Mutex<BTreeMap<String, usize>>>,
     key: String,
 }
 
 impl ActiveTurnGuard {
-    fn new(set: Arc<Mutex<HashSet<String>>>, key: String) -> Self {
-        set.lock().unwrap().insert(key.clone());
+    fn new(set: Arc<Mutex<BTreeMap<String, usize>>>, key: String) -> Self {
+        {
+            let mut counts = set.lock().unwrap();
+            *counts.entry(key.clone()).or_insert(0) += 1;
+        }
         Self { set, key }
     }
 }
 
 impl Drop for ActiveTurnGuard {
     fn drop(&mut self) {
-        self.set.lock().unwrap().remove(&self.key);
+        let mut set = self.set.lock().unwrap();
+        if let Some(count) = set.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                set.remove(&self.key);
+            }
+        }
     }
+}
+
+#[derive(Clone)]
+struct StopNotification {
+    target: ProgressTarget,
+    completion_message: String,
+    cancellation_observed: bool,
 }
 
 #[derive(Clone)]
@@ -830,6 +1012,26 @@ impl ProgressTarget {
             chat_id: msg.chat_id.clone(),
             metadata: msg.metadata.clone(),
         }
+    }
+
+    fn outbound(&self, content: impl Into<String>) -> OutboundMessage {
+        OutboundMessage {
+            channel: self.channel.clone(),
+            chat_id: self.chat_id.clone(),
+            content: content.into(),
+            reply_to: None,
+            media: Vec::new(),
+            metadata: self.metadata.clone(),
+        }
+    }
+}
+
+fn special_command_action(trimmed: &str) -> Option<&'static str> {
+    match trimmed {
+        "/new" | "new" | "/clear" | "clear" | "[clear]" => Some("start a new session"),
+        "/status" | "status" => Some("get status"),
+        "/help" | "help" => Some("show help"),
+        _ => None,
     }
 }
 

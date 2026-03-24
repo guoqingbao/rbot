@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -213,4 +214,91 @@ async fn stop_command_cancels_active_subagent_tasks() {
         .unwrap()
         .unwrap();
     assert_eq!(stopped_again.content, "No active task to stop.");
+}
+
+#[tokio::test]
+async fn runtime_stop_command_acknowledges_and_confirms_subagent_cancellation() {
+    let dir = tempdir().unwrap();
+    let provider = Arc::new(DeterministicSubagentProvider::new(SubagentMode::Slow));
+    let agent = Arc::new(
+        AgentLoop::new(
+            provider,
+            dir.path(),
+            Some("test-model".to_string()),
+            6,
+            8_000,
+            Default::default(),
+            None,
+            ExecToolConfig {
+                enable: false,
+                timeout: 60,
+                path_append: String::new(),
+            },
+            false,
+            None,
+            &Default::default(),
+        )
+        .await
+        .unwrap(),
+    );
+    let bus = MessageBus::new(16);
+    let runtime = AgentRuntime::new(agent, bus.clone());
+    runtime.start().await.unwrap();
+
+    let metadata = BTreeMap::from([(
+        "slack".to_string(),
+        json!({
+            "thread_ts": "1700000000.000100",
+            "channel_type": "channel",
+        }),
+    )]);
+    let session_key = "slack:C123:1700000000.000100".to_string();
+
+    bus.publish_inbound(InboundMessage {
+        channel: "slack".to_string(),
+        sender_id: "u1".to_string(),
+        chat_id: "C123".to_string(),
+        content: "delegate slow work".to_string(),
+        timestamp: chrono::Utc::now(),
+        media: Vec::new(),
+        metadata: metadata.clone(),
+        session_key_override: Some(session_key.clone()),
+    })
+    .await
+    .unwrap();
+
+    let started = tokio::time::timeout(Duration::from_secs(1), bus.consume_outbound())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(started.content, "Background task started.");
+
+    bus.publish_inbound(InboundMessage {
+        channel: "slack".to_string(),
+        sender_id: "u1".to_string(),
+        chat_id: "C123".to_string(),
+        content: "/stop".to_string(),
+        timestamp: chrono::Utc::now(),
+        media: Vec::new(),
+        metadata: metadata.clone(),
+        session_key_override: Some(session_key),
+    })
+    .await
+    .unwrap();
+
+    let ack = tokio::time::timeout(Duration::from_secs(1), bus.consume_outbound())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ack.content, "Stopping 1 task(s)...");
+    assert_eq!(ack.metadata, metadata);
+
+    let completion = tokio::time::timeout(Duration::from_secs(1), bus.consume_outbound())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completion.content, "Stopped 1 task(s) by user request.");
+    assert_eq!(completion.metadata, ack.metadata);
+
+    runtime.stop().await;
 }
