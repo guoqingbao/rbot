@@ -111,7 +111,9 @@ pub struct ReqwestSlackApi {
 impl ReqwestSlackApi {
     pub fn new(bot_token: String) -> Result<Self> {
         Ok(Self {
-            client: Client::builder().build()?,
+            client: Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
             bot_token,
         })
     }
@@ -239,28 +241,53 @@ impl SlackApi for ReqwestSlackApi {
     }
 
     async fn download_file(&self, url: &str) -> Result<Vec<u8>> {
-        let response = self.get_with_auth(url).await?;
-        if response.status().is_success() {
-            let body = response.bytes().await?.to_vec();
-            if !looks_like_html_shell(&body) {
-                return Ok(body);
-            }
+        let mut current_url = url.to_string();
+        let mut hops = 0;
+        const MAX_HOPS: usize = 5;
 
-            if let Some(redirect_url) = extract_slack_redirect_url(&body) {
-                let redirected = self.get_with_auth(&redirect_url).await?;
-                if redirected.status().is_success() {
-                    let redirected_body = redirected.bytes().await?.to_vec();
-                    if !looks_like_html_shell(&redirected_body) {
-                        return Ok(redirected_body);
+        loop {
+            if hops >= MAX_HOPS {
+                return Err(anyhow!("too many redirects downloading slack file"));
+            }
+            let response = self.get_with_auth(&current_url).await?;
+
+            if response.status().is_redirection() {
+                if let Some(location) = response.headers().get("location") {
+                    let next_url = location.to_str()?;
+                    if next_url.starts_with("http") {
+                        current_url = next_url.to_string();
+                    } else if next_url.starts_with('/') {
+                        let parsed = reqwest::Url::parse(&current_url)?;
+                        current_url = format!(
+                            "{}://{}{}",
+                            parsed.scheme(),
+                            parsed.host_str().unwrap_or("slack.com"),
+                            next_url
+                        );
                     }
+                    hops += 1;
+                    continue;
                 }
             }
 
-            Err(anyhow!(
-                "slack file download returned html instead of image bytes"
-            ))
-        } else {
-            Err(anyhow!("failed to download file: {}", response.status()))
+            if response.status().is_success() {
+                let body = response.bytes().await?.to_vec();
+                if !looks_like_html_shell(&body) {
+                    return Ok(body);
+                }
+
+                if let Some(redirect_url) = extract_slack_redirect_url(&body) {
+                    current_url = redirect_url;
+                    hops += 1;
+                    continue;
+                }
+
+                return Err(anyhow!(
+                    "slack file download returned html instead of image bytes"
+                ));
+            } else {
+                return Err(anyhow!("failed to download file: {}", response.status()));
+            }
         }
     }
 

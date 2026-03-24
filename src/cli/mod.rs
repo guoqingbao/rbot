@@ -179,23 +179,28 @@ impl Style {
     }
 
     fn panel_header(&self, text: impl AsRef<str>, width: usize) -> String {
-        self.panel_line("48;5;250;38;5;236;1", text, width)
+        self.panel_line("48;5;236;38;5;252;1", text, width)
     }
 
     fn panel_meta(&self, text: impl AsRef<str>, width: usize) -> String {
-        self.panel_line("48;5;254;38;5;239", text, width)
+        self.panel_line("48;5;235;38;5;245", text, width)
     }
 
     fn panel_context(&self, text: impl AsRef<str>, width: usize) -> String {
-        self.panel_line("48;5;254;38;5;236", text, width)
+        self.panel_line("48;5;235;38;5;252", text, width)
     }
 
     fn panel_added(&self, text: impl AsRef<str>, width: usize) -> String {
-        self.panel_line("48;5;194;38;5;22", text, width)
+        self.panel_line("48;5;22;38;5;114", text, width)
     }
 
     fn panel_removed(&self, text: impl AsRef<str>, width: usize) -> String {
-        self.panel_line("48;5;224;38;5;52", text, width)
+        self.panel_line("48;5;52;38;5;210", text, width)
+    }
+
+    fn separator(&self, width: usize) -> String {
+        let line = "─".repeat(width.min(60));
+        self.dim(line)
     }
 
     fn queue_pill(&self, text: impl AsRef<str>) -> String {
@@ -1007,15 +1012,18 @@ impl StreamRenderer {
                 note_output(&mut state, &tail);
             }
             if state.trailing_newlines == 0 {
-                self.target.write_raw("\n\n");
-            } else if state.trailing_newlines == 1 {
                 self.target.write_raw("\n");
             }
-            state.trailing_newlines = 2;
+            self.target
+                .write_raw(format!("\n{}\n", self.target.style.separator(60)));
+            state.trailing_newlines = 1;
         } else {
             let rendered = render_markdown_response(&self.target.style, content);
-            let rendered = format!("\n{}\n\n", rendered);
-            self.target.write_raw(&rendered);
+            self.target.write_raw(format!(
+                "\n{}\n\n{}\n",
+                rendered,
+                self.target.style.separator(60)
+            ));
             note_output(&mut state, &rendered);
         }
         self.footer.complete(summary);
@@ -1491,6 +1499,13 @@ fn sentence_flush_index(text: &str) -> Option<usize> {
             continue;
         }
         if matches!(ch, '.' | '!' | '?' | ':' | ';') {
+            // Don't break at numbered list markers like "1. " or "10. "
+            if ch == '.' {
+                let before = &text[..idx];
+                if before.ends_with(|c: char| c.is_ascii_digit()) {
+                    continue;
+                }
+            }
             let next = text[idx + ch.len_utf8()..].chars().next();
             if next.is_none_or(char::is_whitespace) {
                 return Some(idx + ch.len_utf8());
@@ -1997,7 +2012,26 @@ fn is_number_start(chars: &[char], index: usize) -> bool {
 }
 
 fn char_width(text: &str) -> usize {
-    text.chars().count()
+    strip_ansi_escapes(text).chars().count()
+}
+
+fn strip_ansi_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_escape = false;
+    for ch in text.chars() {
+        if in_escape {
+            if ch == 'm' {
+                in_escape = false;
+            }
+            continue;
+        }
+        if ch == '\x1b' {
+            in_escape = true;
+            continue;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn pad_to_width(text: &str, width: usize) -> String {
@@ -2129,7 +2163,7 @@ mod tests {
             Some(&args),
         );
         assert!(rendered.contains("edit_file"));
-        assert!(rendered.contains("revision:"));
+        assert!(rendered.contains("mod.rs"));
         assert!(rendered.contains("beta"));
         assert!(rendered.contains("old   new | diff preview"));
     }
