@@ -43,7 +43,15 @@ pub async fn run_config_provider(config_path: Option<&Path>) -> Result<()> {
         .unwrap_or_default();
 
     if !spec.is_local && selected_provider_name != "custom" {
-        provider_cfg.api_key = Text::new("Enter API Key:").prompt()?;
+        let api_key_prompt = if !provider_cfg.api_key.is_empty() {
+            Text::new("Enter API Key:").with_default(&provider_cfg.api_key)
+        } else {
+            Text::new("Enter API Key:")
+        };
+        let input = api_key_prompt.prompt()?;
+        if !input.is_empty() {
+            provider_cfg.api_key = input;
+        }
 
         println!(
             "{}",

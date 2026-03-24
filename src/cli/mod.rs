@@ -1178,7 +1178,7 @@ fn render_tool_hint(
     style.tool_hint_pill(&parts)
 }
 
-fn render_edit_file_hint(style: &Style, hint: &str, tool_args: Option<&Value>) -> Option<String> {
+fn render_edit_file_hint(style: &Style, _hint: &str, tool_args: Option<&Value>) -> Option<String> {
     let args = tool_args?.as_object()?;
     let path = args.get("path")?.as_str()?;
     let old_text = args
@@ -1191,16 +1191,12 @@ fn render_edit_file_hint(style: &Style, hint: &str, tool_args: Option<&Value>) -
         .and_then(Value::as_str)
         .unwrap_or_default()
         .replace("\r\n", "\n");
-    let replace_all = args
+    let _replace_all = args
         .get("replace_all")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let width = 100usize;
     let diff = build_edit_diff(&old_text, &new_text);
-    let old_lines = count_lines(&old_text);
-    let new_lines = count_lines(&new_text);
-    let line_delta = new_lines as isize - old_lines as isize;
-    let char_delta = new_text.chars().count() as isize - old_text.chars().count() as isize;
     let mut lines = Vec::new();
     lines.push(style.panel_header(
         format!(
@@ -1209,39 +1205,8 @@ fn render_edit_file_hint(style: &Style, hint: &str, tool_args: Option<&Value>) -
         ),
         width,
     ));
-    lines.push(style.panel_meta(
-        format!(
-            " summary: {}",
-            truncate_middle(hint, width.saturating_sub(11))
-        ),
-        width,
-    ));
-    lines.push(style.panel_meta(
-        format!(
-            " revision: replace_all={} · old {}L/{}B · new {}L/{}B · {:+}L · {:+}B · {} add · {} del",
-            replace_all,
-            old_lines,
-            old_text.len(),
-            new_lines,
-            new_text.len(),
-            line_delta,
-            char_delta,
-            diff.added,
-            diff.removed,
-        ),
-        width,
-    ));
     lines.push(style.panel_meta("   old   new | diff preview", width));
     lines.extend(render_diff_lines(style, &diff.lines, width));
-    lines.push(style.panel_meta(
-        format!(
-            " blocks: {} · visible lines: {}{}",
-            diff.changed_blocks,
-            diff.lines.len(),
-            if diff.truncated { " · truncated" } else { "" }
-        ),
-        width,
-    ));
     Some(lines.join("\n"))
 }
 
@@ -1273,10 +1238,6 @@ fn render_diff_lines(style: &Style, lines: &[RenderedDiffLine], width: usize) ->
 
 struct EditDiff {
     lines: Vec<RenderedDiffLine>,
-    added: usize,
-    removed: usize,
-    changed_blocks: usize,
-    truncated: bool,
 }
 
 #[derive(Clone)]
@@ -1300,20 +1261,8 @@ fn build_edit_diff(old_text: &str, new_text: &str) -> EditDiff {
     let old_lines = split_lines_for_diff(old_text);
     let new_lines = split_lines_for_diff(new_text);
     let ops = diff_ops(&old_lines, &new_lines);
-    let (rendered, changed_blocks) = compress_diff_ops(ops, 2, 64);
-    EditDiff {
-        added: rendered
-            .iter()
-            .filter(|line| line.kind == DiffKind::Added)
-            .count(),
-        removed: rendered
-            .iter()
-            .filter(|line| line.kind == DiffKind::Removed)
-            .count(),
-        truncated: rendered.iter().any(|line| line.kind == DiffKind::Omitted),
-        lines: rendered,
-        changed_blocks,
-    }
+    let (rendered, _changed_blocks) = compress_diff_ops(ops, 2, 64);
+    EditDiff { lines: rendered }
 }
 
 fn split_lines_for_diff(text: &str) -> Vec<String> {
@@ -2045,14 +1994,6 @@ fn is_number_start(chars: &[char], index: usize) -> bool {
         return false;
     }
     true
-}
-
-fn count_lines(text: &str) -> usize {
-    if text.is_empty() {
-        0
-    } else {
-        text.lines().count()
-    }
 }
 
 fn char_width(text: &str) -> usize {
