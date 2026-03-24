@@ -13,6 +13,8 @@ use std::{
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use cli::{CliOutput, CliShell, InputEvent, TurnSummary, run_config_channel, run_config_provider};
+use colored::*;
+use local_ip_address::local_ip;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use rbot::channels::ChannelManager;
@@ -497,7 +499,18 @@ async fn run(config_path: Option<&Path>, model_override: Option<String>) -> Resu
     let host = config.gateway.host.clone();
     let port = config.gateway.port;
     let listener = tokio::net::TcpListener::bind(format!("{host}:{port}")).await?;
-    println!("Gateway listening on http://{host}:{port}");
+    println!(
+        "Gateway listening on {}",
+        format!("http://{host}:{port}").blue().bold()
+    );
+    println!(
+        "Admin UI: {}",
+        format_gateway_url(&gateway_url(&host, port, &config.gateway.admin.path))
+    );
+    println!(
+        "Metrics: {}",
+        format_gateway_url(&gateway_url(&host, port, &config.gateway.metrics.path))
+    );
     let server_task = tokio::spawn(async move {
         let _ = axum::serve(listener, router)
             .with_graceful_shutdown(async move {
@@ -561,12 +574,20 @@ async fn status(config_path: Option<&Path>, model_override: Option<String>) -> R
         api_base.unwrap_or_else(|| "(default)".to_string())
     );
     println!(
-        "Admin UI: http://{}:{}{}",
-        config.gateway.host, config.gateway.port, config.gateway.admin.path
+        "Admin UI: {}",
+        format_gateway_url(&gateway_url(
+            &config.gateway.host,
+            config.gateway.port,
+            &config.gateway.admin.path
+        ))
     );
     println!(
-        "Metrics: http://{}:{}{}",
-        config.gateway.host, config.gateway.port, config.gateway.metrics.path
+        "Metrics: {}",
+        format_gateway_url(&gateway_url(
+            &config.gateway.host,
+            config.gateway.port,
+            &config.gateway.metrics.path
+        ))
     );
     println!("Sessions: {}", sessions.len());
     println!("Cron Jobs: {cron_jobs}");
@@ -738,6 +759,61 @@ fn resolve_cli_workspace(config: &Config, cwd: &Path) -> PathBuf {
         cwd.to_path_buf()
     } else {
         configured
+    }
+}
+
+fn gateway_url(host: &str, port: u16, path: &str) -> String {
+    format!(
+        "http://{}:{port}{path}",
+        gateway_display_host(host).as_str()
+    )
+}
+
+fn format_gateway_url(url: &str) -> String {
+    format!("{}", url.blue().bold())
+}
+
+fn gateway_display_host(host: &str) -> String {
+    resolve_gateway_display_host(host, detected_local_ip().as_deref())
+}
+
+fn resolve_gateway_display_host(host: &str, local_ip_hint: Option<&str>) -> String {
+    if matches!(host, "0.0.0.0" | "::" | "[::]") {
+        return local_ip_hint.unwrap_or("127.0.0.1").to_string();
+    }
+    host.to_string()
+}
+
+fn detected_local_ip() -> Option<String> {
+    local_ip().ok().map(|ip| ip.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_gateway_display_host;
+
+    #[test]
+    fn wildcard_gateway_host_uses_local_ip_hint() {
+        assert_eq!(
+            resolve_gateway_display_host("0.0.0.0", Some("192.168.1.25")),
+            "192.168.1.25"
+        );
+        assert_eq!(
+            resolve_gateway_display_host("::", Some("10.0.0.8")),
+            "10.0.0.8"
+        );
+    }
+
+    #[test]
+    fn fixed_gateway_host_is_preserved() {
+        assert_eq!(
+            resolve_gateway_display_host("127.0.0.1", Some("192.168.1.25")),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            resolve_gateway_display_host("example.local", Some("192.168.1.25")),
+            "example.local"
+        );
     }
 }
 

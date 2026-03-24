@@ -11,6 +11,7 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 chrono-tz = { version = "0.10", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
+colored = "3.0.0"
 cron = "0.15"
 dirs = "6.0"
 futures = "0.3"
@@ -20,6 +21,7 @@ html2text = "0.13"
 imap = "2.4"
 ipnet = "2.11"
 lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "native-tls", "smtp-transport"] }
+local-ip-address = "0.6.5"
 mailparse = "0.15"
 mime_guess = "2.0"
 native-tls = "0.2"
