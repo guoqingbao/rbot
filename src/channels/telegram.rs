@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use super::{Channel, ChannelBase};
 use crate::security::validate_url_target;
 use crate::storage::{MessageBus, OutboundMessage};
-use crate::util::split_message;
+use crate::util::{split_message, workspace_state_dir};
 
 pub const TELEGRAM_MAX_MESSAGE_LEN: usize = 4000;
 pub const TELEGRAM_REPLY_CONTEXT_MAX_LEN: usize = TELEGRAM_MAX_MESSAGE_LEN;
@@ -74,6 +74,8 @@ pub struct ReplyParameters {
 #[async_trait]
 pub trait TelegramApi: Send + Sync {
     async fn get_me(&self) -> Result<TelegramBotIdentity>;
+    async fn get_file(&self, file_id: &str) -> Result<String>;
+    async fn download_file(&self, file_path: &str) -> Result<Vec<u8>>;
     async fn send_message(
         &self,
         chat_id: i64,
@@ -113,6 +115,7 @@ pub trait TelegramApi: Send + Sync {
 
 pub struct ReqwestTelegramApi {
     client: Client,
+    token: String,
     base_url: String,
 }
 
@@ -127,6 +130,7 @@ impl ReqwestTelegramApi {
         }
         Ok(Self {
             client: builder.build()?,
+            token: token.to_string(),
             base_url: format!("https://api.telegram.org/bot{token}"),
         })
     }
@@ -234,6 +238,43 @@ impl TelegramApi for ReqwestTelegramApi {
         })
     }
 
+    async fn get_file(&self, file_id: &str) -> Result<String> {
+        let response = self
+            .client
+            .post(format!("{}/getFile", self.base_url))
+            .json(&json!({ "file_id": file_id }))
+            .send()
+            .await?;
+        let payload: Value = response.json().await?;
+        if payload.get("ok").and_then(Value::as_bool) == Some(true) {
+            payload["result"]["file_path"]
+                .as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| anyhow!("telegram getFile result missing file_path"))
+        } else {
+            Err(anyhow!(
+                "telegram getFile error: {}",
+                payload["description"].as_str().unwrap_or("unknown")
+            ))
+        }
+    }
+
+    async fn download_file(&self, file_path: &str) -> Result<Vec<u8>> {
+        let url = format!(
+            "https://api.telegram.org/file/bot{}/{}",
+            self.token, file_path
+        );
+        let response = self.client.get(url).send().await?;
+        if response.status().is_success() {
+            Ok(response.bytes().await?.to_vec())
+        } else {
+            Err(anyhow!(
+                "telegram file download failed: {}",
+                response.status()
+            ))
+        }
+    }
+
     async fn send_message(
         &self,
         chat_id: i64,
@@ -335,10 +376,10 @@ pub struct TelegramChannel {
 }
 
 impl TelegramChannel {
-    pub fn new(config: Value, bus: MessageBus) -> Result<Self> {
+    pub fn new(config: Value, bus: MessageBus, workspace: PathBuf) -> Result<Self> {
         let config: TelegramConfig = serde_json::from_value(config)?;
         Ok(Self {
-            base: ChannelBase::new(serde_json::to_value(&config)?, bus),
+            base: ChannelBase::new(serde_json::to_value(&config)?, bus, workspace),
             config,
             api: AsyncMutex::new(None),
             bot_identity: Mutex::new(None),
@@ -479,7 +520,19 @@ impl TelegramChannel {
                 format!("{reply_context}\n\n{content}")
             };
         }
-        if content.trim().is_empty() {
+
+        let mut media_paths = Vec::new();
+        if let Some(photo) = message.get("photo").and_then(Value::as_array) {
+            if let Some(best_photo) = photo.last() {
+                if let Some(file_id) = best_photo.get("file_id").and_then(Value::as_str) {
+                    if let Ok(file_path) = self.download_telegram_file(file_id).await {
+                        media_paths.push(file_path);
+                    }
+                }
+            }
+        }
+
+        if content.trim().is_empty() && media_paths.is_empty() {
             return Ok(());
         }
         let message_id = message.get("message_id").and_then(Value::as_i64);
@@ -505,11 +558,29 @@ impl TelegramChannel {
                 &sender_id,
                 &chat_id,
                 &content,
-                None,
+                Some(media_paths),
                 Some(metadata),
                 session_key,
             )
             .await
+    }
+
+    async fn download_telegram_file(&self, file_id: &str) -> Result<String> {
+        let api = self.api().await?;
+        let file_path = api.get_file(file_id).await?;
+        let bytes = api.download_file(&file_path).await?;
+
+        let downloads_dir = workspace_state_dir(&self.base.workspace).join("downloads");
+        std::fs::create_dir_all(&downloads_dir)?;
+
+        let filename = Path::new(&file_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
+        let local_path = downloads_dir.join(format!("{}_{}", file_id, filename));
+        std::fs::write(&local_path, bytes)?;
+
+        Ok(local_path.display().to_string())
     }
 
     async fn group_message_targets_bot(&self, message: &Value) -> Result<bool> {

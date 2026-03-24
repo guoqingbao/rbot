@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
@@ -15,6 +16,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use super::{Channel, ChannelBase};
 use crate::storage::{MessageBus, OutboundMessage};
+use crate::util::{detect_image_mime, safe_filename, workspace_state_dir};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -96,6 +98,7 @@ pub trait SlackApi: Send + Sync {
         thread_ts: Option<&str>,
     ) -> Result<()>;
     async fn files_upload(&self, channel: &str, file: &str, thread_ts: Option<&str>) -> Result<()>;
+    async fn download_file(&self, url: &str) -> Result<Vec<u8>>;
     async fn reactions_add(&self, channel: &str, name: &str, timestamp: &str) -> Result<()>;
     async fn reactions_remove(&self, channel: &str, name: &str, timestamp: &str) -> Result<()>;
 }
@@ -111,6 +114,15 @@ impl ReqwestSlackApi {
             client: Client::builder().build()?,
             bot_token,
         })
+    }
+
+    async fn get_with_auth(&self, url: &str) -> Result<reqwest::Response> {
+        Ok(self
+            .client
+            .get(url)
+            .bearer_auth(&self.bot_token)
+            .send()
+            .await?)
     }
 
     async fn post_json(&self, url: &str, body: Value) -> Result<()> {
@@ -226,6 +238,32 @@ impl SlackApi for ReqwestSlackApi {
         }
     }
 
+    async fn download_file(&self, url: &str) -> Result<Vec<u8>> {
+        let response = self.get_with_auth(url).await?;
+        if response.status().is_success() {
+            let body = response.bytes().await?.to_vec();
+            if !looks_like_html_shell(&body) {
+                return Ok(body);
+            }
+
+            if let Some(redirect_url) = extract_slack_redirect_url(&body) {
+                let redirected = self.get_with_auth(&redirect_url).await?;
+                if redirected.status().is_success() {
+                    let redirected_body = redirected.bytes().await?.to_vec();
+                    if !looks_like_html_shell(&redirected_body) {
+                        return Ok(redirected_body);
+                    }
+                }
+            }
+
+            Err(anyhow!(
+                "slack file download returned html instead of image bytes"
+            ))
+        } else {
+            Err(anyhow!("failed to download file: {}", response.status()))
+        }
+    }
+
     async fn reactions_add(&self, channel: &str, name: &str, timestamp: &str) -> Result<()> {
         self.post_json(
             "https://slack.com/api/reactions.add",
@@ -262,10 +300,10 @@ pub struct SlackChannel {
 }
 
 impl SlackChannel {
-    pub fn new(config: Value, bus: MessageBus) -> Result<Self> {
+    pub fn new(config: Value, bus: MessageBus, workspace: PathBuf) -> Result<Self> {
         let config: SlackConfig = serde_json::from_value(config)?;
         Ok(Self {
-            base: ChannelBase::new(serde_json::to_value(&config)?, bus),
+            base: ChannelBase::new(serde_json::to_value(&config)?, bus, workspace),
             config,
             api: Arc::new(AsyncMutex::new(None)),
             bot_user_id: Arc::new(Mutex::new(None)),
@@ -499,6 +537,65 @@ impl SlackChannel {
             );
             return Ok(());
         }
+
+        let mut media = Vec::new();
+        if let Some(files) = event.get("files").and_then(Value::as_array) {
+            let api = self.api().await?;
+            let downloads_dir = workspace_state_dir(&self.base.workspace).join("downloads");
+            std::fs::create_dir_all(&downloads_dir)?;
+
+            for file in files {
+                let Some(url) = file
+                    .get("url_private_download")
+                    .and_then(Value::as_str)
+                    .or_else(|| file.get("url_private").and_then(Value::as_str))
+                else {
+                    continue;
+                };
+                let Some(name) = file.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(mimetype) = file.get("mimetype").and_then(Value::as_str) else {
+                    continue;
+                };
+                if !mimetype.starts_with("image/") {
+                    continue;
+                }
+
+                match api.download_file(url).await {
+                    Ok(data) => {
+                        let Some(detected_mime) = detect_image_mime(&data) else {
+                            eprintln!(
+                                "[slack] skipping image '{}': unsupported or unrecognized image bytes (slack mimetype: {mimetype})",
+                                name
+                            );
+                            continue;
+                        };
+                        let extension = image_extension_for_mime(detected_mime);
+                        let base_name = Path::new(name)
+                            .file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .filter(|stem| !stem.trim().is_empty())
+                            .unwrap_or("image");
+                        let path = downloads_dir.join(format!(
+                            "{}_{}.{}",
+                            event.get("ts").and_then(Value::as_str).unwrap_or("file"),
+                            safe_filename(base_name),
+                            extension
+                        ));
+                        if let Err(err) = std::fs::write(&path, data) {
+                            eprintln!("[slack] failed to save downloaded file: {err}");
+                        } else {
+                            media.push(path.display().to_string());
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("[slack] failed to download file from {url}: {err}");
+                    }
+                }
+            }
+        }
+
         let thread_ts = event.get("thread_ts").and_then(Value::as_str).or_else(|| {
             (self.config.reply_in_thread && channel_type != "im")
                 .then(|| event.get("ts").and_then(Value::as_str))
@@ -523,7 +620,7 @@ impl SlackChannel {
                 sender_id,
                 chat_id,
                 cleaned.trim(),
-                None,
+                Some(media),
                 Some(metadata),
                 session_key,
             )
@@ -593,6 +690,43 @@ impl SlackChannel {
                 .await;
         }
         Ok(())
+    }
+}
+
+fn image_extension_for_mime(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "bin",
+    }
+}
+
+fn looks_like_html_shell(body: &[u8]) -> bool {
+    let prefix = String::from_utf8_lossy(&body[..body.len().min(512)]).to_ascii_lowercase();
+    prefix.contains("<!doctype html")
+        || prefix.contains("<html")
+        || prefix.contains("ga.boot_data.request_uri")
+}
+
+fn extract_slack_redirect_url(body: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(body);
+    let re = Regex::new(r#"GA\.boot_data\.request_uri = "([^"]+)";"#).ok()?;
+    let request_uri = re
+        .captures(&text)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().replace("\\/", "/"))?;
+    let url = reqwest::Url::parse(&format!("https://slack.com{request_uri}")).ok()?;
+    let redir = url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "redir").then(|| value.into_owned()))?;
+    if redir.starts_with("http://") || redir.starts_with("https://") {
+        Some(redir)
+    } else if redir.starts_with('/') {
+        Some(format!("https://slack.com{redir}"))
+    } else {
+        None
     }
 }
 
@@ -700,5 +834,22 @@ impl Channel for SlackChannel {
             self.update_react_emoji(&msg.chat_id, event_ts).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_slack_redirect_url, looks_like_html_shell};
+
+    #[test]
+    fn parses_slack_html_redirect_shell() {
+        let html = br#"<!DOCTYPE html><html><head></head><body>
+GA.boot_data.request_uri = "\/?redir=%2Ffiles-pri%2FT0AN1MWUCBD-F0APAQZJLCQ%2Fscreenshot.jpg";
+</body></html>"#;
+        assert!(looks_like_html_shell(html));
+        assert_eq!(
+            extract_slack_redirect_url(html).as_deref(),
+            Some("https://slack.com/files-pri/T0AN1MWUCBD-F0APAQZJLCQ/screenshot.jpg")
+        );
     }
 }

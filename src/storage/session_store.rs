@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::util::{ensure_dir, now_iso, safe_filename, workspace_state_dir};
 
@@ -59,6 +59,42 @@ impl ChatMessage {
             Some(other) => Some(other.to_string()),
             None => None,
         }
+    }
+
+    pub fn to_openai_payload(&self) -> Value {
+        let mut out = json!({
+            "role": self.role,
+        });
+        if let Some(content) = &self.content {
+            match content {
+                Value::Array(blocks) => {
+                    let cleaned = blocks
+                        .iter()
+                        .map(|block| {
+                            let mut b = block.clone();
+                            if let Some(obj) = b.as_object_mut() {
+                                obj.remove("_meta");
+                            }
+                            b
+                        })
+                        .collect::<Vec<_>>();
+                    out["content"] = Value::Array(cleaned);
+                }
+                other => {
+                    out["content"] = other.clone();
+                }
+            }
+        }
+        if let Some(tool_calls) = &self.tool_calls {
+            out["tool_calls"] = Value::Array(tool_calls.clone());
+        }
+        if let Some(tool_call_id) = &self.tool_call_id {
+            out["tool_call_id"] = json!(tool_call_id);
+        }
+        if let Some(name) = &self.name {
+            out["name"] = json!(name);
+        }
+        out
     }
 }
 
@@ -180,6 +216,57 @@ fn find_legal_start(messages: &[ChatMessage]) -> usize {
         }
     }
     start
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChatMessage;
+    use serde_json::json;
+
+    #[test]
+    fn to_openai_payload_strips_meta() {
+        let message = ChatMessage {
+            role: "user".to_string(),
+            content: Some(json!([
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,encoded"},
+                    "_meta": {"path": "test.png"}
+                },
+                {
+                    "type": "text",
+                    "text": "what is this?"
+                }
+            ])),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            timestamp: None,
+            reasoning_content: None,
+            thinking_blocks: None,
+            metadata: None,
+        };
+
+        let payload = message.to_openai_payload();
+        let content = payload.get("content").unwrap().as_array().unwrap();
+
+        assert_eq!(content.len(), 2);
+        assert!(content[0].get("_meta").is_none());
+        assert_eq!(
+            content[0].get("image_url").unwrap().get("url").unwrap(),
+            "data:image/png;base64,encoded"
+        );
+        assert_eq!(content[1].get("text").unwrap(), "what is this?");
+    }
+
+    #[test]
+    fn to_openai_payload_preserves_role_and_text_content() {
+        let message = ChatMessage::text("user", "hello");
+        let payload = message.to_openai_payload();
+
+        assert_eq!(payload.get("role").unwrap(), "user");
+        assert_eq!(payload.get("content").unwrap(), "hello");
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

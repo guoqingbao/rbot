@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use super::{Channel, ChannelBase};
 use crate::storage::{MessageBus, OutboundMessage};
-use crate::util::{ensure_dir, safe_filename};
+use crate::util::{safe_filename, workspace_state_dir};
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn";
 
@@ -808,10 +808,10 @@ impl FeishuChannel {
     const AUDIO_EXTS: &'static [&'static str] = &[".opus"];
     const VIDEO_EXTS: &'static [&'static str] = &[".mp4", ".mov", ".avi"];
 
-    pub fn new(config: Value, bus: MessageBus) -> Result<Self> {
+    pub fn new(config: Value, bus: MessageBus, workspace: PathBuf) -> Result<Self> {
         let config: FeishuConfig = serde_json::from_value(config)?;
         Ok(Self {
-            base: ChannelBase::new(serde_json::to_value(&config)?, bus),
+            base: ChannelBase::new(serde_json::to_value(&config)?, bus, workspace),
             config,
             api: AsyncMutex::new(None),
             _processed_message_ids: Mutex::new(VecDeque::new()),
@@ -1078,13 +1078,9 @@ impl FeishuChannel {
     }
 
     fn media_dir(&self) -> Result<std::path::PathBuf> {
-        ensure_dir(
-            dirs::home_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join(".rbot")
-                .join("media")
-                .join("feishu"),
-        )
+        let dir = workspace_state_dir(&self.base.workspace).join("downloads");
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
     }
 
     async fn add_reaction(&self, message_id: &str, emoji_type: &str) {

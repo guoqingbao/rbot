@@ -5,6 +5,7 @@ pub mod telegram;
 
 use std::any::Any;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Result, anyhow};
@@ -34,14 +35,16 @@ pub use telegram::{
 pub struct ChannelBase {
     pub config: Value,
     pub bus: MessageBus,
+    pub workspace: PathBuf,
     running: Arc<Mutex<bool>>,
 }
 
 impl ChannelBase {
-    pub fn new(config: Value, bus: MessageBus) -> Self {
+    pub fn new(config: Value, bus: MessageBus, workspace: PathBuf) -> Self {
         Self {
             config,
             bus,
+            workspace,
             running: Arc::new(Mutex::new(false)),
         }
     }
@@ -122,7 +125,8 @@ pub trait Channel: Send + Sync {
     async fn send(&self, msg: OutboundMessage) -> Result<()>;
 }
 
-type ChannelFactory = Arc<dyn Fn(Value, MessageBus) -> Result<Arc<dyn Channel>> + Send + Sync>;
+type ChannelFactory =
+    Arc<dyn Fn(Value, MessageBus, PathBuf) -> Result<Arc<dyn Channel>> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct ChannelDescriptor {
@@ -160,9 +164,9 @@ pub struct LocalChannel {
 }
 
 impl LocalChannel {
-    pub fn new(config: Value, bus: MessageBus) -> Self {
+    pub fn new(config: Value, bus: MessageBus, workspace: PathBuf) -> Self {
         Self {
-            base: ChannelBase::new(config, bus),
+            base: ChannelBase::new(config, bus, workspace),
             sent: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -275,7 +279,9 @@ pub fn discover_all() -> BTreeMap<String, ChannelDescriptor> {
             "local",
             "Local",
             LocalChannel::default_config(),
-            Arc::new(|config, bus| Ok(Arc::new(LocalChannel::new(config, bus)))),
+            Arc::new(|config, bus, workspace| {
+                Ok(Arc::new(LocalChannel::new(config, bus, workspace)))
+            }),
         ),
     );
     builtin.insert(
@@ -284,7 +290,9 @@ pub fn discover_all() -> BTreeMap<String, ChannelDescriptor> {
             "email",
             "Email",
             EmailChannel::default_config(),
-            Arc::new(|config, bus| Ok(Arc::new(EmailChannel::new(config, bus)?))),
+            Arc::new(|config, bus, workspace| {
+                Ok(Arc::new(EmailChannel::new(config, bus, workspace)?))
+            }),
         ),
     );
     builtin.insert(
@@ -293,7 +301,9 @@ pub fn discover_all() -> BTreeMap<String, ChannelDescriptor> {
             "feishu",
             "Feishu",
             FeishuChannel::default_config(),
-            Arc::new(|config, bus| Ok(Arc::new(FeishuChannel::new(config, bus)?))),
+            Arc::new(|config, bus, workspace| {
+                Ok(Arc::new(FeishuChannel::new(config, bus, workspace)?))
+            }),
         ),
     );
     builtin.insert(
@@ -302,7 +312,9 @@ pub fn discover_all() -> BTreeMap<String, ChannelDescriptor> {
             "slack",
             "Slack",
             SlackChannel::default_config(),
-            Arc::new(|config, bus| Ok(Arc::new(SlackChannel::new(config, bus)?))),
+            Arc::new(|config, bus, workspace| {
+                Ok(Arc::new(SlackChannel::new(config, bus, workspace)?))
+            }),
         ),
     );
     builtin.insert(
@@ -311,7 +323,9 @@ pub fn discover_all() -> BTreeMap<String, ChannelDescriptor> {
             "telegram",
             "Telegram",
             TelegramChannel::default_config(),
-            Arc::new(|config, bus| Ok(Arc::new(TelegramChannel::new(config, bus)?))),
+            Arc::new(|config, bus, workspace| {
+                Ok(Arc::new(TelegramChannel::new(config, bus, workspace)?))
+            }),
         ),
     );
     let external = discover_plugins();
@@ -325,15 +339,17 @@ pub fn discover_all() -> BTreeMap<String, ChannelDescriptor> {
 pub struct ChannelManager {
     pub bus: MessageBus,
     pub channels: BTreeMap<String, Arc<dyn Channel>>,
+    pub workspace: PathBuf,
     config: ChannelsConfig,
     dispatch_task: AsyncMutex<Option<JoinHandle<()>>>,
 }
 
 impl ChannelManager {
-    pub fn new(config: ChannelsConfig, bus: MessageBus) -> Result<Self> {
+    pub fn new(config: ChannelsConfig, bus: MessageBus, workspace: PathBuf) -> Result<Self> {
         let mut manager = Self {
             bus,
             channels: BTreeMap::new(),
+            workspace,
             config,
             dispatch_task: AsyncMutex::new(None),
         };
@@ -353,7 +369,8 @@ impl ChannelManager {
             if !enabled {
                 continue;
             }
-            let channel = (descriptor.factory)(section.clone(), self.bus.clone())?;
+            let channel =
+                (descriptor.factory)(section.clone(), self.bus.clone(), self.workspace.clone())?;
             if channel.base().allow_from().is_empty() {
                 return Err(anyhow!(
                     "\"{name}\" has empty allowFrom (denies all). Set [\"*\"] or explicit IDs."

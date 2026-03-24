@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -49,7 +50,11 @@ impl Channel for DummyChannel {
 #[test]
 fn is_allowed_requires_exact_match() {
     let channel = DummyChannel {
-        base: ChannelBase::new(json!({"allowFrom":["allow@email.com"]}), MessageBus::new(4)),
+        base: ChannelBase::new(
+            json!({"allowFrom":["allow@email.com"]}),
+            MessageBus::new(4),
+            PathBuf::new(),
+        ),
     };
     assert!(channel.base().is_allowed("allow@email.com"));
     assert!(!channel.base().is_allowed("attacker|allow@email.com"));
@@ -73,9 +78,9 @@ fn discover_plugins_and_builtin_priority() {
         "line",
         "Line",
         json!({"enabled": false}),
-        Arc::new(|config, bus| {
+        Arc::new(|config, bus, workspace| {
             Ok(Arc::new(DummyChannel {
-                base: ChannelBase::new(config, bus),
+                base: ChannelBase::new(config, bus, workspace),
             }))
         }),
     ));
@@ -83,9 +88,9 @@ fn discover_plugins_and_builtin_priority() {
         "local",
         "Fake Local",
         json!({"enabled": false}),
-        Arc::new(|config, bus| {
+        Arc::new(|config, bus, workspace| {
             Ok(Arc::new(DummyChannel {
-                base: ChannelBase::new(config, bus),
+                base: ChannelBase::new(config, bus, workspace),
             }))
         }),
     ));
@@ -109,7 +114,7 @@ async fn manager_loads_plugin_from_dict_config_and_dispatches() {
         "fakeplugin",
         "Fake Plugin",
         json!({"enabled": false}),
-        Arc::new(move |config, bus| {
+        Arc::new(move |config, bus, workspace| {
             let sent = sent_ref.clone();
             struct FakeChannel {
                 base: ChannelBase,
@@ -140,7 +145,7 @@ async fn manager_loads_plugin_from_dict_config_and_dispatches() {
                 }
             }
             Ok(Arc::new(FakeChannel {
-                base: ChannelBase::new(config, bus),
+                base: ChannelBase::new(config, bus, workspace),
                 sent,
             }))
         }),
@@ -151,7 +156,7 @@ async fn manager_loads_plugin_from_dict_config_and_dispatches() {
         "fakeplugin": {"enabled": true, "allowFrom": ["*"]}
     }))
     .unwrap();
-    let manager = ChannelManager::new(cfg, bus.clone()).unwrap();
+    let manager = ChannelManager::new(cfg, bus.clone(), PathBuf::new()).unwrap();
     assert!(
         manager
             .enabled_channels()

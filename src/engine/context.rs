@@ -205,9 +205,12 @@ impl ContextBuilder {
                 continue;
             }
             let raw = fs::read(&path)?;
-            let mime = detect_image_mime(&raw)
-                .or_else(|| mime_guess::from_path(&path).first_raw())
-                .filter(|mime| mime.starts_with("image/"));
+            let mime = detect_image_mime(&raw).filter(|mime| {
+                matches!(
+                    *mime,
+                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                )
+            });
             if let Some(mime) = mime {
                 blocks.extend(build_image_content_blocks(
                     &raw,
@@ -223,5 +226,63 @@ impl ContextBuilder {
         }
         blocks.push(json!({"type": "text", "text": text}));
         Ok(Value::Array(blocks))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ContextBuilder;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn build_user_content_processes_valid_images_and_excludes_others() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+
+        // Valid PNG (minimal header)
+        let png_path = workspace.join("test.png");
+        fs::write(&png_path, b"\x89PNG\r\n\x1a\nDATA").unwrap();
+
+        // Unsupported SVG
+        let svg_path = workspace.join("test.svg");
+        fs::write(&svg_path, b"<svg></svg>").unwrap();
+
+        // Invalid bytes with a misleading image extension should be excluded.
+        let fake_png_path = workspace.join("fake.png");
+        fs::write(&fake_png_path, b"not really a png").unwrap();
+
+        let builder = ContextBuilder::new(workspace, 1024).unwrap();
+
+        // Test with only text
+        let content = builder.build_user_content("hello", None).unwrap();
+        assert_eq!(content, "hello");
+
+        // Test with mixed media
+        let media = vec![
+            png_path.to_str().unwrap().to_string(),
+            svg_path.to_str().unwrap().to_string(),
+            fake_png_path.to_str().unwrap().to_string(),
+        ];
+        let content = builder
+            .build_user_content("describe this", Some(&media))
+            .unwrap();
+        let blocks = content.as_array().unwrap();
+
+        // Should have 2 blocks for PNG (image_url + label) + 1 for text = 3 total
+        // SVG should be excluded
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].get("type").unwrap(), "image_url");
+        assert_eq!(blocks[1].get("type").unwrap(), "text");
+        assert!(
+            blocks[1]
+                .get("text")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("test.png")
+        );
+        assert_eq!(blocks[2].get("type").unwrap(), "text");
+        assert_eq!(blocks[2].get("text").unwrap(), "describe this");
     }
 }

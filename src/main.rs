@@ -480,7 +480,11 @@ async fn run(config_path: Option<&Path>, model_override: Option<String>) -> Resu
     runtime.start().await?;
     cron_service.start().await?;
 
-    let manager = Arc::new(ChannelManager::new(config.channels.clone(), bus.clone())?);
+    let manager = Arc::new(ChannelManager::new(
+        config.channels.clone(),
+        bus.clone(),
+        workspace.clone(),
+    )?);
     manager.start_all().await?;
     if let Some(heartbeat_service) = &heartbeat_service {
         heartbeat_service.start().await?;

@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -394,10 +395,10 @@ pub struct EmailChannel {
 impl EmailChannel {
     const MAX_PROCESSED_UIDS: usize = 100_000;
 
-    pub fn new(config: Value, bus: MessageBus) -> Result<Self> {
+    pub fn new(config: Value, bus: MessageBus, workspace: PathBuf) -> Result<Self> {
         let config: EmailConfig = serde_json::from_value(config)?;
         Ok(Self {
-            base: ChannelBase::new(serde_json::to_value(&config)?, bus),
+            base: ChannelBase::new(serde_json::to_value(&config)?, bus, workspace),
             config,
             backend: Arc::new(SystemEmailBackend),
             poll_task: AsyncMutex::new(None),

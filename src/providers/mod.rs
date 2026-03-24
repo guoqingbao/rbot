@@ -377,9 +377,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
         text_stream: Option<TextStreamCallback>,
     ) -> Result<LlmResponse> {
         let endpoint = format!("{}/chat/completions", self.api_base.trim_end_matches('/'));
+        let openai_messages: Vec<Value> = messages.iter().map(|m| m.to_openai_payload()).collect();
         let mut request = self.client.post(endpoint).json(&json!({
             "model": model.unwrap_or(self.default_model()),
-            "messages": messages,
+            "messages": openai_messages,
             "tools": tools.unwrap_or(&[]),
             "max_tokens": max_tokens.unwrap_or(self.generation.max_tokens),
             "temperature": temperature.unwrap_or(self.generation.temperature),
@@ -437,8 +438,9 @@ impl LlmProvider for AzureOpenAiProvider {
         text_stream: Option<TextStreamCallback>,
     ) -> Result<LlmResponse> {
         let endpoint = self.build_chat_url(model.unwrap_or(&self.default_model));
+        let openai_messages: Vec<Value> = messages.iter().map(|m| m.to_openai_payload()).collect();
         let mut payload = json!({
-            "messages": messages,
+            "messages": openai_messages,
             "max_completion_tokens": max_tokens.unwrap_or(self.generation.max_tokens),
             "stream": true,
         });

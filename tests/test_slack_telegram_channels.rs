@@ -18,6 +18,7 @@ struct FakeSlackApi {
     uploads: Mutex<Vec<BTreeMap<String, Value>>>,
     reactions_add: Mutex<Vec<BTreeMap<String, Value>>>,
     reactions_remove: Mutex<Vec<BTreeMap<String, Value>>>,
+    downloads: Mutex<BTreeMap<String, Vec<u8>>>,
 }
 
 #[async_trait]
@@ -47,6 +48,16 @@ impl SlackApi for FakeSlackApi {
             ("thread_ts".to_string(), json!(thread_ts)),
         ]));
         Ok(())
+    }
+
+    async fn download_file(&self, url: &str) -> Result<Vec<u8>> {
+        Ok(self
+            .downloads
+            .lock()
+            .unwrap()
+            .get(url)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn reactions_add(&self, channel: &str, name: &str, timestamp: &str) -> Result<()> {
@@ -83,6 +94,14 @@ impl TelegramApi for FakeTelegramApi {
             id: 999,
             username: "rbot_test".to_string(),
         })
+    }
+
+    async fn get_file(&self, _file_id: &str) -> Result<String> {
+        Ok("mock/file/path".to_string())
+    }
+
+    async fn download_file(&self, _file_path: &str) -> Result<Vec<u8>> {
+        Ok(Vec::new())
     }
 
     async fn send_message(
@@ -175,6 +194,7 @@ async fn slack_send_uses_thread_for_channel_messages() {
     let channel = SlackChannel::new(
         json!({"enabled": true, "allowFrom": ["*"], "botToken": "x"}),
         MessageBus::new(8),
+        std::env::temp_dir(),
     )
     .unwrap();
     let api = Arc::new(FakeSlackApi::default());
@@ -214,6 +234,7 @@ async fn slack_send_updates_reactions_for_final_responses() {
     let channel = SlackChannel::new(
         json!({"enabled": true, "allowFrom": ["*"], "botToken": "x", "reactEmoji": "eyes"}),
         MessageBus::new(8),
+        std::env::temp_dir(),
     )
     .unwrap();
     let api = Arc::new(FakeSlackApi::default());
@@ -258,6 +279,7 @@ async fn slack_handle_event_scopes_channel_threads_to_session_key() {
     let channel = SlackChannel::new(
         json!({"enabled": true, "allowFrom": ["u1"], "botToken": "x"}),
         bus.clone(),
+        std::env::temp_dir(),
     )
     .unwrap();
     channel.set_bot_user_id(Some("B123".to_string()));
@@ -282,11 +304,57 @@ async fn slack_handle_event_scopes_channel_threads_to_session_key() {
     assert_eq!(inbound.session_key(), "slack:C123:1700000000.000100");
 }
 
+#[tokio::test]
+async fn slack_handle_event_skips_unrecognized_image_downloads() {
+    let dir = tempdir().unwrap();
+    let bus = MessageBus::new(8);
+    let channel = SlackChannel::new(
+        json!({"enabled": true, "allowFrom": ["u1"], "botToken": "x"}),
+        bus.clone(),
+        dir.path().to_path_buf(),
+    )
+    .unwrap();
+    channel.set_bot_user_id(Some("B123".to_string()));
+    let api = Arc::new(FakeSlackApi::default());
+    api.downloads.lock().unwrap().insert(
+        "https://files.slack.com/demo".to_string(),
+        b"not really an image".to_vec(),
+    );
+    channel.set_api(api).await;
+
+    channel
+        .handle_event(&json!({
+            "type": "app_mention",
+            "user": "u1",
+            "channel": "C123",
+            "channel_type": "channel",
+            "text": "<@B123> inspect this image",
+            "ts": "1700000000.000100",
+            "files": [
+                {
+                    "url_private": "https://files.slack.com/demo",
+                    "name": "photo.png",
+                    "mimetype": "image/png"
+                }
+            ]
+        }))
+        .await
+        .unwrap();
+
+    let inbound = tokio::time::timeout(Duration::from_secs(1), bus.consume_inbound())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(inbound.content, "inspect this image");
+    assert!(inbound.media.is_empty());
+}
+
 #[test]
 fn telegram_is_allowed_accepts_legacy_id_username_formats() {
     let channel = TelegramChannel::new(
         json!({"allowFrom": ["12345", "alice", "67890|bob"]}),
         MessageBus::new(8),
+        std::env::temp_dir(),
     )
     .unwrap();
     assert!(channel.is_allowed("12345|carol"));
@@ -312,6 +380,7 @@ async fn telegram_send_preserves_topic_and_infers_reply_topic_from_cache() {
     let channel = TelegramChannel::new(
         json!({"enabled": true, "token": "123:abc", "allowFrom": ["*"], "replyToMessage": true}),
         MessageBus::new(8),
+        std::env::temp_dir(),
     )
     .unwrap();
     let api = Arc::new(FakeTelegramApi::default());
@@ -362,6 +431,7 @@ async fn telegram_send_routes_media_and_blocks_unsafe_remote_urls() {
     let channel = TelegramChannel::new(
         json!({"enabled": true, "token": "123:abc", "allowFrom": ["*"]}),
         MessageBus::new(8),
+        std::env::temp_dir(),
     )
     .unwrap();
     let api = Arc::new(FakeTelegramApi::default());
@@ -398,6 +468,7 @@ async fn telegram_group_policy_mention_gates_group_messages() {
     let channel = TelegramChannel::new(
         json!({"enabled": true, "token": "123:abc", "allowFrom": ["*"], "groupPolicy": "mention"}),
         bus.clone(),
+        std::env::temp_dir(),
     )
     .unwrap();
     let api = Arc::new(FakeTelegramApi::default());
