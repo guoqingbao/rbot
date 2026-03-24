@@ -1274,7 +1274,16 @@ impl FeishuChannel {
         receive_id: &str,
         tool_hint: &str,
     ) -> Result<()> {
-        let formatted = Self::format_tool_hint_lines(tool_hint);
+        let clean_hint = tool_hint
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim();
+        let clean_hint = if let Some((_, remainder)) = clean_hint.split_once(' ') {
+            remainder.trim()
+        } else {
+            clean_hint
+        };
+        let formatted = Self::format_tool_hint_lines(clean_hint);
         let card = json!({
             "config": {"wide_screen_mode": true},
             "elements": [

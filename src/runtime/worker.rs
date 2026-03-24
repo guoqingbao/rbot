@@ -66,25 +66,28 @@ impl AgentRuntime {
                 let Some(msg) = this.bus.consume_inbound().await else {
                     break;
                 };
-                match this.agent.process_inbound(msg).await {
-                    Ok(Some(outbound)) => {
-                        let _ = this.bus.publish_outbound(outbound).await;
+                let this_clone = this.clone();
+                tokio::spawn(async move {
+                    match this_clone.agent.process_inbound(msg).await {
+                        Ok(Some(outbound)) => {
+                            let _ = this_clone.bus.publish_outbound(outbound).await;
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            let _ = this_clone
+                                .bus
+                                .publish_outbound(OutboundMessage {
+                                    channel: "system".to_string(),
+                                    chat_id: "runtime".to_string(),
+                                    content: format!("Error processing inbound message: {err}"),
+                                    reply_to: None,
+                                    media: Vec::new(),
+                                    metadata: Default::default(),
+                                })
+                                .await;
+                        }
                     }
-                    Ok(None) => {}
-                    Err(err) => {
-                        let _ = this
-                            .bus
-                            .publish_outbound(OutboundMessage {
-                                channel: "system".to_string(),
-                                chat_id: "runtime".to_string(),
-                                content: format!("Error processing inbound message: {err}"),
-                                reply_to: None,
-                                media: Vec::new(),
-                                metadata: Default::default(),
-                            })
-                            .await;
-                    }
-                }
+                });
             }
         });
         *self.task.lock().await = Some(handle);

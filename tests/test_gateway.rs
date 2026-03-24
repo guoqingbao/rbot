@@ -89,6 +89,33 @@ async fn slack_gateway_handles_url_verification() {
     }))
     .unwrap();
     let manager = Arc::new(ChannelManager::new(cfg.clone(), bus).unwrap());
+    let slack_channel = manager.get_channel("slack").unwrap();
+    let slack = slack_channel
+        .as_any()
+        .downcast_ref::<rbot::channels::SlackChannel>()
+        .unwrap();
+
+    struct FakeSlackApi;
+    #[async_trait]
+    impl rbot::channels::SlackApi for FakeSlackApi {
+        async fn auth_test(&self) -> Result<String> {
+            Ok("B123".to_string())
+        }
+        async fn chat_post_message(&self, _: &str, _: &str, _: Option<&str>) -> Result<()> {
+            Ok(())
+        }
+        async fn files_upload(&self, _: &str, _: &str, _: Option<&str>) -> Result<()> {
+            Ok(())
+        }
+        async fn reactions_add(&self, _: &str, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn reactions_remove(&self, _: &str, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+    slack.set_api(Arc::new(FakeSlackApi)).await;
+
     let router = build_webhook_router(&manager, &cfg).unwrap().unwrap();
     manager.start_all().await.unwrap();
 
@@ -258,6 +285,33 @@ async fn slack_gateway_rejects_invalid_signature() {
     }))
     .unwrap();
     let manager = Arc::new(ChannelManager::new(cfg.clone(), bus).unwrap());
+    let slack_channel = manager.get_channel("slack").unwrap();
+    let slack = slack_channel
+        .as_any()
+        .downcast_ref::<rbot::channels::SlackChannel>()
+        .unwrap();
+
+    struct FakeSlackApi;
+    #[async_trait]
+    impl rbot::channels::SlackApi for FakeSlackApi {
+        async fn auth_test(&self) -> Result<String> {
+            Ok("B123".to_string())
+        }
+        async fn chat_post_message(&self, _: &str, _: &str, _: Option<&str>) -> Result<()> {
+            Ok(())
+        }
+        async fn files_upload(&self, _: &str, _: &str, _: Option<&str>) -> Result<()> {
+            Ok(())
+        }
+        async fn reactions_add(&self, _: &str, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn reactions_remove(&self, _: &str, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+    slack.set_api(Arc::new(FakeSlackApi)).await;
+
     let router = build_webhook_router(&manager, &cfg).unwrap().unwrap();
 
     let response = router

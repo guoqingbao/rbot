@@ -112,8 +112,8 @@ pub async fn run_config_provider(config_path: Option<&Path>) -> Result<()> {
             .prompt()?;
     }
 
-    config.providers.insert(provider_key, provider_cfg);
-    config.agents.defaults.provider = selected_provider_name;
+    config.providers.insert(provider_key.clone(), provider_cfg);
+    config.agents.defaults.provider = provider_key;
 
     let path = config.save(config_path)?;
     println!(

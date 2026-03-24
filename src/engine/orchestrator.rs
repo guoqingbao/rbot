@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -52,6 +52,8 @@ pub struct AgentLoop {
     cron_tool: Option<Arc<CronTool>>,
     start_time: Instant,
     last_usage: Mutex<(usize, usize)>,
+    cancellations: Arc<Mutex<HashSet<String>>>,
+    active_turns: Arc<Mutex<HashSet<String>>>,
 }
 
 impl AgentLoop {
@@ -141,6 +143,8 @@ impl AgentLoop {
             cron_tool,
             start_time: Instant::now(),
             last_usage: Mutex::new((0, 0)),
+            cancellations: Arc::new(Mutex::new(HashSet::new())),
+            active_turns: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -206,27 +210,58 @@ impl AgentLoop {
         if msg.channel == "system" {
             return self.process_system_inbound(msg).await;
         }
-        if msg.content.trim() == "/stop" {
-            let cancelled = self.subagents.cancel_by_session(&msg.session_key()).await;
+        let trimmed = msg.content.trim().to_lowercase();
+        if trimmed == "/stop" || trimmed == "stop" || trimmed == "[stop]" {
+            let session_key = msg.session_key();
+            self.cancellations
+                .lock()
+                .expect("cancellations lock poisoned")
+                .insert(session_key.clone());
+            let cancelled = self.subagents.cancel_by_session(&session_key).await;
+            let is_active = self
+                .active_turns
+                .lock()
+                .expect("active turns lock poisoned")
+                .contains(&session_key);
+
             return Ok(Some(OutboundMessage {
                 channel: msg.channel,
                 chat_id: msg.chat_id,
-                content: if cancelled == 0 {
+                content: if cancelled == 0 && !is_active {
                     "No active task to stop.".to_string()
-                } else {
+                } else if cancelled > 0 && is_active {
+                    format!("Stopped {cancelled} task(s) and current turn.")
+                } else if cancelled > 0 {
                     format!("Stopped {cancelled} task(s).")
+                } else {
+                    "Stopping current turn...".to_string()
                 },
                 reply_to: None,
                 media: Vec::new(),
                 metadata: BTreeMap::new(),
             }));
         }
+
+        let session_key = msg.session_key();
+
+        // Immediate cancellation check: if user just sent a stop command, don't start a new turn
+        {
+            if self
+                .cancellations
+                .lock()
+                .expect("cancellations lock poisoned")
+                .contains(&session_key)
+            {
+                return Ok(None);
+            }
+        }
+
         {
             let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
-            let mut session = sessions.get_or_create(&msg.session_key())?;
+            let mut session = sessions.get_or_create(&session_key)?;
 
-            match msg.content.trim() {
-                "/new" => {
+            match trimmed.as_str() {
+                "/new" | "new" | "/clear" | "clear" | "[clear]" => {
                     let snapshot = session.messages[session.last_consolidated..].to_vec();
                     session.clear();
                     sessions.save(&session)?;
@@ -236,20 +271,20 @@ impl AgentLoop {
                     return Ok(Some(OutboundMessage {
                         channel: msg.channel,
                         chat_id: msg.chat_id,
-                        content: "New session started.".to_string(),
+                        content: "New session started. Memory cleared.".to_string(),
                         reply_to: None,
                         media: Vec::new(),
                         metadata: BTreeMap::new(),
                     }));
                 }
-                "/status" => {
+                "/status" | "status" => {
                     return Ok(Some(self.status_response(&msg, &session)));
                 }
-                "/help" => {
+                "/help" | "help" => {
                     return Ok(Some(OutboundMessage {
                         channel: msg.channel,
                         chat_id: msg.chat_id,
-                        content: "/new\n/stop\n/restart\n/status\n/help".to_string(),
+                        content: "/new (or clear)\n/stop\n/status\n/help".to_string(),
                         reply_to: None,
                         media: Vec::new(),
                         metadata: BTreeMap::new(),
@@ -276,9 +311,10 @@ impl AgentLoop {
             cron_tool.set_context(&msg.channel, &msg.chat_id);
         }
 
+        let session_key = msg.session_key();
         let history = {
             let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
-            sessions.get_or_create(&msg.session_key())?.get_history(0)
+            sessions.get_or_create(&session_key)?.get_history(0)
         };
         let initial_messages = self.context.build_messages(
             history,
@@ -288,8 +324,11 @@ impl AgentLoop {
             Some(&msg.chat_id),
             "user",
         )?;
-        let (final_content, all_messages) = match self
+
+        let _guard = ActiveTurnGuard::new(self.active_turns.clone(), session_key.clone());
+        let (final_content, all_messages, interrupted) = match self
             .run_agent_loop(
+                &session_key,
                 initial_messages.clone(),
                 text_stream,
                 Some(ProgressTarget::from_inbound(&msg)),
@@ -298,16 +337,20 @@ impl AgentLoop {
         {
             Ok(result) => result,
             Err(err) => {
-                self.persist_session_messages(&msg.session_key(), &initial_messages)?;
+                self.persist_session_messages(&session_key, &initial_messages)?;
                 return Err(err);
             }
         };
 
         let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
-        let mut session = sessions.get_or_create(&msg.session_key())?;
+        let mut session = sessions.get_or_create(&session_key)?;
         self.save_turn(&mut session, &all_messages)?;
         self.memory.maybe_consolidate_by_tokens(&mut session)?;
         sessions.save(&session)?;
+
+        if interrupted {
+            return Ok(None);
+        }
 
         if self.message_tool.sent_in_turn() {
             return Ok(None);
@@ -357,8 +400,11 @@ impl AgentLoop {
                 "user"
             },
         )?;
-        let (final_content, all_messages) = match self
+
+        let _guard = ActiveTurnGuard::new(self.active_turns.clone(), session_key.clone());
+        let (final_content, all_messages, interrupted) = match self
             .run_agent_loop(
+                &session_key,
                 initial_messages.clone(),
                 None,
                 Some(ProgressTarget {
@@ -382,6 +428,10 @@ impl AgentLoop {
         self.memory.maybe_consolidate_by_tokens(&mut session)?;
         sessions.save(&session)?;
 
+        if interrupted {
+            return Ok(None);
+        }
+
         Ok(Some(OutboundMessage {
             channel,
             chat_id,
@@ -394,19 +444,39 @@ impl AgentLoop {
 
     async fn run_agent_loop(
         &self,
+        session_key: &str,
         mut messages: Vec<ChatMessage>,
         text_stream: Option<TextStreamCallback>,
         progress_target: Option<ProgressTarget>,
-    ) -> Result<(Option<String>, Vec<ChatMessage>)> {
+    ) -> Result<(Option<String>, Vec<ChatMessage>, bool)> {
+        // Clear any existing cancellation for this session at the start of a turn
+        {
+            self.cancellations
+                .lock()
+                .expect("cancellations lock poisoned")
+                .remove(session_key);
+        }
+
         *self.last_usage.lock().expect("usage lock poisoned") = (0, 0);
         let mut final_content = None;
         let think_re = Regex::new(r"(?s)<think>.*?</think>").expect("valid think regex");
-        let mut last_tool_fingerprint: Option<String> = None;
-        let mut repeated_tool_batches = 0_usize;
+        let mut tool_fingerprint_history: Vec<String> = Vec::new();
         let mut last_assistant_content: Option<String> = None;
 
         let mut iteration = 0_usize;
         loop {
+            // Check for cancellation at the start of the loop
+            {
+                if self
+                    .cancellations
+                    .lock()
+                    .expect("cancellations lock poisoned")
+                    .contains(session_key)
+                {
+                    return Ok((None, messages, true));
+                }
+            }
+
             if self.max_iterations > 0 && iteration >= self.max_iterations {
                 break;
             }
@@ -425,15 +495,32 @@ impl AgentLoop {
                 .await?;
             self.record_usage(&response);
 
+            // Check for cancellation immediately after LLM response
+            {
+                if self
+                    .cancellations
+                    .lock()
+                    .expect("cancellations lock poisoned")
+                    .contains(session_key)
+                {
+                    return Ok((None, messages, true));
+                }
+            }
+
             if response.has_tool_calls() {
+                // Improve repeated tool detection: check for identical fingerprint anywhere in recent history
                 let tool_call_fingerprint = serde_json::to_string(&response.tool_calls)
                     .unwrap_or_else(|_| format!("{:?}", response.tool_calls));
-                if last_tool_fingerprint.as_deref() == Some(tool_call_fingerprint.as_str()) {
-                    repeated_tool_batches += 1;
-                } else {
-                    repeated_tool_batches = 1;
-                    last_tool_fingerprint = Some(tool_call_fingerprint);
+
+                let repeated = tool_fingerprint_history
+                    .iter()
+                    .any(|h| h == &tool_call_fingerprint);
+
+                tool_fingerprint_history.push(tool_call_fingerprint);
+                if tool_fingerprint_history.len() > 10 {
+                    tool_fingerprint_history.remove(0);
                 }
+
                 let tool_calls = response
                     .tool_calls
                     .iter()
@@ -454,7 +541,19 @@ impl AgentLoop {
                     response.reasoning_content.clone(),
                     response.thinking_blocks.clone(),
                 );
+
                 for tool_call in response.tool_calls {
+                    // Check for cancellation before each tool call
+                    {
+                        if self
+                            .cancellations
+                            .lock()
+                            .expect("cancellations lock poisoned")
+                            .contains(session_key)
+                        {
+                            return Ok((None, messages, true));
+                        }
+                    }
                     self.send_tool_hint(progress_target.as_ref(), &tool_call)
                         .await;
                     let output = self
@@ -468,13 +567,33 @@ impl AgentLoop {
                         output.into_value(),
                     );
                 }
-                if repeated_tool_batches >= 3 {
-                    final_content = Some(build_repeated_tool_loop_message(
-                        repeated_tool_batches,
-                        &messages,
-                        last_assistant_content.as_deref(),
-                    ));
-                    break;
+
+                // Break the main loop if cancellation was detected during tool execution
+                {
+                    if self
+                        .cancellations
+                        .lock()
+                        .expect("cancellations lock poisoned")
+                        .contains(session_key)
+                    {
+                        return Ok((None, messages, true));
+                    }
+                }
+
+                if repeated {
+                    // Check if we've seen this exact same pattern multiple times in this turn
+                    let count = tool_fingerprint_history
+                        .iter()
+                        .filter(|h| h.as_str() == tool_fingerprint_history.last().unwrap().as_str())
+                        .count();
+                    if count >= 3 {
+                        final_content = Some(build_repeated_tool_loop_message(
+                            count,
+                            &messages,
+                            last_assistant_content.as_deref(),
+                        ));
+                        break;
+                    }
                 }
             } else {
                 let content = response
@@ -497,6 +616,18 @@ impl AgentLoop {
             }
         }
 
+        // Final cancellation check before returning
+        {
+            if self
+                .cancellations
+                .lock()
+                .expect("cancellations lock poisoned")
+                .contains(session_key)
+            {
+                return Ok((None, messages, true));
+            }
+        }
+
         if final_content.is_none() && self.max_iterations > 0 {
             final_content = Some(build_iteration_limit_message(
                 self.max_iterations,
@@ -505,7 +636,7 @@ impl AgentLoop {
             ));
         }
 
-        Ok((final_content, messages))
+        Ok((final_content, messages, false))
     }
 
     fn recent_tool_diagnostics(messages: &[ChatMessage]) -> Vec<String> {
@@ -667,6 +798,24 @@ impl AgentLoop {
     }
 }
 
+struct ActiveTurnGuard {
+    set: Arc<Mutex<HashSet<String>>>,
+    key: String,
+}
+
+impl ActiveTurnGuard {
+    fn new(set: Arc<Mutex<HashSet<String>>>, key: String) -> Self {
+        set.lock().unwrap().insert(key.clone());
+        Self { set, key }
+    }
+}
+
+impl Drop for ActiveTurnGuard {
+    fn drop(&mut self) {
+        self.set.lock().unwrap().remove(&self.key);
+    }
+}
+
 #[derive(Clone)]
 struct ProgressTarget {
     channel: String,
@@ -685,11 +834,12 @@ impl ProgressTarget {
 }
 
 fn format_tool_hint(tool_call: &crate::providers::ToolCallRequest) -> String {
+    let emoji = crate::util::tool_emoji(&tool_call.name);
     let preview = summarize_tool_arguments(&tool_call.arguments);
     if preview.is_empty() {
-        tool_call.name.clone()
+        format!("[ {emoji} {} ]", tool_call.name)
     } else {
-        format!("{} · {}", tool_call.name, preview)
+        format!("[ {emoji} {}  {} ]", tool_call.name, preview)
     }
 }
 

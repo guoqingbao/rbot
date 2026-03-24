@@ -1330,7 +1330,11 @@ impl Tool for WebFetchTool {
                         }
                         let truncated = text.len() > max_chars;
                         if truncated {
-                            text.truncate(max_chars);
+                            let mut end = max_chars;
+                            while end > 0 && !text.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            text.truncate(end);
                         }
                         ToolOutput::Text(
                             json!({

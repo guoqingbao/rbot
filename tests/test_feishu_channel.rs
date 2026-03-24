@@ -220,7 +220,7 @@ async fn tool_hint_sends_interactive_code_card() {
         .send(OutboundMessage {
             channel: "feishu".to_string(),
             chat_id: "oc_123456".to_string(),
-            content: r#"web_search("test query")"#.to_string(),
+            content: r#"[ 🔍 web_search  query="test query" ]"#.to_string(),
             reply_to: None,
             media: Vec::new(),
             metadata: BTreeMap::from([("_tool_hint".to_string(), json!(true))]),
@@ -236,7 +236,7 @@ async fn tool_hint_sends_interactive_code_card() {
     let card: Value = serde_json::from_str(&calls[0].3).unwrap();
     assert_eq!(
         card["elements"][0]["content"],
-        json!("**Tool Calls**\n\n```text\nweb_search(\"test query\")\n```")
+        json!("**Tool Calls**\n\n```text\nweb_search  query=\"test query\"\n```")
     );
 }
 

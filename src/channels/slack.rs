@@ -549,7 +549,8 @@ impl SlackChannel {
     }
 
     fn strip_bot_mention(&self, text: &str) -> String {
-        let re = Regex::new(r"<@[A-Z0-9]+>").expect("valid slack mention regex");
+        // Handle standard mentions <@U123> and mentions with display names <@U123|name>
+        let re = Regex::new(r"(?i)<@[A-Z0-9]+(?:\|[^>]+)?>").expect("valid slack mention regex");
         re.replace_all(text, "").trim().to_string()
     }
 

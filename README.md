@@ -50,7 +50,20 @@ Or manually edit `~/.rbot/config.json`. **Examples:**
 - 🚀 vLLM at `http://localhost:8000/v1`
 - 🛠️ LM Studio or any other OpenAI-compatible local server via `providers.custom.apiBase`
 
-See [Getting Started](./docs/USAGE.md) for more configuration options.
+### Config Communication Channels
+
+Before starting the backend, you should configure your preferred communication channels (Slack, Telegram, etc.) to enable message ingress and delivery. 📬
+
+Use the interactive configuration tool:
+
+```bash
+cargo run --release -- config --channel
+```
+
+This tool helps you selectively enable channels, set permissions, and provide required tokens or secrets. For manual configuration or detailed channel options, see [Getting Started](./docs/USAGE.md#5-channel-configuration).
+
+> [!TIP]
+> **Slack Users:** To set up your Slack App for use with `rbot` (including Webhook and Socket Mode instructions), refer to the [OpenClaw Slack Manual](https://www.meta-intelligence.tech/en/insight-openclaw-slack).
 
 ### Run a one-shot prompt:
 
@@ -68,7 +81,7 @@ The CLI includes:
 - 📡 Streamed responses
 - 📜 Persistent history
 - 💻 Local shell commands such as `/help` and `/clear`
-- 🤖 Agent commands such as `/new`, `/status`, and `/stop`
+- 🤖 Agent commands such as `/new`, `/clear`, `/status`, and `/stop`
 
 ### Start the backend (Personal AI Assistant):
 
@@ -98,6 +111,15 @@ cargo run --release -- jobs
 - ✈️ **telegram**: webhook ingress + send
 - 🦘 **feishu**: webhook ingress + send, including inbound media/resource handling
 - 🔌 **mcp**: stdio-based external tool servers exposed as native tools
+
+### Channel Commands
+
+When messaging the bot through Slack, Telegram, or other channels, you can send these signals as standalone messages:
+
+- `stop` or `/stop` - Immediately stop the current agent task and cancel running subagents.
+- `clear`, `new`, `/clear`, or `/new` - Reset the bot's memory for the current session.
+- `status` or `/status` - Get the current version and runtime usage stats.
+- `help` or `/help` - Show available commands.
 
 ### Gateway Endpoints
 

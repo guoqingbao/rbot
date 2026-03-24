@@ -103,6 +103,21 @@ pub fn estimate_json_tokens(value: &Value) -> usize {
     estimate_text_tokens(&value.to_string())
 }
 
+pub fn tool_emoji(tool_name: &str) -> &'static str {
+    match tool_name {
+        "read_file" => "📖",
+        "write_file" => "💾",
+        "edit_file" => "✍",
+        "list_dir" => "📁",
+        "exec" => "💻",
+        "web_search" => "🔍",
+        "web_fetch" => "🌐",
+        "spawn" => "🤖",
+        "cron" => "⏰",
+        _ => "🛠",
+    }
+}
+
 pub fn build_status_content(
     version: &str,
     model: &str,

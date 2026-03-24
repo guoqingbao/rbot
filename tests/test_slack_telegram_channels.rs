@@ -22,6 +22,10 @@ struct FakeSlackApi {
 
 #[async_trait]
 impl SlackApi for FakeSlackApi {
+    async fn auth_test(&self) -> Result<String> {
+        Ok("B123".to_string())
+    }
+
     async fn chat_post_message(
         &self,
         channel: &str,

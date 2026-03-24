@@ -153,15 +153,18 @@ pub fn build_provider_client(
         max_tokens: 8192,
     };
 
-    match provider_name {
-        "custom" => Ok(std::sync::Arc::new(CustomProvider::new(
+    if provider_name == "custom" || spec.is_none() {
+        return Ok(std::sync::Arc::new(CustomProvider::new(
             provider_cfg.api_key.clone(),
             api_base,
             model.to_string(),
             provider_cfg.extra_headers.clone(),
             generation,
             proxy,
-        )?)),
+        )?));
+    }
+
+    match provider_name {
         "azure_openai" => Ok(std::sync::Arc::new(AzureOpenAiProvider::new(
             provider_cfg.api_key.clone(),
             api_base.ok_or_else(|| anyhow!("provider 'azure_openai' requires api_base"))?,

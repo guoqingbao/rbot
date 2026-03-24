@@ -18,7 +18,7 @@ use rustyline::{Editor, ExternalPrinter as RustylineExternalPrinter};
 use serde_json::Value;
 
 use rbot::providers::TextStreamCallback;
-use rbot::util::{ensure_dir, workspace_state_dir};
+use rbot::util::{ensure_dir, tool_emoji, workspace_state_dir};
 
 pub mod config_cli;
 
@@ -980,7 +980,7 @@ impl StreamRenderer {
         start_waiting_indicator(
             &mut state,
             &self.footer,
-            &format!("waiting after {}", truncate_middle(hint.trim(), 20)),
+            &format!(""),
             Duration::from_secs(10),
         );
         drop(state);
@@ -1121,10 +1121,11 @@ enum LocalCommand {
 }
 
 fn parse_local_command(input: &str) -> Option<LocalCommand> {
-    match input.trim() {
-        "/help" => Some(LocalCommand::Help),
-        "/clear" => Some(LocalCommand::Clear),
-        "/stop" => Some(LocalCommand::Stop),
+    let trimmed = input.trim().to_lowercase();
+    match trimmed.as_str() {
+        "/help" | "help" => Some(LocalCommand::Help),
+        "/clear" | "clear" => Some(LocalCommand::Clear),
+        "/stop" | "stop" | "[stop]" => Some(LocalCommand::Stop),
         "/exit" | "/quit" | "exit" | "quit" => Some(LocalCommand::Exit),
         _ => None,
     }
@@ -1160,6 +1161,13 @@ fn render_tool_hint(
     if tool_name == Some("edit_file") {
         if let Some(rendered) = render_edit_file_hint(style, hint, tool_args) {
             return rendered;
+        }
+    }
+    if hint.starts_with("[ ") && hint.ends_with(" ]") {
+        if style.ansi {
+            return style.paint("48;5;253;38;5;236", hint);
+        } else {
+            return hint.to_string();
         }
     }
     let parts = parse_tool_hint(hint);
@@ -1459,22 +1467,6 @@ struct ToolHintParts<'a> {
     emoji: &'static str,
     tool_name: &'a str,
     detail: &'a str,
-}
-
-fn tool_emoji(tool_name: &str) -> &'static str {
-    match tool_name {
-        "read_file" => "📄",
-        "write_file" | "edit_file" => "✍️",
-        "list_dir" => "🗂️",
-        "exec" => "🖥️",
-        "web_search" => "🔎",
-        "web_fetch" => "🌐",
-        "message" => "💬",
-        "spawn" => "🧵",
-        "cron" => "⏱️",
-        name if name.starts_with("mcp_") => "🧩",
-        _ => "⚙️",
-    }
 }
 
 fn render_markdown_response(style: &Style, content: &str) -> String {
@@ -2141,7 +2133,7 @@ mod tests {
     #[test]
     fn parses_tool_hint_and_emoji() {
         let parts = parse_tool_hint("read_file · path=src/main.rs");
-        assert_eq!(parts.emoji, "📄");
+        assert_eq!(parts.emoji, "📖");
         assert_eq!(parts.tool_name, "read_file");
         assert_eq!(parts.detail, "path=src/main.rs");
     }

@@ -352,8 +352,8 @@ impl Config {
                     "maxToolIterations": self.agents.defaults.max_tool_iterations,
                 }
             },
-            "channels": channels,
             "providers": providers,
+            "channels": channels,
             "gateway": {
                 "host": self.gateway.host,
                 "port": self.gateway.port,
