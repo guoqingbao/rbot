@@ -461,10 +461,10 @@ impl SlackChannel {
             .unwrap_or_default()
         {
             "hello" => {
-                eprintln!("[slack] socket mode hello");
+                eprintln!("[slack] socket mode hello (APP online)");
             }
             "disconnect" => {
-                eprintln!("[slack] socket mode disconnect requested by Slack");
+                eprintln!("[slack] socket mode disconnect requested by Slack (APP offline)");
             }
             "events_api" => {
                 if let Some(event) = payload.get("payload").and_then(|inner| inner.get("event")) {
@@ -838,6 +838,10 @@ impl Channel for SlackChannel {
             } else {
                 format!("{}\n", msg.content)
             };
+            use slack_markdown_converter::{self, TableRenderMode};
+            let converter = slack_markdown_converter::SlackMarkdownConverter::new()
+                .with_table_mode(TableRenderMode::CodeBlock);
+            let text = converter.convert(&text);
             api.chat_post_message(&msg.chat_id, &text, thread_ts)
                 .await?;
 

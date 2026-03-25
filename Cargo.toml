@@ -41,6 +41,7 @@ walkdir = "2.5"
 rustyline = "15.0"
 inquire = "0.7"
 console = "0.15"
+slack-markdown-converter = "0.1"
 
 [dev-dependencies]
 serial_test = "3.2"
