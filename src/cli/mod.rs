@@ -8,6 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use console::Term;
 use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
@@ -896,9 +897,21 @@ struct StreamState {
     started: bool,
     pending: String,
     code_language: Option<String>,
+    pending_table: Option<PendingTable>,
     trailing_newlines: usize,
     waiting_stop: Option<Arc<AtomicBool>>,
     waiting_handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct PendingTable {
+    lines: Vec<PendingTableLine>,
+}
+
+struct PendingTableLine {
+    indent: String,
+    trimmed: String,
+    has_newline: bool,
 }
 
 impl Drop for StreamState {
@@ -1456,6 +1469,9 @@ fn render_stream_delta(
                 let line = std::mem::take(&mut state.pending);
                 out.push_str(&render_stream_line(style, state, &line));
             }
+            if state.code_language.is_none() && state.pending_table.is_some() {
+                out.push_str(&flush_pending_table(style, state));
+            }
             break;
         }
         if state.code_language.is_none() {
@@ -1498,7 +1514,7 @@ fn sentence_flush_index(text: &str) -> Option<usize> {
             quote = Some(ch);
             continue;
         }
-        if matches!(ch, '.' | '!' | '?' | ':' | ';') {
+        if matches!(ch, '.' | '!' | '?') {
             // Don't break at numbered list markers like "1. " or "10. "
             if ch == '.' {
                 let before = &text[..idx];
@@ -1539,6 +1555,41 @@ fn note_output(state: &mut StreamState, text: &str) {
 fn render_stream_line(style: &Style, state: &mut StreamState, line: &str) -> String {
     let has_newline = line.ends_with('\n');
     let normalized = line.trim_end_matches('\n').trim_end_matches('\r');
+    if state.code_language.is_none() {
+        if let Some((indent, trimmed)) = parse_table_line(normalized) {
+            state
+                .pending_table
+                .get_or_insert_with(PendingTable::default)
+                .lines
+                .push(PendingTableLine {
+                    indent: indent.to_string(),
+                    trimmed: trimmed.to_string(),
+                    has_newline,
+                });
+            return String::new();
+        }
+        if state.pending_table.is_some() {
+            let mut flushed = flush_pending_table(style, state);
+            if !normalized.is_empty() || has_newline {
+                flushed.push_str(&render_stream_line_without_tables(
+                    style,
+                    state,
+                    normalized,
+                    has_newline,
+                ));
+            }
+            return flushed;
+        }
+    }
+    render_stream_line_without_tables(style, state, normalized, has_newline)
+}
+
+fn render_stream_line_without_tables(
+    style: &Style,
+    state: &mut StreamState,
+    normalized: &str,
+    has_newline: bool,
+) -> String {
     if let Some(lang) = fence_language(normalized) {
         if state.code_language.is_none() {
             state.code_language = Some(lang.to_string());
@@ -1562,6 +1613,13 @@ fn render_stream_line(style: &Style, state: &mut StreamState, line: &str) -> Str
             rendered
         }
     }
+}
+
+fn flush_pending_table(style: &Style, state: &mut StreamState) -> String {
+    let Some(table) = state.pending_table.take() else {
+        return String::new();
+    };
+    render_table_block(style, table)
 }
 
 fn render_markdown_line(style: &Style, line: &str) -> String {
@@ -1628,6 +1686,181 @@ fn render_markdown_line(style: &Style, line: &str) -> String {
     }
 
     render_inline_markdown(style, line)
+}
+
+fn parse_table_line(line: &str) -> Option<(&str, &str)> {
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let trimmed = line.trim_start();
+    (trimmed.starts_with('|') && trimmed.ends_with('|')).then_some((indent, trimmed))
+}
+
+fn parse_table_cells(line: &str) -> Vec<&str> {
+    line.trim_matches('|').split('|').map(str::trim).collect()
+}
+
+fn is_table_separator_row(line: &str) -> bool {
+    let cells = parse_table_cells(line);
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            !cell.is_empty()
+                && cell
+                    .chars()
+                    .all(|ch| ch == '-' || ch == ':' || ch.is_ascii_whitespace())
+                && cell.contains('-')
+        })
+}
+
+fn render_table_block(style: &Style, table: PendingTable) -> String {
+    if table.lines.is_empty() {
+        return String::new();
+    }
+
+    if table.lines.len() >= 2 && is_table_separator_row(&table.lines[1].trimmed) {
+        render_aligned_table(style, &table.lines)
+    } else {
+        table
+            .lines
+            .iter()
+            .map(|line| {
+                let rendered =
+                    render_markdown_line(style, &format!("{}{}", line.indent, line.trimmed));
+                if line.has_newline {
+                    format!("{rendered}\n")
+                } else {
+                    rendered
+                }
+            })
+            .collect::<String>()
+    }
+}
+
+fn render_aligned_table(style: &Style, lines: &[PendingTableLine]) -> String {
+    let indent = lines
+        .first()
+        .map(|line| line.indent.as_str())
+        .unwrap_or_default();
+    render_aligned_table_with_width(style, lines, available_table_width(indent))
+}
+
+fn render_aligned_table_with_width(
+    style: &Style,
+    lines: &[PendingTableLine],
+    max_table_width: usize,
+) -> String {
+    let indent = lines
+        .first()
+        .map(|line| line.indent.as_str())
+        .unwrap_or_default();
+    let mut rows = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            (!is_table_separator_row(&line.trimmed) || index != 1).then_some(
+                parse_table_cells(&line.trimmed)
+                    .into_iter()
+                    .map(|cell| render_inline_markdown(style, cell))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let column_count = rows.iter().map(Vec::len).max().unwrap_or(0);
+    for row in &mut rows {
+        row.resize(column_count, String::new());
+    }
+    let mut widths = (0..column_count)
+        .map(|column| {
+            rows.iter()
+                .map(|row| char_width(&row[column]))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect::<Vec<_>>();
+    constrain_column_widths(&mut widths, max_table_width);
+
+    let separator = widths
+        .iter()
+        .map(|width| style.dim("─".repeat(*width)))
+        .collect::<Vec<_>>()
+        .join(&style.dim("─┼─"));
+
+    let mut rendered_lines = rows
+        .into_iter()
+        .enumerate()
+        .flat_map(|(index, row)| {
+            let rendered_row = row
+                .iter()
+                .enumerate()
+                .map(|(column, cell)| fit_table_cell(cell, widths[column]))
+                .collect::<Vec<_>>()
+                .join(&style.dim(" │ "));
+            if index == 0 {
+                vec![
+                    format!("{indent}{rendered_row}"),
+                    format!("{indent}{separator}"),
+                ]
+            } else {
+                vec![format!("{indent}{rendered_row}")]
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if lines.last().is_some_and(|line| line.has_newline) {
+        rendered_lines.push('\n');
+    }
+    rendered_lines
+}
+
+fn available_table_width(indent: &str) -> usize {
+    let (_, columns) = Term::stdout().size();
+    usize::from(columns)
+        .saturating_sub(char_width(indent))
+        .saturating_sub(1)
+}
+
+fn constrain_column_widths(widths: &mut [usize], max_table_width: usize) {
+    if widths.is_empty() {
+        return;
+    }
+
+    let separator_width = (widths.len() - 1) * 3;
+    let mut total_width = widths.iter().sum::<usize>() + separator_width;
+    if total_width <= max_table_width {
+        return;
+    }
+
+    let mut min_widths = widths
+        .iter()
+        .map(|width| (*width).min(3))
+        .collect::<Vec<_>>();
+    let min_total = min_widths.iter().sum::<usize>() + separator_width;
+    if min_total > max_table_width {
+        min_widths.fill(1);
+    }
+
+    while total_width > max_table_width {
+        let Some((index, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(index, width)| **width > min_widths[*index])
+            .max_by_key(|(_, width)| **width)
+        else {
+            break;
+        };
+        widths[index] -= 1;
+        total_width -= 1;
+    }
+}
+
+fn fit_table_cell(text: &str, width: usize) -> String {
+    let visible_width = char_width(text);
+    if visible_width <= width {
+        return pad_to_width(text, width);
+    }
+
+    let plain = strip_ansi_escapes(text);
+    pad_to_width(&truncate_end(&plain, width), width)
 }
 
 fn render_inline_markdown(style: &Style, text: &str) -> String {
@@ -2080,9 +2313,10 @@ fn truncate_middle(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        LocalCommand, fence_language, highlight_code_line, line_requests_continuation,
-        parse_local_command, parse_tool_hint, render_markdown_line, render_tool_hint,
-        sentence_flush_index, truncate_middle,
+        LocalCommand, PendingTableLine, StreamState, char_width, fence_language,
+        highlight_code_line, line_requests_continuation, parse_local_command, parse_tool_hint,
+        render_aligned_table_with_width, render_markdown_line, render_markdown_response,
+        render_stream_delta, render_tool_hint, sentence_flush_index, truncate_middle,
     };
     use serde_json::json;
 
@@ -2136,6 +2370,8 @@ mod tests {
     fn sentence_flush_finds_boundary() {
         assert_eq!(sentence_flush_index("Hello world. Next"), Some(12));
         assert_eq!(sentence_flush_index("path=src/main.rs"), None);
+        assert_eq!(sentence_flush_index("### Phase 1: Critical"), None);
+        assert_eq!(sentence_flush_index("2026-03-25T08:"), None);
     }
 
     #[test]
@@ -2145,6 +2381,158 @@ mod tests {
         assert_eq!(render_markdown_line(&style, "- item"), "• item");
         assert_eq!(render_markdown_line(&style, "> note"), "│ note");
         assert_eq!(render_markdown_line(&style, "`code`"), "code");
+    }
+
+    #[test]
+    fn renders_markdown_tables_without_literal_separator_rows() {
+        let style = super::Style { ansi: false };
+        let content = "## Bug Severity Distribution\n\n| Severity | Count | Percentage |\n|----------|-------|------------|\n| High | 4 | 25% |\n| Medium | 10 | 62.5% |\n| Low | 2 | 12.5% |\n| **Total** | **16** | **100%** |";
+        let rendered = render_markdown_response(&style, content);
+        assert!(rendered.contains("Severity │ Count │ Percentage"));
+        assert!(rendered.contains("┼"));
+        assert!(!rendered.contains("---------- │ ------- │ ------------"));
+        assert!(rendered.contains("Total    │ 16    │ 100%"));
+    }
+
+    #[test]
+    fn streams_markdown_tables_as_aligned_blocks() {
+        let style = super::Style { ansi: false };
+        let mut state = StreamState::default();
+        let mut rendered = String::new();
+        rendered.push_str(&render_stream_delta(
+            &style,
+            &mut state,
+            "| Severity | Count | Percentage |\n",
+            false,
+            false,
+        ));
+        rendered.push_str(&render_stream_delta(
+            &style,
+            &mut state,
+            "|----------|-------|------------|\n",
+            false,
+            false,
+        ));
+        rendered.push_str(&render_stream_delta(
+            &style,
+            &mut state,
+            "| High | 4 | 25% |\n",
+            false,
+            false,
+        ));
+        rendered.push_str(&render_stream_delta(
+            &style,
+            &mut state,
+            "| Medium | 10 | 62.5% |\n",
+            false,
+            false,
+        ));
+        rendered.push_str(&render_stream_delta(&style, &mut state, "", true, false));
+        assert!(rendered.contains("Severity │ Count │ Percentage"));
+        assert!(rendered.contains("High     │ 4     │ 25%"));
+        assert!(rendered.contains("Medium   │ 10    │ 62.5%"));
+        assert!(!rendered.contains("---------- │ ------- │ ------------"));
+    }
+
+    #[test]
+    fn constrains_wide_tables_to_available_width() {
+        let style = super::Style { ansi: false };
+        let lines = vec![
+            PendingTableLine {
+                indent: String::new(),
+                trimmed: "| Metric | Value |".to_string(),
+                has_newline: true,
+            },
+            PendingTableLine {
+                indent: String::new(),
+                trimmed: "|--------|-------|".to_string(),
+                has_newline: true,
+            },
+            PendingTableLine {
+                indent: String::new(),
+                trimmed: "| Channels Affected | 4 (Telegram, Slack, Feishu, Email) |".to_string(),
+                has_newline: true,
+            },
+            PendingTableLine {
+                indent: String::new(),
+                trimmed: "| Files Requiring Changes | 6 |".to_string(),
+                has_newline: false,
+            },
+        ];
+
+        let rendered = render_aligned_table_with_width(&style, &lines, 36);
+        for line in rendered.lines() {
+            assert!(char_width(line) <= 36, "{line}");
+        }
+        assert!(rendered.contains("Channels"));
+        assert!(rendered.contains("Files"));
+        assert!(rendered.contains('…'));
+    }
+
+    #[test]
+    fn constrains_multi_column_tables_without_wrapping() {
+        let style = super::Style { ansi: false };
+        let lines = vec![
+            PendingTableLine {
+                indent: String::new(),
+                trimmed: "| # | Channel | Bug Description | Risk | Fix Complexity |".to_string(),
+                has_newline: true,
+            },
+            PendingTableLine {
+                indent: String::new(),
+                trimmed: "|---|---------|-----------------|------|----------------|".to_string(),
+                has_newline: true,
+            },
+            PendingTableLine {
+                indent: String::new(),
+                trimmed: "| 3 | Telegram | Path traversal - external filenames not sanitized | Security | Low |".to_string(),
+                has_newline: false,
+            },
+        ];
+
+        let rendered = render_aligned_table_with_width(&style, &lines, 60);
+        for line in rendered.lines() {
+            assert!(char_width(line) <= 60, "{line}");
+        }
+        assert!(rendered.contains("Path traversal"));
+        assert!(rendered.contains('…'));
+    }
+
+    #[test]
+    fn line_safe_streaming_keeps_colon_chunks_buffered() {
+        let style = super::Style { ansi: false };
+        let mut state = StreamState::default();
+        assert_eq!(
+            render_stream_delta(&style, &mut state, "### Phase 1:", false, true),
+            ""
+        );
+        assert_eq!(
+            render_stream_delta(
+                &style,
+                &mut state,
+                " Critical (Do Immediately)",
+                false,
+                true
+            ),
+            ""
+        );
+        assert_eq!(
+            render_stream_delta(
+                &style,
+                &mut state,
+                " **Report Generated:** 2026-03-25T08:",
+                false,
+                true
+            ),
+            ""
+        );
+        assert_eq!(
+            render_stream_delta(&style, &mut state, "13:", false, true),
+            ""
+        );
+        let rendered = render_stream_delta(&style, &mut state, "00Z", true, true);
+        assert!(rendered.contains("Phase 1: Critical (Do Immediately)"));
+        assert!(rendered.contains("Report Generated: 2026-03-25T08:13:00Z"));
     }
 
     #[test]
