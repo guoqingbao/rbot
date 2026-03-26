@@ -17,6 +17,7 @@ use rustyline::history::DefaultHistory;
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Editor, ExternalPrinter as RustylineExternalPrinter};
 use serde_json::Value;
+use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
 
 use rbot::providers::TextStreamCallback;
@@ -168,23 +169,23 @@ impl Style {
     }
 
     fn panel_header(&self, text: impl AsRef<str>, width: usize) -> String {
-        self.panel_line("48;5;236;38;5;252;1", text, width)
+        self.panel_line("1;38;5;252", text, width)
     }
 
     fn panel_meta(&self, text: impl AsRef<str>, width: usize) -> String {
-        self.panel_line("48;5;235;38;5;245", text, width)
+        self.panel_line("38;5;245", text, width)
     }
 
     fn panel_context(&self, text: impl AsRef<str>, width: usize) -> String {
-        self.panel_line("48;5;235;38;5;252", text, width)
+        self.panel_line("38;5;252", text, width)
     }
 
     fn panel_added(&self, text: impl AsRef<str>, width: usize) -> String {
-        self.panel_line("48;5;22;38;5;114", text, width)
+        self.panel_line("38;5;114", text, width)
     }
 
     fn panel_removed(&self, text: impl AsRef<str>, width: usize) -> String {
-        self.panel_line("48;5;52;38;5;210", text, width)
+        self.panel_line("38;5;210", text, width)
     }
 
     fn separator(&self, width: usize) -> String {
@@ -637,29 +638,39 @@ impl CliShell {
             &workspace_state_dir(&self.workspace).display().to_string(),
             72,
         );
-        let session_status = format_session_status(session_message_count);
-        println!("{}", self.style.accent("╭─ rbot interactive"));
+        let session_status = if session_message_count == 0 {
+            "new session".to_string()
+        } else {
+            self.style.bold(format!(
+                "continue with {session_message_count} history messages"
+            ))
+        };
+        let primary_commands = if session_message_count == 0 {
+            self.style.dim("/help  /clear  /exit  /new")
+        } else {
+            format!(
+                "{}{}",
+                self.style.dim("/help  /clear  /exit  "),
+                self.style.paint("1;31", "/new (used to start fresh)")
+            )
+        };
+        let rows = vec![
+            ("model".to_string(), self.style.accent(&self.model)),
+            ("provider".to_string(), self.provider.clone()),
+            ("cwd".to_string(), cwd),
+            ("workspace".to_string(), workspace),
+            ("state".to_string(), state_root),
+            ("session".to_string(), session_status),
+            ("commands".to_string(), primary_commands),
+            (
+                String::new(),
+                self.style
+                    .dim("/memorize <text>  /model [name]  /status  /stop"),
+            ),
+        ];
         println!(
-            "{} {}",
-            self.style.dim("│ model     "),
-            self.style.accent(&self.model)
-        );
-        println!("{} {}", self.style.dim("│ provider  "), self.provider);
-        println!("{} {}", self.style.dim("│ cwd       "), cwd);
-        println!("{} {}", self.style.dim("│ workspace "), workspace);
-        println!("{} {}", self.style.dim("│ state     "), state_root);
-        println!("{} {}", self.style.dim("│ session   "), session_status);
-        println!(
-            "{} {}",
-            self.style.dim("│ input     "),
-            self.style
-                .subtle("queued turns allowed while a task is running")
-        );
-        println!(
-            "{} {}",
-            self.style.dim("╰ commands  "),
-            self.style
-                .dim("/help  /clear  /exit  /new  /memorize <text>  /model [name]  /status  /stop")
+            "{}",
+            render_rounded_panel(&self.style, "rbot interactive", &rows)
         );
     }
 
@@ -1341,6 +1352,43 @@ fn render_rounded_panel(style: &Style, title: &str, rows: &[(String, String)]) -
     out.join("\n")
 }
 
+fn render_rounded_block(style: &Style, title: &str, lines: &[String], width: usize) -> String {
+    let content_width = width.max(char_width(title) + 1);
+    let top_fill = content_width.saturating_sub(char_width(title) + 1);
+
+    let mut out = vec![format!(
+        "{}{}{}",
+        style.dim("╭─ "),
+        style.accent(title),
+        style.dim(format!(" {}╮", "─".repeat(top_fill)))
+    )];
+    if lines.is_empty() {
+        out.push(format!(
+            "{}{}{}",
+            style.dim("╰"),
+            style.dim("─".repeat(content_width + 2)),
+            style.dim("╯")
+        ));
+        return out.join("\n");
+    }
+
+    for line in lines {
+        out.push(format!(
+            "{} {} {}",
+            style.dim("│"),
+            pad_to_width(line, content_width),
+            style.dim("│")
+        ));
+    }
+    out.push(format!(
+        "{}{}{}",
+        style.dim("╰"),
+        style.dim("─".repeat(content_width + 2)),
+        style.dim("╯")
+    ));
+    out.join("\n")
+}
+
 fn render_status_panel(style: &Style, content: &str) -> Option<String> {
     let mut lines = content.lines();
     let version = lines.next()?.strip_prefix("rbot v")?;
@@ -1482,16 +1530,16 @@ fn render_edit_file_hint(style: &Style, _hint: &str, tool_args: Option<&Value>) 
     let width = available_panel_width();
     let diff = build_edit_diff(&old_text, &new_text);
     let mut lines = Vec::new();
-    lines.push(style.panel_header(
-        format!(
-            " ✍ edit_file  {}",
-            truncate_middle(path, width.saturating_sub(14))
-        ),
+    lines.push(style.panel_meta(
+        format!("path    {}", truncate_middle(path, width.saturating_sub(8))),
         width,
     ));
-    lines.push(style.panel_meta("   old   new | diff preview", width));
+    lines.push(style.panel_header(
+        format!(" {:>5} {:>5} |   diff preview", "old", "new"),
+        width,
+    ));
     lines.extend(render_diff_lines(style, &diff.lines, width));
-    Some(lines.join("\n"))
+    Some(render_rounded_block(style, "✍ edit_file", &lines, width))
 }
 
 fn render_diff_lines(style: &Style, lines: &[RenderedDiffLine], width: usize) -> Vec<String> {
@@ -1700,6 +1748,7 @@ fn compress_diff_ops(
     (out, changed_blocks)
 }
 
+#[allow(dead_code)]
 struct ToolHintParts<'a> {
     emoji: &'static str,
     tool_name: &'a str,
@@ -2517,6 +2566,33 @@ fn char_width(text: &str) -> usize {
     UnicodeWidthStr::width(strip_ansi_escapes(text).as_str())
 }
 
+fn truncate_display_width(text: &str, max_width: usize) -> String {
+    let plain = strip_ansi_escapes(text);
+    let visible_width = UnicodeWidthStr::width(plain.as_str());
+    if visible_width <= max_width {
+        return plain;
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+
+    let mut out = String::new();
+    let mut width = 0usize;
+    for ch in plain.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > max_width.saturating_sub(1) {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out.push('…');
+    out
+}
+
 fn strip_ansi_escapes(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_escape = false;
@@ -2537,13 +2613,16 @@ fn strip_ansi_escapes(text: &str) -> String {
 }
 
 fn pad_to_width(text: &str, width: usize) -> String {
-    let len = char_width(text);
-    if len >= width {
-        return truncate_end(text, width);
+    let visible_width = char_width(text);
+    if visible_width == width {
+        return text.to_string();
     }
-    let mut out = String::with_capacity(text.len() + width.saturating_sub(len));
+    if visible_width > width {
+        return truncate_display_width(text, width);
+    }
+    let mut out = String::with_capacity(text.len() + width.saturating_sub(visible_width));
     out.push_str(text);
-    out.push_str(&" ".repeat(width - len));
+    out.push_str(&" ".repeat(width - visible_width));
     out
 }
 
@@ -2577,19 +2656,6 @@ fn truncate_middle(text: &str, max_chars: usize) -> String {
         .rev()
         .collect::<String>();
     format!("{start}...{end}")
-}
-
-fn format_session_status(session_message_count: usize) -> String {
-    if session_message_count == 0 {
-        "new session".to_string()
-    } else {
-        let label = if session_message_count == 1 {
-            "message"
-        } else {
-            "messages"
-        };
-        format!("resuming {session_message_count} {label}; /new to start fresh")
-    }
 }
 
 #[cfg(test)]
@@ -2886,7 +2952,29 @@ mod tests {
         assert!(rendered.contains("edit_file"));
         assert!(rendered.contains("mod.rs"));
         assert!(rendered.contains("beta"));
-        assert!(rendered.contains("old   new | diff preview"));
+        assert!(rendered.contains("old   new |   diff preview"));
+    }
+
+    #[test]
+    fn edit_file_hint_rows_stay_aligned_and_full_width() {
+        let style = super::Style { ansi: false };
+        let args = json!({
+            "path": "/root/rbot/src/tools.rs",
+            "old_text": "\"number\" => match value {\n    Value::String(text) => text.parse::<f64>().map(Value::from).unwrap_or_else(|_| value.clone()),\n    _ => value.clone(),\n},\n",
+            "new_text": "\"number\" => match value {\n    Value::String(text) => match text.parse::<f64>() {\n        Ok(num) => Value::from(num),\n        Err(_) => Value::String(format!(\"[invalid number: {}]\", text)),\n    },\n    _ => value.clone(),\n},\n",
+            "replace_all": false
+        });
+        let rendered = render_tool_hint(
+            &style,
+            "edit_file · path=/root/rbot/src/tools.rs",
+            Some("edit_file"),
+            Some(&args),
+        );
+        let expected_width = available_panel_width() + 4;
+        for line in rendered.lines() {
+            assert_eq!(char_width(line), expected_width, "{line}");
+        }
+        assert!(rendered.contains(" old   new |   diff preview"));
     }
 
     #[test]
