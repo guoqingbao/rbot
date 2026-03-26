@@ -15,7 +15,7 @@ use crate::engine::{
     ContextBuilder, MemoryConsolidator, MemoryEntry, MemoryEntryKind, SkillsLoader, SubagentManager,
 };
 use crate::integrations::mcp::register_mcp_tools;
-use crate::providers::{LlmResponse, SharedProvider, TextStreamCallback};
+use crate::providers::{LlmResponse, ProviderModelInfo, SharedProvider, TextStreamCallback};
 use crate::storage::{
     ChatMessage, InboundMessage, MessageBus, OutboundMessage, Session, SessionManager,
 };
@@ -24,6 +24,8 @@ use crate::tools::{
     SpawnTool, ToolOutput, ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use crate::util::build_status_content;
+
+pub type ModelSwitchCallback = Arc<dyn Fn(String, Option<usize>) -> Result<()> + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentSnapshot {
@@ -58,6 +60,8 @@ pub struct AgentLoop {
     cancellations: Arc<Mutex<HashSet<String>>>,
     active_turns: Arc<Mutex<BTreeMap<String, usize>>>,
     stop_notifications: Arc<Mutex<BTreeMap<String, StopNotification>>>,
+    announced_sessions: Arc<Mutex<HashSet<String>>>,
+    model_switch_callback: Arc<Mutex<Option<ModelSwitchCallback>>>,
 }
 
 impl AgentLoop {
@@ -82,6 +86,12 @@ impl AgentLoop {
         let resolved_model = model
             .clone()
             .unwrap_or_else(|| provider.default_model().to_string());
+        let resolved_context_window_tokens = provider
+            .list_models()
+            .await
+            .ok()
+            .and_then(|models| find_model_context_window_tokens(&models, &resolved_model))
+            .unwrap_or(context_window_tokens);
         let subagents = SubagentManager::new(
             provider.clone(),
             workspace.clone(),
@@ -136,7 +146,7 @@ impl AgentLoop {
             workspace,
             model: model.unwrap_or_else(|| provider.default_model().to_string()),
             max_iterations,
-            context_window_tokens,
+            context_window_tokens: resolved_context_window_tokens,
             context,
             sessions: Mutex::new(sessions),
             tools,
@@ -151,6 +161,8 @@ impl AgentLoop {
             cancellations: Arc::new(Mutex::new(HashSet::new())),
             active_turns: Arc::new(Mutex::new(BTreeMap::new())),
             stop_notifications: Arc::new(Mutex::new(BTreeMap::new())),
+            announced_sessions: Arc::new(Mutex::new(HashSet::new())),
+            model_switch_callback: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -165,8 +177,273 @@ impl AgentLoop {
             .expect("progress callback lock poisoned") = callback;
     }
 
+    pub fn set_model_switch_callback(&self, callback: Option<ModelSwitchCallback>) {
+        *self
+            .model_switch_callback
+            .lock()
+            .expect("model switch callback lock poisoned") = callback;
+    }
+
     pub fn set_runtime_bus(&self, bus: MessageBus) {
         self.subagents.set_bus(bus);
+    }
+
+    async fn prepare_session(
+        &self,
+        msg: &InboundMessage,
+        target: &ProgressTarget,
+        session_key: &str,
+        trimmed: &str,
+        trimmed_lower: &str,
+    ) -> Result<SessionSetup> {
+        self.refresh_session_model_metadata(session_key).await?;
+
+        if let Some(model_arg) = parse_model_command(trimmed) {
+            return self
+                .handle_model_command(msg, session_key, model_arg.as_deref())
+                .await;
+        }
+
+        let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
+        let mut session = sessions.get_or_create(session_key)?;
+        let active_model = self.session_model(&session);
+        let context_window_tokens = self.session_context_window_tokens(&session);
+        let session_notice = if should_announce_backend_session(msg, trimmed_lower) {
+            self.register_session_announcement(session_key)
+                .then(|| format_backend_session_notice(session.get_history(0).len()))
+        } else {
+            None
+        };
+
+        match trimmed_lower {
+            "/new" | "new" | "/clear" | "clear" | "[clear]" => {
+                session.clear();
+                sessions.save(&session)?;
+                self.reset_session_announcement(session_key);
+                self.memory.store().reset_history()?;
+                return Ok(SessionSetup {
+                    response: Some(
+                        target.outbound("New session started. Session cleared and history reset."),
+                    ),
+                    session_notice: None,
+                    active_model,
+                    context_window_tokens,
+                });
+            }
+            "/status" | "status" => {
+                return Ok(SessionSetup {
+                    response: Some(self.status_response(msg, &session)),
+                    session_notice: None,
+                    active_model,
+                    context_window_tokens,
+                });
+            }
+            "/help" | "help" => {
+                return Ok(SessionSetup {
+                    response: Some(target.outbound(
+                        "/new (or clear)\n/stop\n/memorize <text>\n/model [name]\n/status\n/help",
+                    )),
+                    session_notice: None,
+                    active_model,
+                    context_window_tokens,
+                });
+            }
+            _ => {}
+        }
+
+        self.memory
+            .maybe_consolidate_by_tokens(&mut session, context_window_tokens)?;
+        sessions.put(session);
+        Ok(SessionSetup {
+            response: None,
+            session_notice,
+            active_model,
+            context_window_tokens,
+        })
+    }
+
+    async fn refresh_session_model_metadata(&self, session_key: &str) -> Result<()> {
+        let (session_model, has_context_window) = {
+            let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
+            let session = sessions.get_or_create(session_key)?;
+            (
+                session
+                    .metadata
+                    .get(SESSION_MODEL_KEY)
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                session
+                    .metadata
+                    .get(SESSION_CONTEXT_WINDOW_KEY)
+                    .and_then(Value::as_u64)
+                    .map(|value| value > 0)
+                    .unwrap_or(false),
+            )
+        };
+        let Some(session_model) = session_model else {
+            return Ok(());
+        };
+        if has_context_window {
+            return Ok(());
+        }
+
+        let models = match self.provider.list_models().await {
+            Ok(models) => models,
+            Err(_) => return Ok(()),
+        };
+        let Some(resolved_model) = resolve_runtime_model_info(&models, &session_model) else {
+            return Ok(());
+        };
+
+        {
+            let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
+            let mut session = sessions.get_or_create(session_key)?;
+            session.metadata.insert(
+                SESSION_MODEL_KEY.to_string(),
+                Value::String(resolved_model.id.clone()),
+            );
+            if let Some(context_window_tokens) = resolved_model.context_window_tokens {
+                session.metadata.insert(
+                    SESSION_CONTEXT_WINDOW_KEY.to_string(),
+                    Value::from(context_window_tokens as u64),
+                );
+            }
+            sessions.save(&session)?;
+        }
+
+        if let Some(callback) = self
+            .model_switch_callback
+            .lock()
+            .expect("model switch callback lock poisoned")
+            .clone()
+        {
+            let _ = callback(
+                resolved_model.id.clone(),
+                resolved_model.context_window_tokens,
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn handle_model_command(
+        &self,
+        msg: &InboundMessage,
+        session_key: &str,
+        requested_model: Option<&str>,
+    ) -> Result<SessionSetup> {
+        let models = self.provider.list_models().await?;
+        if models.is_empty() {
+            return Err(anyhow::anyhow!("provider returned no models"));
+        }
+
+        let current_model = {
+            let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
+            let session = sessions.get_or_create(session_key)?;
+            self.session_model(&session)
+        };
+
+        if requested_model.is_none() {
+            let mut lines = vec![format!("Current model: {current_model}")];
+            if let Some(context_window_tokens) =
+                find_model_context_window_tokens(&models, &current_model)
+            {
+                lines.push(format!("Context window: {context_window_tokens}"));
+            }
+            lines.push("Available models:".to_string());
+            lines.extend(models.iter().map(|model| format!("- {}", model.id)));
+            return Ok(SessionSetup {
+                response: Some(ProgressTarget::from_inbound(msg).outbound(lines.join("\n"))),
+                session_notice: None,
+                active_model: current_model.clone(),
+                context_window_tokens: find_model_context_window_tokens(&models, &current_model)
+                    .unwrap_or(self.context_window_tokens),
+            });
+        }
+
+        let requested_model = requested_model.unwrap_or_default();
+        let selected_model =
+            resolve_model_selection(&models, requested_model).ok_or_else(|| {
+                anyhow::anyhow!("model '{requested_model}' was not found in provider /models")
+            })?;
+        let context_window_tokens = selected_model
+            .context_window_tokens
+            .unwrap_or(self.context_window_tokens);
+        if let Some(callback) = self
+            .model_switch_callback
+            .lock()
+            .expect("model switch callback lock poisoned")
+            .clone()
+        {
+            callback(
+                selected_model.id.clone(),
+                selected_model.context_window_tokens,
+            )?;
+        }
+        {
+            let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
+            let mut session = sessions.get_or_create(session_key)?;
+            session.metadata.insert(
+                SESSION_MODEL_KEY.to_string(),
+                Value::String(selected_model.id.clone()),
+            );
+            if let Some(context_window_tokens) = selected_model.context_window_tokens {
+                session.metadata.insert(
+                    SESSION_CONTEXT_WINDOW_KEY.to_string(),
+                    Value::from(context_window_tokens as u64),
+                );
+            } else {
+                session.metadata.remove(SESSION_CONTEXT_WINDOW_KEY);
+            }
+            sessions.save(&session)?;
+        }
+        Ok(SessionSetup {
+            response: Some(ProgressTarget::from_inbound(msg).outbound(format!(
+                "Model switched to {}{}",
+                selected_model.id,
+                selected_model
+                    .context_window_tokens
+                    .map(|value| format!(" (context window {value})"))
+                    .unwrap_or_default()
+            ))),
+            session_notice: None,
+            active_model: selected_model.id.clone(),
+            context_window_tokens,
+        })
+    }
+
+    fn session_model(&self, session: &Session) -> String {
+        session
+            .metadata
+            .get(SESSION_MODEL_KEY)
+            .and_then(Value::as_str)
+            .filter(|model| !model.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| self.model.clone())
+    }
+
+    fn session_context_window_tokens(&self, session: &Session) -> usize {
+        session
+            .metadata
+            .get(SESSION_CONTEXT_WINDOW_KEY)
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .filter(|value| *value > 0)
+            .unwrap_or(self.context_window_tokens)
+    }
+
+    fn register_session_announcement(&self, session_key: &str) -> bool {
+        self.announced_sessions
+            .lock()
+            .expect("announced sessions lock poisoned")
+            .insert(session_key.to_string())
+    }
+
+    fn reset_session_announcement(&self, session_key: &str) -> bool {
+        self.announced_sessions
+            .lock()
+            .expect("announced sessions lock poisoned")
+            .remove(session_key)
     }
 
     pub async fn process_direct(
@@ -217,8 +494,9 @@ impl AgentLoop {
             return self.process_system_inbound(msg).await;
         }
         let target = ProgressTarget::from_inbound(&msg);
-        let trimmed = msg.content.trim().to_lowercase();
-        if trimmed == "/stop" || trimmed == "stop" || trimmed == "[stop]" {
+        let trimmed = msg.content.trim();
+        let trimmed_lower = trimmed.to_lowercase();
+        if trimmed_lower == "/stop" || trimmed_lower == "stop" || trimmed_lower == "[stop]" {
             return self.handle_stop_signal(&msg, &target).await;
         }
         if let Some(memory_input) = parse_memorize_command(&msg.content) {
@@ -240,43 +518,32 @@ impl AgentLoop {
             self.clear_cancellation(&session_key);
         }
 
-        let session_setup = (|| -> Result<Option<OutboundMessage>> {
-            let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
-            let mut session = sessions.get_or_create(&session_key)?;
-
-            match trimmed.as_str() {
-                "/new" | "new" | "/clear" | "clear" | "[clear]" => {
-                    session.clear();
-                    sessions.save(&session)?;
-                    self.memory.store().reset_history()?;
-                    return Ok(Some(target.outbound(
-                        "New session started. Session cleared and history reset.",
-                    )));
+        let session_setup = self
+            .prepare_session(&msg, &target, &session_key, trimmed, &trimmed_lower)
+            .await
+            .or_else(|err| {
+                if let Some(action) = special_command_action(&trimmed_lower) {
+                    Ok(SessionSetup {
+                        response: Some(target.outbound(format!("Unable to {action}: {err}"))),
+                        session_notice: None,
+                        active_model: self.model.clone(),
+                        context_window_tokens: self.context_window_tokens,
+                    })
+                } else {
+                    Err(err)
                 }
-                "/status" | "status" => {
-                    return Ok(Some(self.status_response(&msg, &session)));
-                }
-                "/help" | "help" => {
-                    return Ok(Some(target.outbound(
-                        "/new (or clear)\n/stop\n/memorize <text>\n/status\n/help",
-                    )));
-                }
-                _ => {}
-            }
-
-            self.memory.maybe_consolidate_by_tokens(&mut session)?;
-            sessions.put(session);
-            Ok(None)
-        })();
-        match session_setup {
-            Ok(Some(response)) => return Ok(Some(response)),
-            Ok(None) => {}
-            Err(err) => {
-                if let Some(action) = special_command_action(&trimmed) {
-                    return Ok(Some(target.outbound(format!("Unable to {action}: {err}"))));
-                }
-                return Err(err);
-            }
+            })?;
+        let SessionSetup {
+            response,
+            session_notice,
+            active_model,
+            context_window_tokens,
+        } = session_setup;
+        if let Some(response) = response {
+            return Ok(Some(response));
+        }
+        if let Some(notice) = session_notice {
+            self.send_runtime_reply(&target, notice).await;
         }
 
         self.message_tool.set_context(
@@ -312,6 +579,7 @@ impl AgentLoop {
             let _guard = ActiveTurnGuard::new(self.active_turns.clone(), session_key.clone());
             self.run_agent_loop(
                 &session_key,
+                &active_model,
                 initial_messages.clone(),
                 text_stream,
                 Some(target.clone()),
@@ -336,7 +604,8 @@ impl AgentLoop {
             let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
             let mut session = sessions.get_or_create(&session_key)?;
             self.save_turn(&mut session, &all_messages)?;
-            self.memory.maybe_consolidate_by_tokens(&mut session)?;
+            self.memory
+                .maybe_consolidate_by_tokens(&mut session, context_window_tokens)?;
             sessions.save(&session)?;
         }
 
@@ -382,7 +651,9 @@ impl AgentLoop {
         {
             let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
             let mut session = sessions.get_or_create(&session_key)?;
-            self.memory.maybe_consolidate_by_tokens(&mut session)?;
+            let context_window_tokens = self.session_context_window_tokens(&session);
+            self.memory
+                .maybe_consolidate_by_tokens(&mut session, context_window_tokens)?;
             sessions.put(session);
         }
 
@@ -393,6 +664,16 @@ impl AgentLoop {
         let history = {
             let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
             sessions.get_or_create(&session_key)?.get_history(0)
+        };
+        let active_model = {
+            let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
+            let session = sessions.get_or_create(&session_key)?;
+            self.session_model(&session)
+        };
+        let context_window_tokens = {
+            let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
+            let session = sessions.get_or_create(&session_key)?;
+            self.session_context_window_tokens(&session)
         };
         let initial_messages = self.context.build_messages(
             history,
@@ -411,6 +692,7 @@ impl AgentLoop {
             let _guard = ActiveTurnGuard::new(self.active_turns.clone(), session_key.clone());
             self.run_agent_loop(
                 &session_key,
+                &active_model,
                 initial_messages.clone(),
                 None,
                 Some(ProgressTarget {
@@ -439,7 +721,8 @@ impl AgentLoop {
             let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
             let mut session = sessions.get_or_create(&session_key)?;
             self.save_turn(&mut session, &all_messages)?;
-            self.memory.maybe_consolidate_by_tokens(&mut session)?;
+            self.memory
+                .maybe_consolidate_by_tokens(&mut session, context_window_tokens)?;
             sessions.save(&session)?;
         }
 
@@ -470,6 +753,7 @@ impl AgentLoop {
     async fn run_agent_loop(
         &self,
         session_key: &str,
+        active_model: &str,
         mut messages: Vec<ChatMessage>,
         text_stream: Option<TextStreamCallback>,
         progress_target: Option<ProgressTarget>,
@@ -505,7 +789,7 @@ impl AgentLoop {
                 .chat_with_retry_stream(
                     &messages,
                     Some(&defs),
-                    Some(&self.model),
+                    Some(active_model),
                     None,
                     None,
                     text_stream.clone(),
@@ -980,16 +1264,18 @@ impl AgentLoop {
         let (prompt_tokens, completion_tokens) =
             *self.last_usage.lock().expect("usage lock poisoned");
         let context_tokens = self.memory.estimate_session_prompt_tokens(session);
+        let active_model = self.session_model(session);
+        let context_window_tokens = self.session_context_window_tokens(session);
         OutboundMessage {
             channel: msg.channel.clone(),
             chat_id: msg.chat_id.clone(),
             content: build_status_content(
                 env!("CARGO_PKG_VERSION"),
-                &self.model,
+                &active_model,
                 self.start_time.elapsed().as_secs(),
                 prompt_tokens,
                 completion_tokens,
-                self.context_window_tokens,
+                context_window_tokens,
                 session.get_history(0).len(),
                 context_tokens,
             ),
@@ -1036,7 +1322,9 @@ impl AgentLoop {
         let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
         let mut session = sessions.get_or_create(session_key)?;
         self.save_turn(&mut session, messages)?;
-        self.memory.maybe_consolidate_by_tokens(&mut session)?;
+        let context_window_tokens = self.session_context_window_tokens(&session);
+        self.memory
+            .maybe_consolidate_by_tokens(&mut session, context_window_tokens)?;
         sessions.save(&session)?;
         Ok(())
     }
@@ -1110,6 +1398,13 @@ struct StopNotification {
     cancellation_observed: bool,
 }
 
+struct SessionSetup {
+    response: Option<OutboundMessage>,
+    session_notice: Option<String>,
+    active_model: String,
+    context_window_tokens: usize,
+}
+
 #[derive(Clone)]
 struct ProgressTarget {
     channel: String,
@@ -1138,7 +1433,111 @@ impl ProgressTarget {
     }
 }
 
+const SESSION_MODEL_KEY: &str = "model";
+const SESSION_CONTEXT_WINDOW_KEY: &str = "contextWindowTokens";
+
+fn should_announce_backend_session(msg: &InboundMessage, trimmed: &str) -> bool {
+    msg.channel != "cli" && special_command_action(trimmed).is_none()
+}
+
+fn format_backend_session_notice(session_message_count: usize) -> String {
+    if session_message_count == 0 {
+        "Session: started new session for this conversation.".to_string()
+    } else {
+        let label = if session_message_count == 1 {
+            "message"
+        } else {
+            "messages"
+        };
+        format!("Session: resuming {session_message_count} previous {label}; /new to start fresh.")
+    }
+}
+
+fn parse_model_command(trimmed: &str) -> Option<Option<String>> {
+    for prefix in ["/model", "model"] {
+        if trimmed.eq_ignore_ascii_case(prefix) {
+            return Some(None);
+        }
+        if trimmed.len() > prefix.len()
+            && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix)
+            && trimmed[prefix.len()..].starts_with(char::is_whitespace)
+        {
+            return Some(Some(trimmed[prefix.len()..].trim().to_string()));
+        }
+    }
+    None
+}
+
+fn find_model_context_window_tokens(models: &[ProviderModelInfo], model: &str) -> Option<usize> {
+    resolve_runtime_model_info(models, model).and_then(|item| item.context_window_tokens)
+}
+
+fn resolve_runtime_model_info<'a>(
+    models: &'a [ProviderModelInfo],
+    model: &str,
+) -> Option<&'a ProviderModelInfo> {
+    models
+        .iter()
+        .find(|item| item.id == model)
+        .or_else(|| {
+            let requested = model.to_ascii_lowercase();
+            let mut matches = models
+                .iter()
+                .filter(|item| item.id.to_ascii_lowercase() == requested);
+            let first = matches.next()?;
+            matches.next().is_none().then_some(first)
+        })
+        .or_else(|| {
+            let basename = model_basename(model)?;
+            let mut matches = models.iter().filter(|item| {
+                model_basename(&item.id)
+                    .map(|name| name.eq_ignore_ascii_case(basename))
+                    .unwrap_or(false)
+            });
+            let first = matches.next()?;
+            matches.next().is_none().then_some(first)
+        })
+        .or_else(|| (models.len() == 1).then_some(&models[0]))
+}
+
+fn resolve_model_selection<'a>(
+    models: &'a [ProviderModelInfo],
+    requested_model: &str,
+) -> Option<&'a ProviderModelInfo> {
+    models
+        .iter()
+        .find(|item| item.id == requested_model)
+        .or_else(|| {
+            let requested = requested_model.to_ascii_lowercase();
+            let mut matches = models
+                .iter()
+                .filter(|item| item.id.to_ascii_lowercase() == requested);
+            let first = matches.next()?;
+            matches.next().is_none().then_some(first)
+        })
+        .or_else(|| {
+            let basename = model_basename(requested_model)?;
+            let mut matches = models.iter().filter(|item| {
+                model_basename(&item.id)
+                    .map(|name| name.eq_ignore_ascii_case(basename))
+                    .unwrap_or(false)
+            });
+            let first = matches.next()?;
+            matches.next().is_none().then_some(first)
+        })
+}
+
+fn model_basename(model: &str) -> Option<&str> {
+    let trimmed = model.trim_end_matches(['/', '\\']);
+    Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())
+}
+
 fn special_command_action(trimmed: &str) -> Option<&'static str> {
+    if parse_model_command(trimmed).is_some() {
+        return Some("list or switch models");
+    }
     match trimmed {
         "/new" | "new" | "/clear" | "clear" | "[clear]" => Some("start a new session"),
         "/status" | "status" => Some("get status"),

@@ -11,7 +11,8 @@ use sysinfo::System;
 use tokio::process::Command;
 
 use crate::providers::{
-    GenerationSettings, LlmProvider, LlmResponse, SharedProvider, TextStreamCallback,
+    GenerationSettings, LlmProvider, LlmResponse, ProviderModelInfo, SharedProvider,
+    TextStreamCallback,
 };
 use crate::storage::ChatMessage;
 
@@ -330,6 +331,10 @@ impl LlmProvider for InstrumentedProvider {
                 Err(err)
             }
         }
+    }
+
+    async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        self.inner.list_models().await
     }
 }
 

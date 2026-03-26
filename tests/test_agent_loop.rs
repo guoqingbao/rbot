@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,9 +7,12 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use rbot::config::ExecToolConfig;
 use rbot::engine::AgentLoop;
-use rbot::providers::{LlmProvider, LlmResponse, LlmUsage, QueuedProvider, ToolCallRequest};
+use rbot::providers::{
+    LlmProvider, LlmResponse, LlmUsage, ProviderModelInfo, QueuedProvider, ToolCallRequest,
+};
 use rbot::runtime::AgentRuntime;
-use rbot::storage::{ChatMessage, InboundMessage, MessageBus, SessionManager};
+use rbot::storage::{ChatMessage, InboundMessage, MessageBus, OutboundMessage, SessionManager};
+use rbot::tools::MessageSendCallback;
 use rbot::util::{DEFAULT_HISTORY_TEMPLATE, workspace_state_dir};
 use serde_json::Value;
 use serde_json::json;
@@ -155,6 +159,38 @@ impl LlmProvider for AlwaysFailProvider {
         _temperature: Option<f32>,
     ) -> Result<LlmResponse> {
         Err(anyhow!("error decoding response body"))
+    }
+}
+
+struct CatalogProvider {
+    model: String,
+    models: Vec<ProviderModelInfo>,
+    responses: std::sync::Mutex<VecDeque<LlmResponse>>,
+}
+
+#[async_trait]
+impl LlmProvider for CatalogProvider {
+    fn default_model(&self) -> &str {
+        &self.model
+    }
+
+    async fn chat(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: Option<usize>,
+        _temperature: Option<f32>,
+    ) -> Result<LlmResponse> {
+        self.responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| anyhow!("catalog provider exhausted"))
+    }
+
+    async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        Ok(self.models.clone())
     }
 }
 
@@ -849,6 +885,427 @@ async fn help_command_preserves_inbound_metadata() {
     assert_eq!(response.metadata, metadata);
     assert_eq!(
         response.content,
-        "/new (or clear)\n/stop\n/memorize <text>\n/status\n/help"
+        "/new (or clear)\n/stop\n/memorize <text>\n/model [name]\n/status\n/help"
+    );
+}
+
+#[tokio::test]
+async fn model_command_lists_available_models() {
+    let dir = tempdir().unwrap();
+    let agent = AgentLoop::new(
+        Arc::new(CatalogProvider {
+            model: "base-model".to_string(),
+            models: vec![
+                ProviderModelInfo {
+                    id: "base-model".to_string(),
+                    context_window_tokens: Some(4096),
+                },
+                ProviderModelInfo {
+                    id: "alt-model".to_string(),
+                    context_window_tokens: Some(256000),
+                },
+            ],
+            responses: std::sync::Mutex::new(VecDeque::new()),
+        }),
+        dir.path(),
+        Some("base-model".to_string()),
+        8,
+        8_000,
+        32 * 1024,
+        Default::default(),
+        None,
+        ExecToolConfig {
+            enable: false,
+            timeout: 60,
+            path_append: String::new(),
+        },
+        false,
+        None,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+
+    let response = agent
+        .process_direct("/model", "cli:direct", "cli", "direct")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(response.content.contains("Current model: base-model"));
+    assert!(response.content.contains("Context window: 4096"));
+    assert!(response.content.contains("- base-model"));
+    assert!(response.content.contains("- alt-model"));
+}
+
+#[tokio::test]
+async fn model_command_switches_session_model_and_status_uses_provider_context() {
+    let dir = tempdir().unwrap();
+    let agent = AgentLoop::new(
+        Arc::new(CatalogProvider {
+            model: "base-model".to_string(),
+            models: vec![
+                ProviderModelInfo {
+                    id: "base-model".to_string(),
+                    context_window_tokens: Some(4096),
+                },
+                ProviderModelInfo {
+                    id: "/models/alt-model".to_string(),
+                    context_window_tokens: Some(256000),
+                },
+            ],
+            responses: std::sync::Mutex::new(VecDeque::new()),
+        }),
+        dir.path(),
+        Some("base-model".to_string()),
+        8,
+        8_000,
+        32 * 1024,
+        Default::default(),
+        None,
+        ExecToolConfig {
+            enable: false,
+            timeout: 60,
+            path_append: String::new(),
+        },
+        false,
+        None,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+
+    let switched = agent
+        .process_direct("/model alt-model", "cli:direct", "cli", "direct")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        switched
+            .content
+            .contains("Model switched to /models/alt-model")
+    );
+
+    let status = agent
+        .process_direct("/status", "cli:direct", "cli", "direct")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.content.contains("Model: /models/alt-model"));
+    assert!(status.content.contains("Context: 0/256000 (0%)"));
+}
+
+#[tokio::test]
+async fn model_command_persists_selected_model_and_context() {
+    let dir = tempdir().unwrap();
+    let agent = AgentLoop::new(
+        Arc::new(CatalogProvider {
+            model: "base-model".to_string(),
+            models: vec![
+                ProviderModelInfo {
+                    id: "base-model".to_string(),
+                    context_window_tokens: Some(4096),
+                },
+                ProviderModelInfo {
+                    id: "alt-model".to_string(),
+                    context_window_tokens: Some(256000),
+                },
+            ],
+            responses: std::sync::Mutex::new(VecDeque::new()),
+        }),
+        dir.path(),
+        Some("base-model".to_string()),
+        8,
+        8_000,
+        32 * 1024,
+        Default::default(),
+        None,
+        ExecToolConfig {
+            enable: false,
+            timeout: 60,
+            path_append: String::new(),
+        },
+        false,
+        None,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+
+    let persisted = Arc::new(std::sync::Mutex::new(None::<(String, Option<usize>)>));
+    let persisted_clone = persisted.clone();
+    agent.set_model_switch_callback(Some(Arc::new(move |model, context_window_tokens| {
+        *persisted_clone.lock().unwrap() = Some((model, context_window_tokens));
+        Ok(())
+    })));
+
+    agent
+        .process_direct("/model alt-model", "cli:direct", "cli", "direct")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        *persisted.lock().unwrap(),
+        Some(("alt-model".to_string(), Some(256000)))
+    );
+}
+
+#[tokio::test]
+async fn status_refreshes_resumed_session_context_from_provider_models() {
+    let dir = tempdir().unwrap();
+    let mut sessions = SessionManager::new(dir.path()).unwrap();
+    let mut session = sessions.get_or_create("cli:direct").unwrap();
+    session.metadata.insert(
+        "model".to_string(),
+        Value::String("Qwen3.5-35B-A3B-FP8".to_string()),
+    );
+    sessions.save(&session).unwrap();
+
+    let agent = AgentLoop::new(
+        Arc::new(CatalogProvider {
+            model: "Qwen3.5 27B".to_string(),
+            models: vec![ProviderModelInfo {
+                id: "Qwen3.5-35B-A3B-FP8".to_string(),
+                context_window_tokens: Some(256000),
+            }],
+            responses: std::sync::Mutex::new(VecDeque::new()),
+        }),
+        dir.path(),
+        Some("Qwen3.5 27B".to_string()),
+        8,
+        65_536,
+        32 * 1024,
+        Default::default(),
+        None,
+        ExecToolConfig {
+            enable: false,
+            timeout: 60,
+            path_append: String::new(),
+        },
+        false,
+        None,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+
+    let status = agent
+        .process_direct("/status", "cli:direct", "cli", "direct")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.content.contains("Model: Qwen3.5-35B-A3B-FP8"));
+    assert!(status.content.contains("Context: 0/256000 (0%)"));
+
+    let mut sessions = SessionManager::new(dir.path()).unwrap();
+    let session = sessions.get_or_create("cli:direct").unwrap();
+    assert_eq!(
+        session
+            .metadata
+            .get("contextWindowTokens")
+            .and_then(Value::as_u64),
+        Some(256000)
+    );
+}
+
+#[tokio::test]
+async fn backend_announces_new_session_once_per_runtime_session() {
+    let dir = tempdir().unwrap();
+    let provider = Arc::new(QueuedProvider::new(
+        "test-model",
+        vec![
+            LlmResponse {
+                content: Some("First reply.".to_string()),
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: LlmUsage::default(),
+                reasoning_content: None,
+                thinking_blocks: None,
+            },
+            LlmResponse {
+                content: Some(
+                    r#"{"title":"First turn","summary":"Completed the first backend turn.","attention_points":[]}"#
+                        .to_string(),
+                ),
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: LlmUsage::default(),
+                reasoning_content: None,
+                thinking_blocks: None,
+            },
+            LlmResponse {
+                content: Some("Second reply.".to_string()),
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: LlmUsage::default(),
+                reasoning_content: None,
+                thinking_blocks: None,
+            },
+            LlmResponse {
+                content: Some(
+                    r#"{"title":"Second turn","summary":"Completed the second backend turn.","attention_points":[]}"#
+                        .to_string(),
+                ),
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: LlmUsage::default(),
+                reasoning_content: None,
+                thinking_blocks: None,
+            },
+        ],
+    ));
+    let agent = AgentLoop::new(
+        provider,
+        dir.path(),
+        Some("test-model".to_string()),
+        8,
+        8_000,
+        32 * 1024,
+        Default::default(),
+        None,
+        ExecToolConfig {
+            enable: false,
+            timeout: 60,
+            path_append: String::new(),
+        },
+        false,
+        None,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+    let progress_messages = Arc::new(std::sync::Mutex::new(Vec::<OutboundMessage>::new()));
+    let captured = progress_messages.clone();
+    let callback: MessageSendCallback = Arc::new(move |msg| {
+        let captured = captured.clone();
+        Box::pin(async move {
+            captured.lock().unwrap().push(msg);
+            Ok(())
+        })
+    });
+    agent.set_progress_sender(Some(callback));
+
+    let first = agent
+        .process_inbound(InboundMessage {
+            channel: "slack".to_string(),
+            sender_id: "u1".to_string(),
+            chat_id: "C123".to_string(),
+            content: "hello".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: Vec::new(),
+            metadata: BTreeMap::new(),
+            session_key_override: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.content, "First reply.");
+
+    let second = agent
+        .process_inbound(InboundMessage {
+            channel: "slack".to_string(),
+            sender_id: "u1".to_string(),
+            chat_id: "C123".to_string(),
+            content: "again".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: Vec::new(),
+            metadata: BTreeMap::new(),
+            session_key_override: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.content, "Second reply.");
+
+    let messages = progress_messages.lock().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].content,
+        "Session: started new session for this conversation."
+    );
+}
+
+#[tokio::test]
+async fn backend_announces_when_resuming_existing_session() {
+    let dir = tempdir().unwrap();
+    let mut sessions = SessionManager::new(dir.path()).unwrap();
+    let mut session = sessions.get_or_create("slack:C123").unwrap();
+    session.add_message("user", "Earlier message");
+    sessions.save(&session).unwrap();
+
+    let provider = Arc::new(QueuedProvider::new(
+        "test-model",
+        vec![LlmResponse {
+            content: Some("Reply after resume.".to_string()),
+            tool_calls: Vec::new(),
+            finish_reason: "stop".to_string(),
+            usage: LlmUsage::default(),
+            reasoning_content: None,
+            thinking_blocks: None,
+        },
+        LlmResponse {
+            content: Some(
+                r#"{"title":"Resumed turn","summary":"Completed a resumed backend turn.","attention_points":[]}"#
+                    .to_string(),
+            ),
+            tool_calls: Vec::new(),
+            finish_reason: "stop".to_string(),
+            usage: LlmUsage::default(),
+            reasoning_content: None,
+            thinking_blocks: None,
+        }],
+    ));
+    let agent = AgentLoop::new(
+        provider,
+        dir.path(),
+        Some("test-model".to_string()),
+        8,
+        8_000,
+        32 * 1024,
+        Default::default(),
+        None,
+        ExecToolConfig {
+            enable: false,
+            timeout: 60,
+            path_append: String::new(),
+        },
+        false,
+        None,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+    let progress_messages = Arc::new(std::sync::Mutex::new(Vec::<OutboundMessage>::new()));
+    let captured = progress_messages.clone();
+    let callback: MessageSendCallback = Arc::new(move |msg| {
+        let captured = captured.clone();
+        Box::pin(async move {
+            captured.lock().unwrap().push(msg);
+            Ok(())
+        })
+    });
+    agent.set_progress_sender(Some(callback));
+
+    let response = agent
+        .process_inbound(InboundMessage {
+            channel: "slack".to_string(),
+            sender_id: "u1".to_string(),
+            chat_id: "C123".to_string(),
+            content: "resume".to_string(),
+            timestamp: chrono::Utc::now(),
+            media: Vec::new(),
+            metadata: BTreeMap::new(),
+            session_key_override: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.content, "Reply after resume.");
+
+    let messages = progress_messages.lock().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].content,
+        "Session: resuming 1 previous message; /new to start fresh."
     );
 }

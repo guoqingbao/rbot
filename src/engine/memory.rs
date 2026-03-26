@@ -172,18 +172,16 @@ impl MemoryStore {
 
 pub struct MemoryConsolidator {
     store: MemoryStore,
-    context_window_tokens: usize,
 }
 
 impl MemoryConsolidator {
     pub fn new(
         workspace: &Path,
-        context_window_tokens: usize,
+        _context_window_tokens: usize,
         max_memory_bytes: usize,
     ) -> Result<Self> {
         Ok(Self {
             store: MemoryStore::new(workspace, max_memory_bytes)?,
-            context_window_tokens,
         })
     }
 
@@ -208,11 +206,15 @@ impl MemoryConsolidator {
             .sum()
     }
 
-    pub fn maybe_consolidate_by_tokens(&self, session: &mut Session) -> Result<()> {
-        if self.context_window_tokens == 0 {
+    pub fn maybe_consolidate_by_tokens(
+        &self,
+        session: &mut Session,
+        context_window_tokens: usize,
+    ) -> Result<()> {
+        if context_window_tokens == 0 {
             return Ok(());
         }
-        let target = (self.context_window_tokens * 3) / 4;
+        let target = (context_window_tokens * 3) / 4;
         while self.estimate_session_prompt_tokens(session) > target
             && session.last_consolidated < session.messages.len()
         {

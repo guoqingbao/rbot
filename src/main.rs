@@ -22,12 +22,12 @@ use rbot::config::Config;
 use rbot::cron::CronService;
 use rbot::engine::AgentLoop;
 use rbot::observability::{InstrumentedProvider, RuntimeTelemetry};
-use rbot::providers::SharedProvider;
+use rbot::providers::{ProviderModelInfo, SharedProvider};
 use rbot::runtime::{
     AgentRuntime, HeartbeatService, build_gateway_router, build_provider_client,
     validate_run_config,
 };
-use rbot::storage::{InboundMessage, MessageBus, OutboundMessage};
+use rbot::storage::{InboundMessage, MessageBus, OutboundMessage, SessionManager};
 use rbot::tools::MessageSendCallback;
 use rbot::util::{sync_workspace_templates, workspace_state_dir};
 
@@ -138,6 +138,9 @@ async fn chat(
         prompt.join(" ")
     };
     let built = build_agent(config_path, model).await?;
+    if let Some(notice) = &built.startup_notice {
+        eprintln!("{notice}");
+    }
     let shell = CliShell::new(
         &built.workspace,
         &built.cwd,
@@ -177,10 +180,17 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
         cwd,
         session_key,
         chat_id,
+        startup_notice,
     } = built;
+    let session_message_count = repl_session_message_count(&workspace, &session_key)?;
+    let display_model =
+        repl_session_model(&workspace, &session_key)?.unwrap_or_else(|| model.clone());
     let agent = Arc::new(agent);
-    let mut shell = CliShell::new(&workspace, &cwd, &model, &provider_name)?;
-    shell.print_welcome();
+    let mut shell = CliShell::new(&workspace, &cwd, &display_model, &provider_name)?;
+    shell.print_welcome(session_message_count);
+    if let Some(notice) = startup_notice {
+        println!("{notice}");
+    }
     let output = shell.create_output()?;
     output.show_idle_footer();
     let (tx, mut rx) = unbounded_channel::<ReplEvent>();
@@ -408,9 +418,13 @@ async fn run(config_path: Option<&Path>, model_override: Option<String>) -> Resu
         config.provider_api_base_for_model(Some(&model)),
         config.tools.web.proxy.as_deref(),
     )?;
+    let startup_model = resolve_startup_model(&provider, &model).await;
+    if let Some(notice) = &startup_model.notice {
+        eprintln!("{notice}");
+    }
     let telemetry = RuntimeTelemetry::new(
         provider_name.clone(),
-        model.clone(),
+        startup_model.active_model.clone(),
         config.provider_api_base_for_model(Some(&model)),
     );
     let provider: SharedProvider = Arc::new(InstrumentedProvider::new(provider, telemetry.clone()));
@@ -461,11 +475,12 @@ async fn run(config_path: Option<&Path>, model_override: Option<String>) -> Resu
         build_agent_from_config(
             &config,
             provider,
-            Some(model.clone()),
+            Some(startup_model.active_model.clone()),
             Some(cron_service.clone()),
         )
         .await?,
     );
+    configure_model_switch_persistence(&agent, config_path);
     *agent_slot.lock().expect("agent slot lock poisoned") = Some(agent.clone());
 
     let runtime = AgentRuntime::new(agent.clone(), bus.clone());
@@ -474,7 +489,7 @@ async fn run(config_path: Option<&Path>, model_override: Option<String>) -> Resu
         workspace.as_path(),
         bus.clone(),
         agent_slot.clone(),
-        model.clone(),
+        startup_model.active_model.clone(),
         provider_name.clone(),
     );
     runtime.start().await?;
@@ -657,6 +672,7 @@ struct BuiltAgent {
     cwd: PathBuf,
     session_key: String,
     chat_id: String,
+    startup_notice: Option<String>,
 }
 
 enum ReplEvent {
@@ -683,10 +699,18 @@ async fn build_agent(
         config.provider_api_base_for_model(Some(&model)),
         config.tools.web.proxy.as_deref(),
     )?;
+    let startup_model = resolve_startup_model(&provider, &model).await;
     let workspace = resolve_cli_workspace(&config, &cwd);
     sync_workspace_templates(&workspace)?;
-    let agent =
-        build_agent_for_workspace(&config, &workspace, provider, Some(model.clone()), None).await?;
+    let agent = build_agent_for_workspace(
+        &config,
+        &workspace,
+        provider,
+        Some(startup_model.active_model.clone()),
+        None,
+    )
+    .await?;
+    configure_model_switch_persistence(&agent, config_path);
     let session_key = cli_session_key(&cwd);
     let chat_id = cwd
         .file_name()
@@ -695,13 +719,94 @@ async fn build_agent(
         .unwrap_or_else(|| "direct".to_string());
     Ok(BuiltAgent {
         agent,
-        model,
+        model: startup_model.active_model,
         provider_name,
         workspace,
         cwd,
         session_key,
         chat_id,
+        startup_notice: startup_model.notice,
     })
+}
+
+fn configure_model_switch_persistence(agent: &AgentLoop, config_path: Option<&Path>) {
+    let config_path = config_path.map(Path::to_path_buf);
+    agent.set_model_switch_callback(Some(Arc::new(move |model, context_window_tokens| {
+        let mut config = Config::load(config_path.as_deref())?;
+        config.agents.defaults.model = model;
+        if let Some(context_window_tokens) = context_window_tokens.filter(|value| *value > 0) {
+            config.agents.defaults.context_window_tokens = context_window_tokens;
+        }
+        config.save(config_path.as_deref())?;
+        Ok(())
+    })));
+}
+
+struct StartupModelResolution {
+    active_model: String,
+    notice: Option<String>,
+}
+
+async fn resolve_startup_model(
+    provider: &SharedProvider,
+    requested_model: &str,
+) -> StartupModelResolution {
+    let models = match provider.list_models().await {
+        Ok(models) if !models.is_empty() => models,
+        _ => {
+            return StartupModelResolution {
+                active_model: requested_model.to_string(),
+                notice: None,
+            };
+        }
+    };
+    if let Some(selected_model) = resolve_startup_model_selection(&models, requested_model) {
+        return StartupModelResolution {
+            active_model: selected_model.id.clone(),
+            notice: None,
+        };
+    }
+    let selected_model = &models[0];
+    StartupModelResolution {
+        active_model: selected_model.id.clone(),
+        notice: Some(format!(
+            "Warning: requested model '{requested_model}' was not found in provider /models; using '{}' instead. Run `/model {}` to persist it.",
+            selected_model.id, selected_model.id
+        )),
+    }
+}
+
+fn resolve_startup_model_selection<'a>(
+    models: &'a [ProviderModelInfo],
+    requested_model: &str,
+) -> Option<&'a ProviderModelInfo> {
+    models
+        .iter()
+        .find(|item| item.id == requested_model)
+        .or_else(|| {
+            let requested = requested_model.to_ascii_lowercase();
+            let mut matches = models
+                .iter()
+                .filter(|item| item.id.to_ascii_lowercase() == requested);
+            let first = matches.next()?;
+            matches.next().is_none().then_some(first)
+        })
+        .or_else(|| {
+            let basename = requested_model
+                .trim_end_matches(['/', '\\'])
+                .rsplit(['/', '\\'])
+                .next()?;
+            let mut matches = models.iter().filter(|item| {
+                item.id
+                    .trim_end_matches(['/', '\\'])
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .map(|name| name.eq_ignore_ascii_case(basename))
+                    .unwrap_or(false)
+            });
+            let first = matches.next()?;
+            matches.next().is_none().then_some(first)
+        })
 }
 
 async fn build_agent_from_config(
@@ -794,7 +899,45 @@ fn detected_local_ip() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_gateway_display_host;
+    use super::{
+        repl_session_model, resolve_gateway_display_host, resolve_startup_model,
+        resolve_startup_model_selection,
+    };
+    use anyhow::{Result, anyhow};
+    use async_trait::async_trait;
+    use rbot::providers::{LlmProvider, LlmResponse, ProviderModelInfo, SharedProvider};
+    use rbot::storage::ChatMessage;
+    use rbot::storage::SessionManager;
+    use serde_json::Value;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    struct CatalogProvider {
+        model: String,
+        models: Vec<ProviderModelInfo>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for CatalogProvider {
+        fn default_model(&self) -> &str {
+            &self.model
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: Option<usize>,
+            _temperature: Option<f32>,
+        ) -> Result<LlmResponse> {
+            Err(anyhow!("unused in test"))
+        }
+
+        async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+            Ok(self.models.clone())
+        }
+    }
 
     #[test]
     fn wildcard_gateway_host_uses_local_ip_hint() {
@@ -853,6 +996,21 @@ fn cli_session_key(cwd: &Path) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "workspace".to_string());
     format!("cli:{project}:{:016x}", hasher.finish())
+}
+
+fn repl_session_message_count(workspace: &Path, session_key: &str) -> Result<usize> {
+    let mut sessions = SessionManager::new(workspace)?;
+    Ok(sessions.get_or_create(session_key)?.get_history(0).len())
+}
+
+fn repl_session_model(workspace: &Path, session_key: &str) -> Result<Option<String>> {
+    let mut sessions = SessionManager::new(workspace)?;
+    Ok(sessions
+        .get_or_create(session_key)?
+        .metadata
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned))
 }
 
 fn build_heartbeat_service(

@@ -17,6 +17,7 @@ use rustyline::history::DefaultHistory;
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Editor, ExternalPrinter as RustylineExternalPrinter};
 use serde_json::Value;
+use unicode_width::UnicodeWidthStr;
 
 use rbot::providers::TextStreamCallback;
 use rbot::util::{ensure_dir, tool_emoji, workspace_state_dir};
@@ -154,19 +155,6 @@ impl Style {
             self.dim(format!("{marker} {label}"))
         } else {
             format!("{marker} {label}")
-        }
-    }
-
-    fn tool_hint_pill(&self, parts: &ToolHintParts<'_>) -> String {
-        let text = if parts.detail.is_empty() {
-            format!("[ {} {} ]", parts.emoji, parts.tool_name)
-        } else {
-            format!("[ {} {}  {} ]", parts.emoji, parts.tool_name, parts.detail)
-        };
-        if self.ansi {
-            self.paint("48;5;253;38;5;236", text)
-        } else {
-            text
         }
     }
 
@@ -492,7 +480,6 @@ fn render_footer_locked(style: &Style, state: &mut FooterState) {
         state.display = FooterDisplay::Overlay;
         return;
     }
-
     if state.display == FooterDisplay::Overlay {
         clear_overlay_footer();
         state.display = FooterDisplay::None;
@@ -551,7 +538,7 @@ fn build_footer_line(style: &Style, state: &FooterState) -> String {
         }
         FooterMode::Interrupted => "enter continues · queued input kept",
         FooterMode::Error => "enter retries · /new resets · /exit quits",
-        FooterMode::Idle => "enter sends · Ctrl-C exits · /new · /status",
+        FooterMode::Idle => "Ctrl-C exits · /new · /model · /status",
     };
 
     let mut parts = vec![
@@ -643,13 +630,14 @@ impl CliShell {
         })
     }
 
-    pub fn print_welcome(&self) {
+    pub fn print_welcome(&self, session_message_count: usize) {
         let workspace = truncate_middle(&self.workspace.display().to_string(), 72);
         let cwd = truncate_middle(&self.cwd.display().to_string(), 72);
         let state_root = truncate_middle(
             &workspace_state_dir(&self.workspace).display().to_string(),
             72,
         );
+        let session_status = format_session_status(session_message_count);
         println!("{}", self.style.accent("╭─ rbot interactive"));
         println!(
             "{} {}",
@@ -660,6 +648,7 @@ impl CliShell {
         println!("{} {}", self.style.dim("│ cwd       "), cwd);
         println!("{} {}", self.style.dim("│ workspace "), workspace);
         println!("{} {}", self.style.dim("│ state     "), state_root);
+        println!("{} {}", self.style.dim("│ session   "), session_status);
         println!(
             "{} {}",
             self.style.dim("│ input     "),
@@ -670,7 +659,7 @@ impl CliShell {
             "{} {}",
             self.style.dim("╰ commands  "),
             self.style
-                .dim("/help  /clear  /exit  /new  /memorize <text>  /status  /stop")
+                .dim("/help  /clear  /exit  /new  /memorize <text>  /model [name]  /status  /stop")
         );
     }
 
@@ -738,32 +727,26 @@ impl CliShell {
     }
 
     fn print_help(&self) {
-        println!("{}", self.style.accent("╭─ CLI Help"));
-        println!(
-            "{} {}",
-            self.style.dim("│ local    "),
-            "/help  /clear(screen+reset)  /exit  /stop"
-        );
-        println!(
-            "{} {}",
-            self.style.dim("│ agent    "),
-            "/new  /memorize <text>  /status"
-        );
-        println!(
-            "{} {}",
-            self.style.dim("│ input    "),
-            "end a line with \\ for multiline input"
-        );
-        println!(
-            "{} {}",
-            self.style.dim("│ queue    "),
-            "type while busy to queue the next prompt; /stop or Ctrl-C interrupts"
-        );
-        println!(
-            "{} {}",
-            self.style.dim("╰ history  "),
-            "~/.rbot/history.txt"
-        );
+        let rows = vec![
+            (
+                "local".to_string(),
+                "/help  /clear(screen+reset)  /exit  /stop".to_string(),
+            ),
+            (
+                "agent".to_string(),
+                "/new  /memorize <text>  /model [name]  /status".to_string(),
+            ),
+            (
+                "input".to_string(),
+                "end a line with \\ for multiline input".to_string(),
+            ),
+            (
+                "queue".to_string(),
+                "type while busy to queue the next prompt; /stop or Ctrl-C interrupts".to_string(),
+            ),
+            ("history".to_string(), "~/.rbot/history.txt".to_string()),
+        ];
+        println!("{}", render_rounded_panel(&self.style, "CLI Help", &rows));
     }
 
     fn clear_screen(&self) {
@@ -1177,6 +1160,255 @@ fn parse_tool_hint(hint: &str) -> ToolHintParts<'_> {
     }
 }
 
+fn parse_legacy_tool_hint(hint: &str) -> Option<(&str, &str)> {
+    let trimmed = hint
+        .strip_prefix("[ ")
+        .and_then(|value| value.strip_suffix(" ]"))?;
+    let without_emoji = trimmed.split_once(' ')?.1.trim_start();
+    let (tool_name, detail) = without_emoji
+        .split_once("  ")
+        .unwrap_or((without_emoji, ""));
+    Some((tool_name.trim(), detail.trim()))
+}
+
+fn wrap_panel_text(text: &str, max_width: usize) -> Vec<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in trimmed.split_whitespace() {
+        let candidate_width = if current.is_empty() {
+            char_width(word)
+        } else {
+            char_width(&current) + 1 + char_width(word)
+        };
+        if !current.is_empty() && candidate_width > max_width {
+            lines.push(current);
+            current = word.to_string();
+        } else {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(trimmed.to_string());
+    }
+    lines
+}
+
+fn summarize_tool_hint_args(args: &Value) -> String {
+    match args {
+        Value::Object(map) => {
+            let preferred_keys = [
+                "path",
+                "target_file",
+                "file",
+                "command",
+                "cmd",
+                "url",
+                "query",
+                "pattern",
+                "task",
+                "label",
+            ];
+            let mut parts = Vec::new();
+            for key in preferred_keys {
+                let Some(value) = map.get(key) else {
+                    continue;
+                };
+                let summary = summarize_tool_hint_value(value);
+                if !summary.is_empty() {
+                    parts.push(format!("{key}={summary}"));
+                }
+            }
+            if parts.is_empty() {
+                map.iter()
+                    .take(2)
+                    .filter_map(|(key, value)| {
+                        let summary = summarize_tool_hint_value(value);
+                        (!summary.is_empty()).then(|| format!("{key}={summary}"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            } else {
+                parts.join(" · ")
+            }
+        }
+        _ => summarize_tool_hint_value(args),
+    }
+}
+
+fn summarize_tool_hint_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => truncate_middle(text.trim(), 48),
+        Value::Array(values) => {
+            let items = values
+                .iter()
+                .take(3)
+                .map(summarize_tool_hint_value)
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>();
+            if values.len() > 3 {
+                format!("{} …", items.join(", "))
+            } else {
+                items.join(", ")
+            }
+        }
+        Value::Number(number) => number.to_string(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Null => String::new(),
+        Value::Object(_) => "{...}".to_string(),
+    }
+}
+
+fn terminal_columns() -> usize {
+    let (_, columns) = Term::stdout().size();
+    usize::from(columns).max(1)
+}
+
+fn available_panel_width() -> usize {
+    terminal_columns().saturating_sub(4).max(1)
+}
+
+fn render_rounded_panel(style: &Style, title: &str, rows: &[(String, String)]) -> String {
+    let label_width = rows
+        .iter()
+        .map(|(label, _)| label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let rendered_rows = rows
+        .iter()
+        .map(|(label, value)| {
+            if label.is_empty() {
+                let indent = if label_width == 0 {
+                    String::new()
+                } else {
+                    " ".repeat(label_width + 2)
+                };
+                format!("{indent}{value}")
+            } else {
+                format!("{label:label_width$}  {value}")
+            }
+        })
+        .collect::<Vec<_>>();
+    let content_width = rendered_rows
+        .iter()
+        .map(|row| char_width(row))
+        .max()
+        .unwrap_or(0)
+        .max(char_width(title) + 1)
+        .max(available_panel_width());
+    let top_fill = content_width.saturating_sub(char_width(title) + 1);
+
+    let mut out = vec![format!(
+        "{}{}{}",
+        style.dim("╭─ "),
+        style.accent(title),
+        style.dim(format!(" {}╮", "─".repeat(top_fill)))
+    )];
+    if rendered_rows.is_empty() {
+        out.push(format!(
+            "{}{}{}",
+            style.dim("╰"),
+            style.dim("─".repeat(content_width + 2)),
+            style.dim("╯")
+        ));
+        return out.join("\n");
+    }
+
+    for row in rendered_rows {
+        out.push(format!(
+            "{} {} {}",
+            style.dim("│"),
+            pad_to_width(&row, content_width),
+            style.dim("│")
+        ));
+    }
+    out.push(format!(
+        "{}{}{}",
+        style.dim("╰"),
+        style.dim("─".repeat(content_width + 2)),
+        style.dim("╯")
+    ));
+    out.join("\n")
+}
+
+fn render_status_panel(style: &Style, content: &str) -> Option<String> {
+    let mut lines = content.lines();
+    let version = lines.next()?.strip_prefix("rbot v")?;
+    let model = lines.next()?.strip_prefix("Model: ")?;
+    let tokens = lines.next()?.strip_prefix("Tokens: ")?;
+    let context = lines.next()?.strip_prefix("Context: ")?;
+    let session = lines.next()?.strip_prefix("Session: ")?;
+    let uptime = lines.next()?.strip_prefix("Uptime: ")?;
+    if lines.next().is_some() {
+        return None;
+    }
+
+    let rows = vec![
+        ("version".to_string(), format!("v{version}")),
+        ("model".to_string(), style.accent(model)),
+        ("tokens".to_string(), tokens.to_string()),
+        ("context".to_string(), context.to_string()),
+        ("session".to_string(), session.to_string()),
+        ("uptime".to_string(), uptime.to_string()),
+    ];
+    Some(render_rounded_panel(style, "status", &rows))
+}
+
+fn render_model_panel(style: &Style, content: &str) -> Option<String> {
+    if let Some(switched) = content.strip_prefix("Model switched to ") {
+        let (model, context) =
+            if let Some((name, suffix)) = switched.split_once(" (context window ") {
+                (
+                    name.trim(),
+                    Some(suffix.trim_end_matches(')').trim().to_string()),
+                )
+            } else {
+                (switched.trim(), None)
+            };
+        let mut rows = vec![("active".to_string(), style.accent(model))];
+        if let Some(context) = context {
+            rows.push(("context".to_string(), context));
+        }
+        return Some(render_rounded_panel(style, "model", &rows));
+    }
+
+    let mut lines = content.lines();
+    let current_model = lines.next()?.strip_prefix("Current model: ")?;
+    let mut rows = vec![("current".to_string(), style.accent(current_model))];
+
+    let mut next_line = lines.next()?;
+    if let Some(context) = next_line.strip_prefix("Context window: ") {
+        rows.push(("context".to_string(), context.to_string()));
+        next_line = lines.next()?;
+    }
+    if next_line != "Available models:" {
+        return None;
+    }
+
+    let models = lines
+        .map(|line| line.strip_prefix("- ").map(str::trim))
+        .collect::<Option<Vec<_>>>()?;
+    if models.is_empty() {
+        rows.push(("available".to_string(), "none".to_string()));
+    } else {
+        rows.push(("available".to_string(), models[0].to_string()));
+        for model in models.iter().skip(1) {
+            rows.push((String::new(), (*model).to_string()));
+        }
+    }
+    Some(render_rounded_panel(style, "model", &rows))
+}
+
 fn render_tool_hint(
     style: &Style,
     hint: &str,
@@ -1188,15 +1420,46 @@ fn render_tool_hint(
             return rendered;
         }
     }
-    if hint.starts_with("[ ") && hint.ends_with(" ]") {
-        if style.ansi {
-            return style.paint("48;5;253;38;5;236", hint);
-        } else {
-            return hint.to_string();
-        }
+    let (resolved_tool_name, detail) = if let Some(tool_name) = tool_name {
+        (
+            tool_name,
+            tool_args
+                .map(summarize_tool_hint_args)
+                .filter(|detail| !detail.is_empty())
+                .unwrap_or_else(|| {
+                    parse_legacy_tool_hint(hint)
+                        .map(|(_, detail)| detail.to_string())
+                        .unwrap_or_else(|| parse_tool_hint(hint).detail.to_string())
+                }),
+        )
+    } else if let Some((tool_name, detail)) = parse_legacy_tool_hint(hint) {
+        (tool_name, detail.to_string())
+    } else {
+        let parts = parse_tool_hint(hint);
+        (parts.tool_name, parts.detail.to_string())
+    };
+
+    let title = format!("{} {resolved_tool_name}", tool_emoji(resolved_tool_name));
+    let wrapped_detail = wrap_panel_text(&detail, 76);
+    let mut rows = if wrapped_detail.is_empty() {
+        vec![("state".to_string(), style.subtle("running"))]
+    } else {
+        wrapped_detail
+            .into_iter()
+            .enumerate()
+            .map(|(index, line)| {
+                if index == 0 {
+                    ("detail".to_string(), style.subtle(line))
+                } else {
+                    (String::new(), style.subtle(line))
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    if rows.is_empty() {
+        rows.push(("state".to_string(), style.subtle("running")));
     }
-    let parts = parse_tool_hint(hint);
-    style.tool_hint_pill(&parts)
+    render_rounded_panel(style, &title, &rows)
 }
 
 fn render_edit_file_hint(style: &Style, _hint: &str, tool_args: Option<&Value>) -> Option<String> {
@@ -1216,7 +1479,7 @@ fn render_edit_file_hint(style: &Style, _hint: &str, tool_args: Option<&Value>) 
         .get("replace_all")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let width = 100usize;
+    let width = available_panel_width();
     let diff = build_edit_diff(&old_text, &new_text);
     let mut lines = Vec::new();
     lines.push(style.panel_header(
@@ -1444,6 +1707,12 @@ struct ToolHintParts<'a> {
 }
 
 fn render_markdown_response(style: &Style, content: &str) -> String {
+    if let Some(panel) = render_status_panel(style, content) {
+        return panel;
+    }
+    if let Some(panel) = render_model_panel(style, content) {
+        return panel;
+    }
     let mut state = StreamState::default();
     render_stream_delta(style, &mut state, content, true, false)
 }
@@ -2245,7 +2514,7 @@ fn is_number_start(chars: &[char], index: usize) -> bool {
 }
 
 fn char_width(text: &str) -> usize {
-    strip_ansi_escapes(text).chars().count()
+    UnicodeWidthStr::width(strip_ansi_escapes(text).as_str())
 }
 
 fn strip_ansi_escapes(text: &str) -> String {
@@ -2310,13 +2579,27 @@ fn truncate_middle(text: &str, max_chars: usize) -> String {
     format!("{start}...{end}")
 }
 
+fn format_session_status(session_message_count: usize) -> String {
+    if session_message_count == 0 {
+        "new session".to_string()
+    } else {
+        let label = if session_message_count == 1 {
+            "message"
+        } else {
+            "messages"
+        };
+        format!("resuming {session_message_count} {label}; /new to start fresh")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        LocalCommand, PendingTableLine, StreamState, char_width, fence_language,
-        highlight_code_line, line_requests_continuation, parse_local_command, parse_tool_hint,
-        render_aligned_table_with_width, render_markdown_line, render_markdown_response,
-        render_stream_delta, render_tool_hint, sentence_flush_index, truncate_middle,
+        LocalCommand, PendingTableLine, StreamState, available_panel_width, char_width,
+        fence_language, format_session_status, highlight_code_line, line_requests_continuation,
+        parse_local_command, parse_tool_hint, render_aligned_table_with_width,
+        render_markdown_line, render_markdown_response, render_stream_delta, render_tool_hint,
+        sentence_flush_index, truncate_middle,
     };
     use serde_json::json;
 
@@ -2327,6 +2610,7 @@ mod tests {
         assert_eq!(parse_local_command("/stop"), Some(LocalCommand::Stop));
         assert_eq!(parse_local_command("quit"), Some(LocalCommand::Exit));
         assert_eq!(parse_local_command("/status"), None);
+        assert_eq!(parse_local_command("/model"), None);
     }
 
     #[test]
@@ -2341,6 +2625,19 @@ mod tests {
         let value = truncate_middle("/very/long/path/to/a/project/workspace/directory", 20);
         assert!(value.contains("..."));
         assert!(value.len() <= 20);
+    }
+
+    #[test]
+    fn formats_session_status_for_new_and_existing_sessions() {
+        assert_eq!(format_session_status(0), "new session");
+        assert_eq!(
+            format_session_status(1),
+            "resuming 1 message; /new to start fresh"
+        );
+        assert_eq!(
+            format_session_status(11),
+            "resuming 11 messages; /new to start fresh"
+        );
     }
 
     #[test]
@@ -2392,6 +2689,42 @@ mod tests {
         assert!(rendered.contains("┼"));
         assert!(!rendered.contains("---------- │ ------- │ ------------"));
         assert!(rendered.contains("Total    │ 16    │ 100%"));
+    }
+
+    #[test]
+    fn renders_status_response_as_closed_panel() {
+        let style = super::Style { ansi: false };
+        let content = "rbot v0.1.0\nModel: qwen\nTokens: 10 in / 22 out\nContext: 512/4096 (12%)\nSession: 8 messages\nUptime: 2m 4s";
+        let rendered = render_markdown_response(&style, content);
+        assert!(rendered.contains("╭─ status"));
+        assert!(rendered.contains("│ version"));
+        assert!(rendered.contains("│ model"));
+        assert!(rendered.contains("╰"));
+        assert!(rendered.contains("╯"));
+    }
+
+    #[test]
+    fn expands_status_panel_to_terminal_width() {
+        let style = super::Style { ansi: false };
+        let content = "rbot v0.1.0\nModel: qwen\nTokens: 10 in / 22 out\nContext: 512/4096 (12%)\nSession: 8 messages\nUptime: 2m 4s";
+        let rendered = render_markdown_response(&style, content);
+        let expected_width = available_panel_width() + 4;
+        for line in rendered.lines() {
+            assert_eq!(char_width(line), expected_width, "{line}");
+        }
+    }
+
+    #[test]
+    fn renders_model_response_as_closed_panel() {
+        let style = super::Style { ansi: false };
+        let content =
+            "Current model: qwen\nContext window: 131072\nAvailable models:\n- qwen\n- llama";
+        let rendered = render_markdown_response(&style, content);
+        assert!(rendered.contains("╭─ model"));
+        assert!(rendered.contains("│ current"));
+        assert!(rendered.contains("│ available"));
+        assert!(rendered.contains("llama"));
+        assert!(rendered.contains("╯"));
     }
 
     #[test]
@@ -2554,5 +2887,38 @@ mod tests {
         assert!(rendered.contains("mod.rs"));
         assert!(rendered.contains("beta"));
         assert!(rendered.contains("old   new | diff preview"));
+    }
+
+    #[test]
+    fn renders_tool_hint_as_closed_panel() {
+        let style = super::Style { ansi: false };
+        let args = json!({"path": "src/main.rs"});
+        let rendered = render_tool_hint(
+            &style,
+            "[ 📖 read_file  path=src/main.rs ]",
+            Some("read_file"),
+            Some(&args),
+        );
+        assert!(rendered.contains("╭─ 📖 read_file"));
+        assert!(rendered.contains("│ detail"));
+        assert!(rendered.contains("path=src/main.rs"));
+        assert!(!rendered.contains("[ 📖"));
+        assert!(rendered.contains("╯"));
+    }
+
+    #[test]
+    fn tool_hint_panel_with_emoji_title_matches_terminal_width() {
+        let style = super::Style { ansi: false };
+        let args = json!({"path": "/root/rbot/src/channels/telegram.rs"});
+        let rendered = render_tool_hint(
+            &style,
+            "read_file · path=/root/rbot/src/channels/telegram.rs",
+            Some("read_file"),
+            Some(&args),
+        );
+        let expected_width = available_panel_width() + 4;
+        for line in rendered.lines() {
+            assert_eq!(char_width(line), expected_width, "{line}");
+        }
     }
 }

@@ -85,6 +85,13 @@ impl LlmResponse {
 
 pub type TextStreamCallback = Arc<Mutex<Box<dyn FnMut(String) + Send>>>;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderModelInfo {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub struct GenerationSettings {
     pub temperature: f32,
@@ -116,6 +123,10 @@ pub trait LlmProvider: Send + Sync {
         max_tokens: Option<usize>,
         temperature: Option<f32>,
     ) -> Result<LlmResponse>;
+
+    async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        Err(anyhow!("listing models is not supported by this provider"))
+    }
 
     async fn chat_stream(
         &self,
@@ -233,6 +244,38 @@ impl OpenAiCompatibleProvider {
             generation,
         })
     }
+
+    async fn list_models_inner(&self) -> Result<Vec<ProviderModelInfo>> {
+        let endpoint = format!("{}/models", self.api_base.trim_end_matches('/'));
+        let mut request = self.client.get(endpoint);
+        if !self.api_key.trim().is_empty() {
+            request = request.bearer_auth(&self.api_key);
+        }
+        for (key, value) in &self.extra_headers {
+            request = request.header(key, value);
+        }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!("provider error {status}: {body}"));
+        }
+        let payload = response.json::<Value>().await?;
+        let items = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .context("provider /models response missing data array")?;
+        Ok(items
+            .iter()
+            .filter_map(|item| {
+                let id = item.get("id").and_then(Value::as_str)?;
+                Some(ProviderModelInfo {
+                    id: id.to_string(),
+                    context_window_tokens: extract_context_window_tokens(item),
+                })
+            })
+            .collect())
+    }
 }
 
 pub struct CustomProvider {
@@ -299,6 +342,10 @@ impl LlmProvider for CustomProvider {
         self.inner
             .chat_stream(messages, tools, model, max_tokens, temperature, text_stream)
             .await
+    }
+
+    async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        self.inner.list_models().await
     }
 }
 
@@ -404,6 +451,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
         parse_openai_like_response_stream_first(response, text_stream.as_ref()).await
     }
+
+    async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        self.list_models_inner().await
+    }
 }
 
 #[async_trait]
@@ -468,6 +519,12 @@ impl LlmProvider for AzureOpenAiProvider {
             return Err(anyhow!("provider error {status}: {body}"));
         }
         parse_openai_like_response_stream_first(response, text_stream.as_ref()).await
+    }
+
+    async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        Err(anyhow!(
+            "listing models is not supported for Azure OpenAI providers"
+        ))
     }
 }
 
@@ -810,6 +867,50 @@ fn apply_openai_like_sse_event(
     Ok(())
 }
 
+fn extract_context_window_tokens(value: &Value) -> Option<usize> {
+    const KEYS: &[&str] = &[
+        "context_length",
+        "max_context_length",
+        "max_model_len",
+        "max_sequence_length",
+        "max_seq_len",
+        "context_window",
+        "num_ctx",
+        "n_ctx",
+    ];
+    match value {
+        Value::Object(map) => {
+            for key in KEYS {
+                if let Some(parsed) = map.get(*key).and_then(parse_context_value) {
+                    return Some(parsed);
+                }
+            }
+            for child in map.values() {
+                if let Some(parsed) = extract_context_window_tokens(child) {
+                    return Some(parsed);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items.iter().find_map(extract_context_window_tokens),
+        _ => None,
+    }
+}
+
+fn parse_context_value(value: &Value) -> Option<usize> {
+    match value {
+        Value::Number(number) => number.as_u64().map(|value| value as usize),
+        Value::String(text) => {
+            let digits = text
+                .chars()
+                .filter(|ch| ch.is_ascii_digit())
+                .collect::<String>();
+            digits.parse::<usize>().ok().filter(|value| *value > 0)
+        }
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 pub struct QueuedProvider {
     queue: Mutex<VecDeque<LlmResponse>>,
@@ -851,6 +952,13 @@ impl LlmProvider for QueuedProvider {
             .expect("queue lock poisoned")
             .pop_front()
             .context("queued provider exhausted")
+    }
+
+    async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        Ok(vec![ProviderModelInfo {
+            id: self.model.clone(),
+            context_window_tokens: None,
+        }])
     }
 }
 
