@@ -183,11 +183,12 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
         startup_notice,
     } = built;
     let session_message_count = repl_session_message_count(&workspace, &session_key)?;
+    let context_status = repl_session_context_status(&agent, &session_key).await?;
     let display_model =
         repl_session_model(&workspace, &session_key)?.unwrap_or_else(|| model.clone());
     let agent = Arc::new(agent);
     let mut shell = CliShell::new(&workspace, &cwd, &display_model, &provider_name)?;
-    shell.print_welcome(session_message_count);
+    shell.print_welcome(session_message_count, &context_status);
     if let Some(notice) = startup_notice {
         println!("{notice}");
     }
@@ -404,6 +405,9 @@ fn spawn_repl_turn(
 
 async fn run(config_path: Option<&Path>, model_override: Option<String>) -> Result<()> {
     let config = Config::load(config_path)?;
+    let resolved_config_path = config_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(Config::default_path);
     let workspace = config.workspace_path();
     sync_workspace_templates(&workspace)?;
     let model = model_override.unwrap_or_else(|| config.agents.defaults.model.clone());
@@ -518,18 +522,10 @@ async fn run(config_path: Option<&Path>, model_override: Option<String>) -> Resu
     let host = config.gateway.host.clone();
     let port = config.gateway.port;
     let listener = tokio::net::TcpListener::bind(format!("{host}:{port}")).await?;
-    println!(
-        "Gateway listening on {}",
-        format!("http://{host}:{port}").blue().bold()
-    );
-    println!(
-        "Admin UI: {}",
-        format_gateway_url(&gateway_url(&host, port, &config.gateway.admin.path))
-    );
-    println!(
-        "Metrics: {}",
-        format_gateway_url(&gateway_url(&host, port, &config.gateway.metrics.path))
-    );
+    let gateway_bind = format!("http://{host}:{port}");
+    let gateway_public = gateway_url(&host, port, "/");
+    let admin_url = gateway_url(&host, port, &config.gateway.admin.path);
+    let metrics_url = gateway_url(&host, port, &config.gateway.metrics.path);
     let server_task = tokio::spawn(async move {
         let _ = axum::serve(listener, router)
             .with_graceful_shutdown(async move {
@@ -539,15 +535,24 @@ async fn run(config_path: Option<&Path>, model_override: Option<String>) -> Resu
     });
 
     let enabled = manager.enabled_channels();
-    if enabled.is_empty() {
-        println!("Enabled channels: none");
-        println!(
-            "Runtime started without inbound channels; admin UI and gateway are still available."
-        );
-    } else {
-        println!("Enabled channels: {}", enabled.join(", "));
-    }
-    println!("Press Ctrl-C to stop.");
+    let snapshot = agent.snapshot()?;
+    let context_status = format_max_context_length(snapshot.context_window_tokens);
+    println!(
+        "{}",
+        format_run_welcome(
+            resolved_config_path.as_path(),
+            workspace.as_path(),
+            &config,
+            &startup_model.active_model,
+            &provider_name,
+            &context_status,
+            &enabled,
+            &gateway_bind,
+            &gateway_public,
+            &admin_url,
+            &metrics_url,
+        )
+    );
 
     tokio::signal::ctrl_c().await?;
     let _ = shutdown_tx.send(true);
@@ -882,6 +887,161 @@ fn format_gateway_url(url: &str) -> String {
     format!("{}", url.blue().bold())
 }
 
+fn format_max_context_length(total_tokens: usize) -> String {
+    format!("{total_tokens} max")
+}
+
+fn format_run_welcome(
+    config_path: &Path,
+    workspace: &Path,
+    config: &Config,
+    model: &str,
+    provider_name: &str,
+    context_status: &str,
+    enabled_channels: &[String],
+    gateway_bind: &str,
+    gateway_public: &str,
+    admin_url: &str,
+    metrics_url: &str,
+) -> String {
+    let rows = vec![
+        ("mode", "run".to_string()),
+        ("config", config_path.display().to_string()),
+        ("workspace", workspace.display().to_string()),
+        ("model", model.to_string()),
+        (
+            "provider",
+            format!(
+                "{} ({})",
+                provider_name,
+                config
+                    .provider_api_base_for_model(Some(model))
+                    .unwrap_or_else(|| "default api base".to_string())
+            ),
+        ),
+        (
+            "agents",
+            format!(
+                "maxTokens={}  context={}\nmaxToolIterations={}  memory={}B",
+                config.agents.defaults.max_tokens,
+                config.agents.defaults.context_window_tokens,
+                config.agents.defaults.max_tool_iterations,
+                config.agents.defaults.memory_max_bytes
+            ),
+        ),
+        ("context", context_status.to_string()),
+        ("channels", summarize_run_channels(config, enabled_channels)),
+        ("tools", summarize_run_tools(config)),
+        (
+            "gateway",
+            format!("bind={}  public={}", gateway_bind, gateway_public),
+        ),
+        (
+            "admin",
+            if config.gateway.admin.enabled {
+                admin_url.to_string()
+            } else {
+                "disabled".to_string()
+            },
+        ),
+        (
+            "metrics",
+            if config.gateway.metrics.enabled {
+                metrics_url.to_string()
+            } else {
+                "disabled".to_string()
+            },
+        ),
+        (
+            "heartbeat",
+            if config.gateway.heartbeat.enabled {
+                format!("enabled ({}s)", config.gateway.heartbeat.interval_s)
+            } else {
+                "disabled".to_string()
+            },
+        ),
+        ("stop", "Press Ctrl-C to stop.".to_string()),
+    ];
+    format_left_rounded_kv_panel("rbot runtime", &rows)
+}
+
+fn summarize_run_channels(config: &Config, enabled_channels: &[String]) -> String {
+    let enabled = if enabled_channels.is_empty() {
+        "none".to_string()
+    } else {
+        enabled_channels.join(", ")
+    };
+    let tool_hints = if config.channels.send_tool_hints {
+        "tool hints on"
+    } else {
+        "tool hints muted"
+    };
+    let progress = if config.channels.send_progress {
+        "progress on"
+    } else {
+        "progress off"
+    };
+    if enabled_channels.is_empty() {
+        format!("{enabled} ({progress}, {tool_hints}; gateway/admin still available)")
+    } else {
+        format!("{enabled} ({progress}, {tool_hints})")
+    }
+}
+
+fn summarize_run_tools(config: &Config) -> String {
+    let exec = if config.tools.exec.enable {
+        format!("exec on/{}s", config.tools.exec.timeout)
+    } else {
+        "exec off".to_string()
+    };
+    let web_search = format!("web search {}", config.tools.web.search.provider);
+    let mcp_enabled = config
+        .tools
+        .mcp_servers
+        .iter()
+        .filter(|(_, server)| server.enabled)
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>();
+    let mcp = if mcp_enabled.is_empty() {
+        "mcp none".to_string()
+    } else {
+        format!("mcp {}", mcp_enabled.join(", "))
+    };
+    let scope = if config.tools.restrict_to_workspace {
+        "workspace-only"
+    } else {
+        "workspace+system"
+    };
+    format!("{exec}  {web_search}\n{mcp}  {scope}")
+}
+
+fn format_left_rounded_kv_panel(title: &str, rows: &[(&str, String)]) -> String {
+    let label_width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
+    let lines = rows
+        .iter()
+        .flat_map(|(label, value)| {
+            let mut value_lines = value.lines();
+            let first = value_lines
+                .next()
+                .map(|line| format!("  {} : {line}", format!("{label:label_width$}").bold()))
+                .into_iter();
+            let rest = value_lines.map(|line| format!("  {:label_width$}   {line}", ""));
+            first.chain(rest).collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let top = format!("╭─ {}", title.cyan().bold());
+    let body = lines
+        .iter()
+        .map(|line| format!("│ {line}"))
+        .collect::<Vec<_>>();
+    let bottom = "╰─".to_string();
+    std::iter::once(top)
+        .chain(body)
+        .chain(std::iter::once(bottom))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn gateway_display_host(host: &str) -> String {
     resolve_gateway_display_host(host, detected_local_ip().as_deref())
 }
@@ -900,15 +1060,19 @@ fn detected_local_ip() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        repl_session_model, resolve_gateway_display_host, resolve_startup_model,
-        resolve_startup_model_selection,
+        format_run_welcome, repl_session_context_status, resolve_gateway_display_host,
+        resolve_startup_model, resolve_startup_model_selection,
     };
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
+    use rbot::config::Config;
+    use rbot::engine::AgentLoop;
     use rbot::providers::{LlmProvider, LlmResponse, ProviderModelInfo, SharedProvider};
-    use rbot::storage::ChatMessage;
-    use rbot::storage::SessionManager;
+    use rbot::storage::{ChatMessage, SessionManager};
     use serde_json::Value;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::path::Path;
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -962,6 +1126,118 @@ mod tests {
             "example.local"
         );
     }
+
+    #[test]
+    fn formats_run_welcome_header_with_runtime_summary() {
+        let mut config = Config::default();
+        config.agents.defaults.max_tokens = 4096;
+        config.agents.defaults.context_window_tokens = 32768;
+        config.agents.defaults.max_tool_iterations = 12;
+        config.agents.defaults.memory_max_bytes = 65536;
+        config.channels.send_progress = true;
+        config.channels.send_tool_hints = false;
+        config.channels.sections = BTreeMap::from([
+            (
+                "slack".to_string(),
+                json!({"enabled": true, "allowFrom": ["*"]}),
+            ),
+            (
+                "telegram".to_string(),
+                json!({"enabled": true, "allowFrom": ["*"]}),
+            ),
+        ]);
+        config.tools.exec.enable = true;
+        config.tools.exec.timeout = 90;
+        config.tools.web.search.provider = "duckduckgo".to_string();
+        config.tools.restrict_to_workspace = true;
+        config.tools.mcp_servers.insert(
+            "github".to_string(),
+            rbot::config::McpServerConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.gateway.heartbeat.enabled = true;
+        config.gateway.heartbeat.interval_s = 1800;
+
+        let rendered = format_run_welcome(
+            Path::new("/root/.rbot/config.json"),
+            Path::new("/root/rbot"),
+            &config,
+            "openai/gpt-4.1-mini",
+            "openai",
+            "524288 max",
+            &["slack".to_string(), "telegram".to_string()],
+            "http://0.0.0.0:18790",
+            "http://127.0.0.1:18790/",
+            "http://127.0.0.1:18790/admin",
+            "http://127.0.0.1:18790/metrics",
+        );
+
+        assert!(rendered.starts_with("╭─ rbot runtime"));
+        assert!(rendered.contains("mode      : run"));
+        assert!(rendered.contains("config    : /root/.rbot/config.json"));
+        assert!(rendered.contains("workspace : /root/rbot"));
+        assert!(rendered.contains("model     : openai/gpt-4.1-mini"));
+        assert!(rendered.contains("provider  : openai (default api base)"));
+        assert!(rendered.contains("agents    : maxTokens=4096  context=32768"));
+        assert!(rendered.contains("            maxToolIterations=12  memory=65536B"));
+        assert!(rendered.contains("context   : 524288 max"));
+        assert!(rendered.contains("channels  : slack, telegram (progress on, tool hints muted)"));
+        assert!(rendered.contains("tools     : exec on/90s  web search duckduckgo"));
+        assert!(rendered.contains("mcp github  workspace-only"));
+        assert!(rendered.contains("gateway   : bind=http://0.0.0.0:18790"));
+        assert!(rendered.contains("public=http://127.0.0.1:18790/"));
+        assert!(rendered.contains("admin     : http://127.0.0.1:18790/admin"));
+        assert!(rendered.contains("metrics   : http://127.0.0.1:18790/metrics"));
+        assert!(rendered.contains("heartbeat : enabled (1800s)"));
+        assert!(rendered.contains("stop      : Press Ctrl-C to stop."));
+        assert!(rendered.ends_with("╰─"));
+    }
+
+    #[tokio::test]
+    async fn repl_context_header_reuses_status_context_line() {
+        let dir = tempdir().unwrap();
+        let mut sessions = SessionManager::new(dir.path()).unwrap();
+        let mut session = sessions.get_or_create("cli:demo").unwrap();
+        session.add_message("user", "hello");
+        session
+            .metadata
+            .insert("model".to_string(), Value::String("demo-model".to_string()));
+        sessions.save(&session).unwrap();
+
+        let agent = AgentLoop::new(
+            Arc::new(CatalogProvider {
+                model: "demo-model".to_string(),
+                models: vec![ProviderModelInfo {
+                    id: "demo-model".to_string(),
+                    context_window_tokens: Some(524288),
+                }],
+            }),
+            dir.path(),
+            Some("demo-model".to_string()),
+            8,
+            262144,
+            32 * 1024,
+            Default::default(),
+            None,
+            rbot::config::ExecToolConfig {
+                enable: false,
+                timeout: 60,
+                path_append: String::new(),
+            },
+            false,
+            None,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+        let context = repl_session_context_status(&agent, "cli:demo")
+            .await
+            .unwrap();
+        assert_eq!(context, "5/524288 (0%)");
+    }
 }
 
 fn cli_progress_callback(stream: cli::StreamRenderer) -> MessageSendCallback {
@@ -1011,6 +1287,14 @@ fn repl_session_model(workspace: &Path, session_key: &str) -> Result<Option<Stri
         .get("model")
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned))
+}
+
+async fn repl_session_context_status(agent: &AgentLoop, session_key: &str) -> Result<String> {
+    let content = agent.session_status_content(session_key).await?;
+    content
+        .lines()
+        .find_map(|line| line.strip_prefix("Context: ").map(ToOwned::to_owned))
+        .ok_or_else(|| anyhow!("status content missing context line"))
 }
 
 fn build_heartbeat_service(

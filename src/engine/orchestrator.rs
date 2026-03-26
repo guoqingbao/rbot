@@ -263,7 +263,7 @@ impl AgentLoop {
     }
 
     async fn refresh_session_model_metadata(&self, session_key: &str) -> Result<()> {
-        let (session_model, has_context_window) = {
+        let (session_model, stored_context_window_tokens) = {
             let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
             let session = sessions.get_or_create(session_key)?;
             (
@@ -276,16 +276,13 @@ impl AgentLoop {
                     .metadata
                     .get(SESSION_CONTEXT_WINDOW_KEY)
                     .and_then(Value::as_u64)
-                    .map(|value| value > 0)
-                    .unwrap_or(false),
+                    .map(|value| value as usize)
+                    .filter(|value| *value > 0),
             )
         };
         let Some(session_model) = session_model else {
             return Ok(());
         };
-        if has_context_window {
-            return Ok(());
-        }
 
         let models = match self.provider.list_models().await {
             Ok(models) => models,
@@ -294,6 +291,13 @@ impl AgentLoop {
         let Some(resolved_model) = resolve_runtime_model_info(&models, &session_model) else {
             return Ok(());
         };
+        let resolved_context_window_tokens = resolved_model.context_window_tokens;
+        let model_changed = resolved_model.id != session_model;
+        let context_changed = resolved_context_window_tokens
+            .is_some_and(|value| Some(value) != stored_context_window_tokens);
+        if !model_changed && !context_changed {
+            return Ok(());
+        }
 
         {
             let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
@@ -302,7 +306,7 @@ impl AgentLoop {
                 SESSION_MODEL_KEY.to_string(),
                 Value::String(resolved_model.id.clone()),
             );
-            if let Some(context_window_tokens) = resolved_model.context_window_tokens {
+            if let Some(context_window_tokens) = resolved_context_window_tokens {
                 session.metadata.insert(
                     SESSION_CONTEXT_WINDOW_KEY.to_string(),
                     Value::from(context_window_tokens as u64),
@@ -1281,7 +1285,7 @@ impl AgentLoop {
         format!(
             "{}\n{}",
             format_backend_session_notice(session.get_history(0).len()),
-            self.build_status_content(session)
+            italicize_markdown_lines(&self.build_status_content(session))
         )
     }
 
@@ -1331,6 +1335,13 @@ impl AgentLoop {
 
     pub fn workspace(&self) -> &Path {
         &self.workspace
+    }
+
+    pub async fn session_status_content(&self, session_key: &str) -> Result<String> {
+        self.refresh_session_model_metadata(session_key).await?;
+        let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
+        let session = sessions.get_or_create(session_key)?;
+        Ok(self.build_status_content(&session))
     }
 
     pub fn snapshot(&self) -> Result<AgentSnapshot> {
@@ -1458,6 +1469,20 @@ fn format_backend_session_notice(session_message_count: usize) -> String {
         };
         format!("Session: resuming {session_message_count} previous {label}; /new to start fresh.")
     }
+}
+
+fn italicize_markdown_lines(content: &str) -> String {
+    content
+        .lines()
+        .map(|line| {
+            if line.trim().is_empty() {
+                String::new()
+            } else {
+                format!("*{line}*")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn parse_model_command(trimmed: &str) -> Option<Option<String>> {

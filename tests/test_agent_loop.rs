@@ -1059,6 +1059,9 @@ async fn status_refreshes_resumed_session_context_from_provider_models() {
         "model".to_string(),
         Value::String("Qwen3.5-35B-A3B-FP8".to_string()),
     );
+    session
+        .metadata
+        .insert("contextWindowTokens".to_string(), Value::from(262144_u64));
     sessions.save(&session).unwrap();
 
     let agent = AgentLoop::new(
@@ -1066,14 +1069,14 @@ async fn status_refreshes_resumed_session_context_from_provider_models() {
             model: "Qwen3.5 27B".to_string(),
             models: vec![ProviderModelInfo {
                 id: "Qwen3.5-35B-A3B-FP8".to_string(),
-                context_window_tokens: Some(256000),
+                context_window_tokens: Some(262144),
             }],
             responses: std::sync::Mutex::new(VecDeque::new()),
         }),
         dir.path(),
         Some("Qwen3.5 27B".to_string()),
         8,
-        65_536,
+        262144,
         32 * 1024,
         Default::default(),
         None,
@@ -1222,13 +1225,13 @@ async fn backend_announces_new_session_once_per_runtime_session() {
     assert!(
         messages[0]
             .content
-            .starts_with("Session: started new session for this conversation.\nrbot v")
+            .starts_with("Session: started new session for this conversation.\n*rbot v")
     );
-    assert!(messages[0].content.contains("\nModel: test-model\n"));
+    assert!(messages[0].content.contains("\n*Model: test-model*\n"));
     assert!(
         messages[0]
             .content
-            .contains("\nSession: 0 history messages\n")
+            .contains("\n*Session: 0 history messages*\n")
     );
 }
 
@@ -1314,12 +1317,12 @@ async fn backend_announces_when_resuming_existing_session() {
     assert!(
         messages[0]
             .content
-            .starts_with("Session: resuming 1 previous message; /new to start fresh.\nrbot v")
+            .starts_with("Session: resuming 1 previous message; /new to start fresh.\n*rbot v")
     );
-    assert!(messages[0].content.contains("\nModel: test-model\n"));
+    assert!(messages[0].content.contains("\n*Model: test-model*\n"));
     assert!(
         messages[0]
             .content
-            .contains("\nSession: 1 history messages\n")
+            .contains("\n*Session: 1 history messages*\n")
     );
 }

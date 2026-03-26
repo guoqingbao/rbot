@@ -631,7 +631,7 @@ impl CliShell {
         })
     }
 
-    pub fn print_welcome(&self, session_message_count: usize) {
+    pub fn print_welcome(&self, session_message_count: usize, context_status: &str) {
         let workspace = truncate_middle(&self.workspace.display().to_string(), 72);
         let cwd = truncate_middle(&self.cwd.display().to_string(), 72);
         let state_root = truncate_middle(
@@ -639,7 +639,7 @@ impl CliShell {
             72,
         );
         let session_status = if session_message_count == 0 {
-            "new session".to_string()
+            format_session_status(session_message_count)
         } else {
             self.style.bold(format!(
                 "continue with {session_message_count} history messages"
@@ -661,6 +661,7 @@ impl CliShell {
             ("workspace".to_string(), workspace),
             ("state".to_string(), state_root),
             ("session".to_string(), session_status),
+            ("context".to_string(), context_status.to_string()),
             ("commands".to_string(), primary_commands),
             (
                 String::new(),
@@ -2656,6 +2657,19 @@ fn truncate_middle(text: &str, max_chars: usize) -> String {
         .rev()
         .collect::<String>();
     format!("{start}...{end}")
+}
+
+fn format_session_status(session_message_count: usize) -> String {
+    if session_message_count == 0 {
+        "new session".to_string()
+    } else {
+        let label = if session_message_count == 1 {
+            "message"
+        } else {
+            "messages"
+        };
+        format!("resuming {session_message_count} {label}; /new to start fresh")
+    }
 }
 
 #[cfg(test)]
