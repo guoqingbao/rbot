@@ -365,7 +365,7 @@ Slack is currently webhook-driven in `rbot`.
 {
   "channels": {
     "sendProgress": true,
-    "sendToolHints": true,
+    "sendToolHints": false,
     "slack": {
       "enabled": true,
       "allowFrom": ["*"],
@@ -384,7 +384,8 @@ Operational notes:
 - `signingSecret` is required for startup validation.
 - Point Slack event subscriptions at `http://<host>:<port>/slack/events`.
 - Send software-development tasks as normal messages or mentions, for example: `review this repo, run tests, and fix failures`.
-- Tool execution hints can be sent back to Slack while a task is running when `channels.sendToolHints` is `true`.
+- `channels.sendToolHints` defaults to `false`; in that mode, `rbot` sends a muted-tool notice on the first tool call and batch summaries every 10 tool calls or before the next non-tool reply.
+- Set `channels.sendToolHints` to `true` if you want every tool execution hint sent back to Slack while a task is running.
 
 ### Telegram
 
@@ -394,7 +395,7 @@ Telegram is currently webhook-driven in `rbot`.
 {
   "channels": {
     "sendProgress": true,
-    "sendToolHints": true,
+    "sendToolHints": false,
     "telegram": {
       "enabled": true,
       "allowFrom": ["*"],
@@ -418,7 +419,8 @@ Usage notes:
 
 - Send development or analysis tasks as plain messages to the bot.
 - In groups, `groupPolicy: "mention"` keeps the bot from reacting to every message.
-- Tool execution hints can be sent back to Telegram while a task is running when `channels.sendToolHints` is `true`.
+- `channels.sendToolHints` defaults to `false`; in that mode, `rbot` sends a muted-tool notice on the first tool call and batch summaries every 10 tool calls or before the next non-tool reply.
+- Set `channels.sendToolHints` to `true` if you want every tool execution hint sent back to Telegram while a task is running.
 
 ### Feishu
 
@@ -428,7 +430,7 @@ Feishu runs through the webhook gateway and supports inbound text, post, interac
 {
   "channels": {
     "sendProgress": true,
-    "sendToolHints": true,
+    "sendToolHints": false,
     "feishu": {
       "enabled": true,
       "allowFrom": ["*"],
@@ -452,7 +454,8 @@ Usage notes:
 
 - Mention the bot in group chats when using `groupPolicy: "mention"`.
 - Development tasks can be sent as normal text instructions, and Feishu replies can include dedicated tool-hint cards during execution.
-- Tool execution hints are controlled by `channels.sendToolHints`, while non-tool progress messages are controlled by `channels.sendProgress`.
+- `channels.sendToolHints` defaults to `false`; in that mode, `rbot` sends a muted-tool notice on the first tool call and batch summaries every 10 tool calls or before the next non-tool reply.
+- Set `channels.sendToolHints` to `true` if you want every tool execution hint card sent back during execution. Non-tool progress messages are still controlled by `channels.sendProgress`.
 
 ## 6. Combined Example
 

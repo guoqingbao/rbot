@@ -61,7 +61,7 @@ impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
             send_progress: true,
-            send_tool_hints: true,
+            send_tool_hints: false,
             sections: BTreeMap::new(),
         }
     }

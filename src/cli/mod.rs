@@ -2760,7 +2760,7 @@ mod tests {
     #[test]
     fn renders_status_response_as_closed_panel() {
         let style = super::Style { ansi: false };
-        let content = "rbot v0.1.0\nModel: qwen\nTokens: 10 in / 22 out\nContext: 512/4096 (12%)\nSession: 8 messages\nUptime: 2m 4s";
+        let content = "rbot v0.1.0\nModel: qwen\nTokens: 10 in / 22 out\nContext: 512/4096 (12%)\nSession: 8 history messages\nUptime: 2m 4s";
         let rendered = render_markdown_response(&style, content);
         assert!(rendered.contains("╭─ status"));
         assert!(rendered.contains("│ version"));
@@ -2772,7 +2772,7 @@ mod tests {
     #[test]
     fn expands_status_panel_to_terminal_width() {
         let style = super::Style { ansi: false };
-        let content = "rbot v0.1.0\nModel: qwen\nTokens: 10 in / 22 out\nContext: 512/4096 (12%)\nSession: 8 messages\nUptime: 2m 4s";
+        let content = "rbot v0.1.0\nModel: qwen\nTokens: 10 in / 22 out\nContext: 512/4096 (12%)\nSession: 8 history messages\nUptime: 2m 4s";
         let rendered = render_markdown_response(&style, content);
         let expected_width = available_panel_width() + 4;
         for line in rendered.lines() {

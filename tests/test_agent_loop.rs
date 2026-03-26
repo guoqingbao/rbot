@@ -1219,9 +1219,16 @@ async fn backend_announces_new_session_once_per_runtime_session() {
 
     let messages = progress_messages.lock().unwrap();
     assert_eq!(messages.len(), 1);
-    assert_eq!(
-        messages[0].content,
-        "Session: started new session for this conversation."
+    assert!(
+        messages[0]
+            .content
+            .starts_with("Session: started new session for this conversation.\nrbot v")
+    );
+    assert!(messages[0].content.contains("\nModel: test-model\n"));
+    assert!(
+        messages[0]
+            .content
+            .contains("\nSession: 0 history messages\n")
     );
 }
 
@@ -1304,8 +1311,15 @@ async fn backend_announces_when_resuming_existing_session() {
 
     let messages = progress_messages.lock().unwrap();
     assert_eq!(messages.len(), 1);
-    assert_eq!(
-        messages[0].content,
-        "Session: resuming 1 previous message; /new to start fresh."
+    assert!(
+        messages[0]
+            .content
+            .starts_with("Session: resuming 1 previous message; /new to start fresh.\nrbot v")
+    );
+    assert!(messages[0].content.contains("\nModel: test-model\n"));
+    assert!(
+        messages[0]
+            .content
+            .contains("\nSession: 1 history messages\n")
     );
 }

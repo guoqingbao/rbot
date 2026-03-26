@@ -210,7 +210,7 @@ impl AgentLoop {
         let context_window_tokens = self.session_context_window_tokens(&session);
         let session_notice = if should_announce_backend_session(msg, trimmed_lower) {
             self.register_session_announcement(session_key)
-                .then(|| format_backend_session_notice(session.get_history(0).len()))
+                .then(|| self.format_backend_session_notice(&session))
         } else {
             None
         };
@@ -628,16 +628,9 @@ impl AgentLoop {
         if self.message_tool.sent_in_turn() {
             return Ok(None);
         }
-        Ok(Some(OutboundMessage {
-            channel: msg.channel,
-            chat_id: msg.chat_id,
-            content: final_content.unwrap_or_else(|| {
-                "I've completed processing but have no response to give.".to_string()
-            }),
-            reply_to: None,
-            media: Vec::new(),
-            metadata: msg.metadata,
-        }))
+        Ok(Some(target.outbound(final_content.unwrap_or_else(|| {
+            "I've completed processing but have no response to give.".to_string()
+        }))))
     }
 
     async fn process_system_inbound(&self, msg: InboundMessage) -> Result<Option<OutboundMessage>> {
@@ -647,6 +640,12 @@ impl AgentLoop {
             .map(|(channel, chat_id)| (channel.to_string(), chat_id.to_string()))
             .unwrap_or_else(|| ("cli".to_string(), msg.chat_id.clone()));
         let session_key = format!("{channel}:{chat_id}");
+        let progress_target = ProgressTarget {
+            channel: channel.clone(),
+            chat_id: chat_id.clone(),
+            session_key: session_key.clone(),
+            metadata: BTreeMap::new(),
+        };
 
         {
             let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
@@ -695,11 +694,7 @@ impl AgentLoop {
                 &active_model,
                 initial_messages.clone(),
                 None,
-                Some(ProgressTarget {
-                    channel: channel.clone(),
-                    chat_id: chat_id.clone(),
-                    metadata: BTreeMap::new(),
-                }),
+                Some(progress_target.clone()),
             )
             .await
         };
@@ -740,14 +735,9 @@ impl AgentLoop {
         )
         .await;
 
-        Ok(Some(OutboundMessage {
-            channel,
-            chat_id,
-            content: final_content.unwrap_or_else(|| "Background task completed.".to_string()),
-            reply_to: None,
-            media: Vec::new(),
-            metadata: BTreeMap::new(),
-        }))
+        Ok(Some(progress_target.outbound(
+            final_content.unwrap_or_else(|| "Background task completed.".to_string()),
+        )))
     }
 
     async fn run_agent_loop(
@@ -969,22 +959,20 @@ impl AgentLoop {
         let Some(callback) = callback else {
             return;
         };
-        let mut metadata = target.metadata.clone();
-        metadata.insert("_progress".to_string(), Value::Bool(true));
-        metadata.insert("_tool_hint".to_string(), Value::Bool(true));
-        metadata.insert(
+        let mut outbound = target.outbound(format_tool_hint(tool_call));
+        outbound
+            .metadata
+            .insert("_progress".to_string(), Value::Bool(true));
+        outbound
+            .metadata
+            .insert("_tool_hint".to_string(), Value::Bool(true));
+        outbound.metadata.insert(
             "_tool_name".to_string(),
             Value::String(tool_call.name.clone()),
         );
-        metadata.insert("_tool_args".to_string(), tool_call.arguments.clone());
-        let outbound = OutboundMessage {
-            channel: target.channel.clone(),
-            chat_id: target.chat_id.clone(),
-            content: format_tool_hint(tool_call),
-            reply_to: None,
-            media: Vec::new(),
-            metadata,
-        };
+        outbound
+            .metadata
+            .insert("_tool_args".to_string(), tool_call.arguments.clone());
         let _ = callback(outbound).await;
     }
 
@@ -1261,28 +1249,40 @@ impl AgentLoop {
     }
 
     fn status_response(&self, msg: &InboundMessage, session: &Session) -> OutboundMessage {
+        OutboundMessage {
+            channel: msg.channel.clone(),
+            chat_id: msg.chat_id.clone(),
+            content: self.build_status_content(session),
+            reply_to: None,
+            media: Vec::new(),
+            metadata: msg.metadata.clone(),
+        }
+    }
+
+    fn build_status_content(&self, session: &Session) -> String {
         let (prompt_tokens, completion_tokens) =
             *self.last_usage.lock().expect("usage lock poisoned");
         let context_tokens = self.memory.estimate_session_prompt_tokens(session);
         let active_model = self.session_model(session);
         let context_window_tokens = self.session_context_window_tokens(session);
-        OutboundMessage {
-            channel: msg.channel.clone(),
-            chat_id: msg.chat_id.clone(),
-            content: build_status_content(
-                env!("CARGO_PKG_VERSION"),
-                &active_model,
-                self.start_time.elapsed().as_secs(),
-                prompt_tokens,
-                completion_tokens,
-                context_window_tokens,
-                session.get_history(0).len(),
-                context_tokens,
-            ),
-            reply_to: None,
-            media: Vec::new(),
-            metadata: msg.metadata.clone(),
-        }
+        build_status_content(
+            env!("CARGO_PKG_VERSION"),
+            &active_model,
+            self.start_time.elapsed().as_secs(),
+            prompt_tokens,
+            completion_tokens,
+            context_window_tokens,
+            session.get_history(0).len(),
+            context_tokens,
+        )
+    }
+
+    fn format_backend_session_notice(&self, session: &Session) -> String {
+        format!(
+            "{}\n{}",
+            format_backend_session_notice(session.get_history(0).len()),
+            self.build_status_content(session)
+        )
     }
 
     fn record_usage(&self, response: &LlmResponse) {
@@ -1409,6 +1409,7 @@ struct SessionSetup {
 struct ProgressTarget {
     channel: String,
     chat_id: String,
+    session_key: String,
     metadata: BTreeMap<String, Value>,
 }
 
@@ -1417,18 +1418,24 @@ impl ProgressTarget {
         Self {
             channel: msg.channel.clone(),
             chat_id: msg.chat_id.clone(),
+            session_key: msg.session_key(),
             metadata: msg.metadata.clone(),
         }
     }
 
     fn outbound(&self, content: impl Into<String>) -> OutboundMessage {
+        let mut metadata = self.metadata.clone();
+        metadata.insert(
+            "_session_key".to_string(),
+            Value::String(self.session_key.clone()),
+        );
         OutboundMessage {
             channel: self.channel.clone(),
             chat_id: self.chat_id.clone(),
             content: content.into(),
             reply_to: None,
             media: Vec::new(),
-            metadata: self.metadata.clone(),
+            metadata,
         }
     }
 }
@@ -1887,7 +1894,7 @@ fn build_repeated_tool_loop_message(
     last_assistant_content: Option<&str>,
 ) -> String {
     let mut lines = vec![format!(
-        "Stopped because the same tool-call pattern repeated {repeated_batches} times without reaching a final answer."
+        "**Stopped because the same tool-call pattern repeated {repeated_batches} times without reaching a final answer.**"
     )];
     if let Some(content) = last_assistant_content.filter(|content| !content.trim().is_empty()) {
         lines.push(format!(
@@ -2004,7 +2011,9 @@ mod tests {
         }];
 
         let message = build_repeated_tool_loop_message(3, &messages, None);
-        assert!(message.contains("repeated 3 times"));
+        assert!(message.contains(
+            "**Stopped because the same tool-call pattern repeated 3 times without reaching a final answer.**"
+        ));
         assert!(message.contains("The agent appears stuck"));
         assert!(message.contains("exec: Permission denied"));
     }

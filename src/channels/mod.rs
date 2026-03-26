@@ -4,7 +4,7 @@ pub mod slack;
 pub mod telegram;
 
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -336,6 +336,134 @@ pub fn discover_all() -> BTreeMap<String, ChannelDescriptor> {
     merged
 }
 
+const MUTED_TOOL_HINT_BATCH_SIZE: usize = 10;
+const SESSION_KEY_METADATA: &str = "_session_key";
+
+#[derive(Debug, Default)]
+struct MutedToolHintState {
+    in_tool_run: bool,
+    batch_count: usize,
+    batch_tool_names: BTreeSet<String>,
+    emitted_batch_summaries: usize,
+}
+
+impl MutedToolHintState {
+    fn record_tool_call(&mut self, tool_name: &str) -> bool {
+        let started_run = !self.in_tool_run;
+        self.in_tool_run = true;
+        self.batch_count += 1;
+        self.batch_tool_names.insert(tool_name.to_string());
+        started_run
+    }
+
+    fn should_flush_batch(&self) -> bool {
+        self.batch_count >= MUTED_TOOL_HINT_BATCH_SIZE
+    }
+
+    fn take_batch_summary(&mut self) -> Option<String> {
+        if self.batch_count == 0 {
+            return None;
+        }
+        let summary = format_muted_tool_hint_summary(
+            self.batch_count,
+            &self.batch_tool_names,
+            self.emitted_batch_summaries > 0,
+        );
+        self.batch_count = 0;
+        self.batch_tool_names.clear();
+        self.emitted_batch_summaries += 1;
+        Some(summary)
+    }
+
+    fn finish_tool_run(&mut self) -> Option<String> {
+        self.in_tool_run = false;
+        let summary = self.take_batch_summary();
+        self.emitted_batch_summaries = 0;
+        summary
+    }
+
+    fn is_idle(&self) -> bool {
+        !self.in_tool_run && self.batch_count == 0
+    }
+}
+
+fn outbound_session_key(msg: &OutboundMessage) -> String {
+    msg.metadata
+        .get(SESSION_KEY_METADATA)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("{}:{}", msg.channel, msg.chat_id))
+}
+
+fn tool_name_from_outbound(msg: &OutboundMessage) -> &str {
+    msg.metadata
+        .get("_tool_name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("tool")
+}
+
+fn format_muted_tool_hint_notice(tool_name: &str) -> String {
+    format!("Tool call hint is muted, I'm executing a \"{tool_name}\" tool.")
+}
+
+fn format_muted_tool_hint_summary(
+    tool_count: usize,
+    tool_names: &BTreeSet<String>,
+    is_additional_batch: bool,
+) -> String {
+    let label = if tool_count == 1 {
+        "tool call"
+    } else {
+        "tool calls"
+    };
+    let names = if tool_names.is_empty() {
+        "tool".to_string()
+    } else {
+        tool_names.iter().cloned().collect::<Vec<_>>().join(", ")
+    };
+    if is_additional_batch {
+        format!("I've executed another {tool_count} {label}, including {names}.")
+    } else {
+        format!("I've executed {tool_count} {label}, including {names}.")
+    }
+}
+
+fn build_progress_update(msg: &OutboundMessage, content: String) -> OutboundMessage {
+    let mut metadata = msg.metadata.clone();
+    metadata.insert("_progress".to_string(), Value::Bool(true));
+    metadata.remove("_tool_hint");
+    metadata.remove("_tool_name");
+    metadata.remove("_tool_args");
+    OutboundMessage {
+        channel: msg.channel.clone(),
+        chat_id: msg.chat_id.clone(),
+        content,
+        reply_to: None,
+        media: Vec::new(),
+        metadata,
+    }
+}
+
+async fn dispatch_outbound(channels: &BTreeMap<String, Arc<dyn Channel>>, msg: OutboundMessage) {
+    let channel_name = msg.channel.clone();
+    let chat_id = msg.chat_id.clone();
+    let content_preview = msg.content.chars().take(200).collect::<String>();
+    if let Some(channel) = channels.get(&msg.channel) {
+        if let Err(err) = channel.send(msg).await {
+            eprintln!(
+                "failed to send outbound message via channel '{channel_name}' to '{chat_id}': {err}"
+            );
+        }
+    } else if channel_name == "system" {
+        eprintln!("{content_preview}");
+    } else {
+        eprintln!(
+            "dropping outbound message for unknown or disabled channel '{channel_name}' to '{chat_id}'"
+        );
+    }
+}
+
 pub struct ChannelManager {
     pub bus: MessageBus,
     pub channels: BTreeMap<String, Arc<dyn Channel>>,
@@ -392,13 +520,12 @@ impl ChannelManager {
             let send_progress = self.config.send_progress;
             let send_tool_hints = self.config.send_tool_hints;
             *dispatch = Some(tokio::spawn(async move {
+                let mut muted_tool_hints = BTreeMap::<String, MutedToolHintState>::new();
                 loop {
                     let Some(msg) = bus.consume_outbound().await else {
                         break;
                     };
-                    let channel_name = msg.channel.clone();
-                    let chat_id = msg.chat_id.clone();
-                    let content_preview = msg.content.chars().take(200).collect::<String>();
+                    let session_key = outbound_session_key(&msg);
                     if msg.metadata.get("_progress").is_some() {
                         let is_tool_hint = msg
                             .metadata
@@ -406,25 +533,51 @@ impl ChannelManager {
                             .and_then(Value::as_bool)
                             .unwrap_or(false);
                         if is_tool_hint && !send_tool_hints {
+                            let tool_name = tool_name_from_outbound(&msg).to_string();
+                            let state = muted_tool_hints.entry(session_key).or_default();
+                            if state.record_tool_call(&tool_name) {
+                                dispatch_outbound(
+                                    &channels,
+                                    build_progress_update(
+                                        &msg,
+                                        format_muted_tool_hint_notice(&tool_name),
+                                    ),
+                                )
+                                .await;
+                            }
+                            if state.should_flush_batch() {
+                                if let Some(summary) = state.take_batch_summary() {
+                                    dispatch_outbound(
+                                        &channels,
+                                        build_progress_update(&msg, summary),
+                                    )
+                                    .await;
+                                }
+                            }
                             continue;
+                        }
+                        if let Some(state) = muted_tool_hints.get_mut(&session_key) {
+                            if let Some(summary) = state.finish_tool_run() {
+                                dispatch_outbound(&channels, build_progress_update(&msg, summary))
+                                    .await;
+                            }
+                            if state.is_idle() {
+                                muted_tool_hints.remove(&session_key);
+                            }
                         }
                         if !is_tool_hint && !send_progress {
                             continue;
                         }
-                    }
-                    if let Some(channel) = channels.get(&msg.channel) {
-                        if let Err(err) = channel.send(msg).await {
-                            eprintln!(
-                                "failed to send outbound message via channel '{channel_name}' to '{chat_id}': {err}"
-                            );
+                    } else if let Some(state) = muted_tool_hints.get_mut(&session_key) {
+                        if let Some(summary) = state.finish_tool_run() {
+                            dispatch_outbound(&channels, build_progress_update(&msg, summary))
+                                .await;
                         }
-                    } else if channel_name == "system" {
-                        eprintln!("{content_preview}");
-                    } else {
-                        eprintln!(
-                            "dropping outbound message for unknown or disabled channel '{channel_name}' to '{chat_id}'"
-                        );
+                        if state.is_idle() {
+                            muted_tool_hints.remove(&session_key);
+                        }
                     }
+                    dispatch_outbound(&channels, msg).await;
                 }
             }));
         }
@@ -480,5 +633,192 @@ impl ChannelManager {
                 )
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use serde_json::json;
+    use tempfile::tempdir;
+    use tokio::time::{Instant, sleep};
+
+    use super::*;
+
+    fn test_channels_config(send_progress: bool, send_tool_hints: bool) -> ChannelsConfig {
+        ChannelsConfig {
+            send_progress,
+            send_tool_hints,
+            sections: BTreeMap::from([(
+                "local".to_string(),
+                json!({
+                    "enabled": true,
+                    "allowFrom": ["*"],
+                }),
+            )]),
+        }
+    }
+
+    fn local_sent_messages(manager: &ChannelManager) -> Vec<OutboundMessage> {
+        manager
+            .get_channel("local")
+            .and_then(|channel| {
+                channel
+                    .as_any()
+                    .downcast_ref::<LocalChannel>()
+                    .map(LocalChannel::sent_messages)
+            })
+            .expect("local channel available")
+    }
+
+    async fn wait_for_sent_count(manager: &ChannelManager, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if local_sent_messages(manager).len() >= expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for outbound messages"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn tool_hint_message(chat_id: &str, session_key: &str, tool_name: &str) -> OutboundMessage {
+        OutboundMessage {
+            channel: "local".to_string(),
+            chat_id: chat_id.to_string(),
+            content: format!("[ {tool_name} ]"),
+            reply_to: None,
+            media: Vec::new(),
+            metadata: BTreeMap::from([
+                ("_progress".to_string(), Value::Bool(true)),
+                ("_tool_hint".to_string(), Value::Bool(true)),
+                (
+                    "_tool_name".to_string(),
+                    Value::String(tool_name.to_string()),
+                ),
+                (
+                    SESSION_KEY_METADATA.to_string(),
+                    Value::String(session_key.to_string()),
+                ),
+            ]),
+        }
+    }
+
+    fn final_message(chat_id: &str, session_key: &str, content: &str) -> OutboundMessage {
+        OutboundMessage {
+            channel: "local".to_string(),
+            chat_id: chat_id.to_string(),
+            content: content.to_string(),
+            reply_to: None,
+            media: Vec::new(),
+            metadata: BTreeMap::from([(
+                SESSION_KEY_METADATA.to_string(),
+                Value::String(session_key.to_string()),
+            )]),
+        }
+    }
+
+    #[tokio::test]
+    async fn muted_tool_hints_flush_summary_before_final_message() {
+        let workspace = tempdir().expect("tempdir");
+        let bus = MessageBus::new(16);
+        let manager = ChannelManager::new(
+            test_channels_config(true, false),
+            bus.clone(),
+            workspace.path().to_path_buf(),
+        )
+        .expect("channel manager");
+        manager.start_all().await.expect("start channels");
+
+        bus.publish_outbound(tool_hint_message("chat-1", "session-1", "read_file"))
+            .await
+            .expect("publish tool hint");
+        bus.publish_outbound(final_message("chat-1", "session-1", "Done."))
+            .await
+            .expect("publish final message");
+
+        wait_for_sent_count(&manager, 3).await;
+        let sent = local_sent_messages(&manager);
+        let contents = sent
+            .iter()
+            .map(|msg| msg.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contents,
+            vec![
+                "Tool call hint is muted, I'm executing a \"read_file\" tool.",
+                "I've executed 1 tool call, including read_file.",
+                "Done.",
+            ]
+        );
+
+        manager.stop_all().await.expect("stop channels");
+    }
+
+    #[tokio::test]
+    async fn muted_tool_hints_emit_summary_every_ten_calls() {
+        let workspace = tempdir().expect("tempdir");
+        let bus = MessageBus::new(48);
+        let manager = ChannelManager::new(
+            test_channels_config(true, false),
+            bus.clone(),
+            workspace.path().to_path_buf(),
+        )
+        .expect("channel manager");
+        manager.start_all().await.expect("start channels");
+
+        for tool_name in [
+            "read_file",
+            "exec",
+            "edit_file",
+            "read_file",
+            "exec",
+            "edit_file",
+            "read_file",
+            "exec",
+            "edit_file",
+            "read_file",
+            "exec",
+            "edit_file",
+            "read_file",
+            "exec",
+            "edit_file",
+            "read_file",
+            "exec",
+            "edit_file",
+            "read_file",
+            "exec",
+        ] {
+            bus.publish_outbound(tool_hint_message("chat-2", "session-2", tool_name))
+                .await
+                .expect("publish tool hint");
+        }
+
+        wait_for_sent_count(&manager, 3).await;
+        bus.publish_outbound(final_message("chat-2", "session-2", "Complete."))
+            .await
+            .expect("publish final message");
+        wait_for_sent_count(&manager, 4).await;
+
+        let sent = local_sent_messages(&manager);
+        let contents = sent
+            .iter()
+            .map(|msg| msg.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contents,
+            vec![
+                "Tool call hint is muted, I'm executing a \"read_file\" tool.",
+                "I've executed 10 tool calls, including edit_file, exec, read_file.",
+                "I've executed another 10 tool calls, including edit_file, exec, read_file.",
+                "Complete.",
+            ]
+        );
+
+        manager.stop_all().await.expect("stop channels");
     }
 }
