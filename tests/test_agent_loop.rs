@@ -1225,7 +1225,7 @@ async fn backend_announces_new_session_once_per_runtime_session() {
     assert!(
         messages[0]
             .content
-            .starts_with("Session: started new session for this conversation.\n*rbot v")
+            .starts_with("Session: started new session for this conversation.\n\n*rbot v")
     );
     assert!(messages[0].content.contains("\n*Model: test-model*\n"));
     assert!(
@@ -1317,7 +1317,7 @@ async fn backend_announces_when_resuming_existing_session() {
     assert!(
         messages[0]
             .content
-            .starts_with("Session: resuming 1 previous message; /new to start fresh.\n*rbot v")
+            .starts_with("Session: resuming 1 previous message; /new to start fresh.\n\n*rbot v")
     );
     assert!(messages[0].content.contains("\n*Model: test-model*\n"));
     assert!(

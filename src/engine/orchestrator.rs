@@ -1283,7 +1283,7 @@ impl AgentLoop {
 
     fn format_backend_session_notice(&self, session: &Session) -> String {
         format!(
-            "{}\n{}",
+            "{}\n\n{}",
             format_backend_session_notice(session.get_history(0).len()),
             italicize_markdown_lines(&self.build_status_content(session))
         )
@@ -1478,7 +1478,7 @@ fn italicize_markdown_lines(content: &str) -> String {
             if line.trim().is_empty() {
                 String::new()
             } else {
-                format!("*{line}*")
+                format!("_{line}_")
             }
         })
         .collect::<Vec<_>>()

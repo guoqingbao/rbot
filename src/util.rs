@@ -196,7 +196,7 @@ pub fn build_status_content(
         0
     };
     format!(
-        "rbot v{version}\nModel: {model}\nTokens: {last_prompt_tokens} in / {last_completion_tokens} out\nContext: {context_tokens_estimate}/{context_window_tokens} ({pct}%)\nSession: {session_message_count} history messages\nUptime: {uptime}"
+        "Model: {model}\nTokens: {last_prompt_tokens} in / {last_completion_tokens} out\nContext: {context_tokens_estimate}/{context_window_tokens} ({pct}%)\nSession: {session_message_count} history messages\nUptime: {uptime}"
     )
 }
 
