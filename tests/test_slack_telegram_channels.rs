@@ -195,6 +195,7 @@ async fn slack_send_uses_thread_for_channel_messages() {
         json!({"enabled": true, "allowFrom": ["*"], "botToken": "x"}),
         MessageBus::new(8),
         std::env::temp_dir(),
+        String::new(),
     )
     .unwrap();
     let api = Arc::new(FakeSlackApi::default());
@@ -235,6 +236,7 @@ async fn slack_send_updates_reactions_for_final_responses() {
         json!({"enabled": true, "allowFrom": ["*"], "botToken": "x", "reactEmoji": "eyes"}),
         MessageBus::new(8),
         std::env::temp_dir(),
+        String::new(),
     )
     .unwrap();
     let api = Arc::new(FakeSlackApi::default());
@@ -280,6 +282,7 @@ async fn slack_handle_event_scopes_channel_threads_to_session_key() {
         json!({"enabled": true, "allowFrom": ["u1"], "botToken": "x"}),
         bus.clone(),
         std::env::temp_dir(),
+        String::new(),
     )
     .unwrap();
     channel.set_bot_user_id(Some("B123".to_string()));
@@ -312,6 +315,7 @@ async fn slack_handle_event_skips_unrecognized_image_downloads() {
         json!({"enabled": true, "allowFrom": ["u1"], "botToken": "x"}),
         bus.clone(),
         dir.path().to_path_buf(),
+        String::new(),
     )
     .unwrap();
     channel.set_bot_user_id(Some("B123".to_string()));
@@ -355,6 +359,7 @@ fn telegram_is_allowed_accepts_legacy_id_username_formats() {
         json!({"allowFrom": ["12345", "alice", "67890|bob"]}),
         MessageBus::new(8),
         std::env::temp_dir(),
+        String::new(),
     )
     .unwrap();
     assert!(channel.is_allowed("12345|carol"));
@@ -381,6 +386,7 @@ async fn telegram_send_preserves_topic_and_infers_reply_topic_from_cache() {
         json!({"enabled": true, "token": "123:abc", "allowFrom": ["*"], "replyToMessage": true}),
         MessageBus::new(8),
         std::env::temp_dir(),
+        String::new(),
     )
     .unwrap();
     let api = Arc::new(FakeTelegramApi::default());
@@ -432,6 +438,7 @@ async fn telegram_send_routes_media_and_blocks_unsafe_remote_urls() {
         json!({"enabled": true, "token": "123:abc", "allowFrom": ["*"]}),
         MessageBus::new(8),
         std::env::temp_dir(),
+        String::new(),
     )
     .unwrap();
     let api = Arc::new(FakeTelegramApi::default());
@@ -469,6 +476,7 @@ async fn telegram_group_policy_mention_gates_group_messages() {
         json!({"enabled": true, "token": "123:abc", "allowFrom": ["*"], "groupPolicy": "mention"}),
         bus.clone(),
         std::env::temp_dir(),
+        String::new(),
     )
     .unwrap();
     let api = Arc::new(FakeTelegramApi::default());

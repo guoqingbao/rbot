@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
@@ -126,7 +127,13 @@ fn parse_md_table_strips_markdown_formatting_in_headers_and_cells() {
 
 #[test]
 fn split_headings_strips_embedded_markdown_before_bolding() {
-    let channel = FeishuChannel::new(FeishuChannel::default_config(), MessageBus::new(8)).unwrap();
+    let channel = FeishuChannel::new(
+        FeishuChannel::default_config(),
+        MessageBus::new(8),
+        PathBuf::new(),
+        String::new(),
+    )
+    .unwrap();
     let elements = channel.split_headings("# **Important** *status* ~~update~~");
     assert_eq!(
         elements,
@@ -139,7 +146,13 @@ fn split_headings_strips_embedded_markdown_before_bolding() {
 
 #[test]
 fn split_headings_keeps_markdown_body_and_code_blocks_intact() {
-    let channel = FeishuChannel::new(FeishuChannel::default_config(), MessageBus::new(8)).unwrap();
+    let channel = FeishuChannel::new(
+        FeishuChannel::default_config(),
+        MessageBus::new(8),
+        PathBuf::new(),
+        String::new(),
+    )
+    .unwrap();
     let elements = channel
         .split_headings("# **Heading**\n\nBody with **bold** text.\n\n```python\nprint('hi')\n```");
     assert_eq!(
@@ -211,6 +224,8 @@ async fn tool_hint_sends_interactive_code_card() {
     let channel = FeishuChannel::new(
         json!({"enabled": true, "appId": "id", "appSecret": "secret", "allowFrom": ["*"]}),
         MessageBus::new(8),
+        PathBuf::new(),
+        String::new(),
     )
     .unwrap();
     let api = Arc::new(FakeFeishuApi::default());
@@ -245,6 +260,8 @@ async fn send_uses_reply_api_when_configured_and_falls_back_to_create() {
     let channel = FeishuChannel::new(
         json!({"enabled": true, "appId": "id", "appSecret": "secret", "allowFrom": ["*"], "replyToMessage": true}),
         MessageBus::new(8),
+        PathBuf::new(),
+        String::new(),
     )
     .unwrap();
     let api = Arc::new(FakeFeishuApi::default());
@@ -274,6 +291,8 @@ async fn send_uses_expected_feishu_msg_type_for_uploaded_files() {
     let channel = FeishuChannel::new(
         json!({"enabled": true, "appId": "id", "appSecret": "secret", "allowFrom": ["*"]}),
         MessageBus::new(8),
+        dir.path().to_path_buf(),
+        String::new(),
     )
     .unwrap();
     let api = Arc::new(FakeFeishuApi::default());
@@ -312,6 +331,8 @@ async fn get_message_content_returns_reply_prefix_and_truncates() {
     let channel = FeishuChannel::new(
         json!({"enabled": true, "appId": "id", "appSecret": "secret", "allowFrom": ["*"]}),
         MessageBus::new(8),
+        PathBuf::new(),
+        String::new(),
     )
     .unwrap();
     let api = Arc::new(FakeFeishuApi::default());
@@ -343,9 +364,12 @@ async fn get_message_content_returns_reply_prefix_and_truncates() {
 #[tokio::test]
 async fn handle_event_downloads_inbound_image_and_adds_reaction() {
     let bus = MessageBus::new(8);
+    let dir = tempdir().unwrap();
     let channel = FeishuChannel::new(
         json!({"enabled": true, "appId": "id", "appSecret": "secret", "allowFrom": ["*"], "reactEmoji": "THUMBSUP"}),
         bus.clone(),
+        dir.path().to_path_buf(),
+        String::new(),
     )
     .unwrap();
     let api = Arc::new(FakeFeishuApi::default());
@@ -395,9 +419,12 @@ async fn handle_event_downloads_inbound_image_and_adds_reaction() {
 #[tokio::test]
 async fn handle_event_extracts_interactive_card_text_and_downloads_post_images() {
     let bus = MessageBus::new(8);
+    let dir = tempdir().unwrap();
     let channel = FeishuChannel::new(
         json!({"enabled": true, "appId": "id", "appSecret": "secret", "allowFrom": ["*"]}),
         bus.clone(),
+        dir.path().to_path_buf(),
+        String::new(),
     )
     .unwrap();
     let api = Arc::new(FakeFeishuApi::default());
@@ -454,9 +481,12 @@ async fn handle_event_extracts_interactive_card_text_and_downloads_post_images()
 #[tokio::test]
 async fn handle_event_extracts_interactive_share_card_text() {
     let bus = MessageBus::new(8);
+    let dir = tempdir().unwrap();
     let channel = FeishuChannel::new(
         json!({"enabled": true, "appId": "id", "appSecret": "secret", "allowFrom": ["*"]}),
         bus.clone(),
+        dir.path().to_path_buf(),
+        String::new(),
     )
     .unwrap();
     channel.set_api(Arc::new(FakeFeishuApi::default())).await;

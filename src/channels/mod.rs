@@ -1,11 +1,19 @@
+pub mod dingtalk;
+pub mod discord;
 pub mod email;
 pub mod feishu;
+pub mod matrix;
+pub mod mochat;
+pub mod qq;
 pub mod slack;
 pub mod telegram;
+pub mod wecom;
+pub mod weixin;
+pub mod whatsapp;
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Result, anyhow};
@@ -17,6 +25,8 @@ use tokio::task::JoinHandle;
 use crate::config::ChannelsConfig;
 use crate::storage::{InboundMessage, MessageBus, OutboundMessage};
 
+pub use dingtalk::{DINGTALK_MAX_MESSAGE_LEN, DingTalkChannel, DingTalkConfig};
+pub use discord::{DISCORD_MAX_MESSAGE_LEN, DiscordChannel, DiscordConfig};
 pub use email::{
     EmailBackend, EmailBackendError, EmailBackendErrorKind, EmailChannel, EmailConfig,
     EmailSearchCriteria, OutgoingEmail, ParsedInboundEmail, RawEmail,
@@ -25,27 +35,58 @@ pub use feishu::{
     FeishuApi, FeishuChannel, FeishuConfig, FeishuMessageDetails, FeishuResource,
     extract_post_content,
 };
+pub use matrix::{MATRIX_MAX_MESSAGE_CHARS, MatrixChannel, MatrixConfig};
+pub use mochat::{MOCHAT_MAX_MESSAGE_LEN, MochatChannel, MochatConfig};
+pub use qq::{QQ_MAX_MESSAGE_LEN, QqChannel, QqConfig};
 pub use slack::{SlackApi, SlackChannel, SlackConfig, SlackDmConfig};
 pub use telegram::{
     ReplyParameters, TELEGRAM_MAX_MESSAGE_LEN, TELEGRAM_REPLY_CONTEXT_MAX_LEN, TelegramApi,
     TelegramBotIdentity, TelegramChannel, TelegramConfig,
 };
+pub use wecom::{WECOM_MAX_MESSAGE_LEN, WecomChannel, WecomConfig};
+pub use weixin::{WEIXIN_MAX_MESSAGE_LEN, WeixinChannel, WeixinConfig};
+pub use whatsapp::{WHATSAPP_MAX_MESSAGE_LEN, WhatsAppChannel, WhatsAppConfig};
 
 #[derive(Debug, Clone)]
 pub struct ChannelBase {
     pub config: Value,
     pub bus: MessageBus,
     pub workspace: PathBuf,
+    pub transcription_api_key: String,
     running: Arc<Mutex<bool>>,
 }
 
 impl ChannelBase {
-    pub fn new(config: Value, bus: MessageBus, workspace: PathBuf) -> Self {
+    pub fn new(
+        config: Value,
+        bus: MessageBus,
+        workspace: PathBuf,
+        transcription_api_key: String,
+    ) -> Self {
         Self {
             config,
             bus,
             workspace,
+            transcription_api_key,
             running: Arc::new(Mutex::new(false)),
+        }
+    }
+
+    pub async fn transcribe_audio(&self, file_path: &Path) -> String {
+        if self.transcription_api_key.is_empty() {
+            return String::new();
+        }
+        match crate::providers::transcription::GroqTranscriptionProvider::new(
+            self.transcription_api_key.clone(),
+        )
+        .transcribe(file_path)
+        .await
+        {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("audio transcription failed: {e}");
+                String::new()
+            }
         }
     }
 
@@ -120,13 +161,37 @@ pub trait Channel: Send + Sync {
     fn display_name(&self) -> &'static str {
         self.name()
     }
+    fn supports_streaming(&self) -> bool {
+        false
+    }
+    /// Whether this channel supports interactive login (QR code, OAuth, etc.).
+    fn supports_login(&self) -> bool {
+        false
+    }
+    /// Perform interactive login. Returns `true` on success.
+    /// The default implementation is a no-op that returns `true`.
+    async fn login(&self, _force: bool) -> Result<bool> {
+        Ok(true)
+    }
     async fn start(&self) -> Result<()>;
     async fn stop(&self) -> Result<()>;
     async fn send(&self, msg: OutboundMessage) -> Result<()>;
+    async fn send_delta(
+        &self,
+        _chat_id: &str,
+        _delta: &str,
+        _metadata: &BTreeMap<String, Value>,
+    ) -> Result<()> {
+        Ok(())
+    }
+    /// Human-readable setup instructions for obtaining tokens/keys.
+    fn setup_instructions(&self) -> &'static str {
+        "Configure this channel via: rbot config --channel"
+    }
 }
 
 type ChannelFactory =
-    Arc<dyn Fn(Value, MessageBus, PathBuf) -> Result<Arc<dyn Channel>> + Send + Sync>;
+    Arc<dyn Fn(Value, MessageBus, PathBuf, String) -> Result<Arc<dyn Channel>> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct ChannelDescriptor {
@@ -164,9 +229,14 @@ pub struct LocalChannel {
 }
 
 impl LocalChannel {
-    pub fn new(config: Value, bus: MessageBus, workspace: PathBuf) -> Self {
+    pub fn new(
+        config: Value,
+        bus: MessageBus,
+        workspace: PathBuf,
+        transcription_api_key: String,
+    ) -> Self {
         Self {
-            base: ChannelBase::new(config, bus, workspace),
+            base: ChannelBase::new(config, bus, workspace, transcription_api_key),
             sent: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -247,6 +317,14 @@ pub fn discover_channel_names() -> Vec<String> {
         "feishu".to_string(),
         "slack".to_string(),
         "telegram".to_string(),
+        "dingtalk".to_string(),
+        "matrix".to_string(),
+        "discord".to_string(),
+        "whatsapp".to_string(),
+        "qq".to_string(),
+        "wecom".to_string(),
+        "weixin".to_string(),
+        "mochat".to_string(),
     ]
 }
 
@@ -279,8 +357,13 @@ pub fn discover_all() -> BTreeMap<String, ChannelDescriptor> {
             "local",
             "Local",
             LocalChannel::default_config(),
-            Arc::new(|config, bus, workspace| {
-                Ok(Arc::new(LocalChannel::new(config, bus, workspace)))
+            Arc::new(|config, bus, workspace, transcription_api_key| {
+                Ok(Arc::new(LocalChannel::new(
+                    config,
+                    bus,
+                    workspace,
+                    transcription_api_key,
+                )))
             }),
         ),
     );
@@ -290,8 +373,13 @@ pub fn discover_all() -> BTreeMap<String, ChannelDescriptor> {
             "email",
             "Email",
             EmailChannel::default_config(),
-            Arc::new(|config, bus, workspace| {
-                Ok(Arc::new(EmailChannel::new(config, bus, workspace)?))
+            Arc::new(|config, bus, workspace, transcription_api_key| {
+                Ok(Arc::new(EmailChannel::new(
+                    config,
+                    bus,
+                    workspace,
+                    transcription_api_key,
+                )?))
             }),
         ),
     );
@@ -301,8 +389,13 @@ pub fn discover_all() -> BTreeMap<String, ChannelDescriptor> {
             "feishu",
             "Feishu",
             FeishuChannel::default_config(),
-            Arc::new(|config, bus, workspace| {
-                Ok(Arc::new(FeishuChannel::new(config, bus, workspace)?))
+            Arc::new(|config, bus, workspace, transcription_api_key| {
+                Ok(Arc::new(FeishuChannel::new(
+                    config,
+                    bus,
+                    workspace,
+                    transcription_api_key,
+                )?))
             }),
         ),
     );
@@ -312,8 +405,13 @@ pub fn discover_all() -> BTreeMap<String, ChannelDescriptor> {
             "slack",
             "Slack",
             SlackChannel::default_config(),
-            Arc::new(|config, bus, workspace| {
-                Ok(Arc::new(SlackChannel::new(config, bus, workspace)?))
+            Arc::new(|config, bus, workspace, transcription_api_key| {
+                Ok(Arc::new(SlackChannel::new(
+                    config,
+                    bus,
+                    workspace,
+                    transcription_api_key,
+                )?))
             }),
         ),
     );
@@ -323,8 +421,141 @@ pub fn discover_all() -> BTreeMap<String, ChannelDescriptor> {
             "telegram",
             "Telegram",
             TelegramChannel::default_config(),
-            Arc::new(|config, bus, workspace| {
-                Ok(Arc::new(TelegramChannel::new(config, bus, workspace)?))
+            Arc::new(|config, bus, workspace, transcription_api_key| {
+                Ok(Arc::new(TelegramChannel::new(
+                    config,
+                    bus,
+                    workspace,
+                    transcription_api_key,
+                )?))
+            }),
+        ),
+    );
+    builtin.insert(
+        "dingtalk".to_string(),
+        ChannelDescriptor::new(
+            "dingtalk",
+            "DingTalk",
+            DingTalkChannel::default_config(),
+            Arc::new(|config, bus, workspace, transcription_api_key| {
+                Ok(Arc::new(DingTalkChannel::new(
+                    config,
+                    bus,
+                    workspace,
+                    transcription_api_key,
+                )?))
+            }),
+        ),
+    );
+    builtin.insert(
+        "matrix".to_string(),
+        ChannelDescriptor::new(
+            "matrix",
+            "Matrix",
+            MatrixChannel::default_config(),
+            Arc::new(|config, bus, workspace, transcription_api_key| {
+                Ok(Arc::new(MatrixChannel::new(
+                    config,
+                    bus,
+                    workspace,
+                    transcription_api_key,
+                )?))
+            }),
+        ),
+    );
+    builtin.insert(
+        "discord".to_string(),
+        ChannelDescriptor::new(
+            "discord",
+            "Discord",
+            DiscordChannel::default_config(),
+            Arc::new(|config, bus, workspace, transcription_api_key| {
+                Ok(Arc::new(DiscordChannel::new(
+                    config,
+                    bus,
+                    workspace,
+                    transcription_api_key,
+                )?))
+            }),
+        ),
+    );
+    builtin.insert(
+        "whatsapp".to_string(),
+        ChannelDescriptor::new(
+            "whatsapp",
+            "WhatsApp",
+            WhatsAppChannel::default_config(),
+            Arc::new(|config, bus, workspace, transcription_api_key| {
+                Ok(Arc::new(WhatsAppChannel::new(
+                    config,
+                    bus,
+                    workspace,
+                    transcription_api_key,
+                )?))
+            }),
+        ),
+    );
+    builtin.insert(
+        "qq".to_string(),
+        ChannelDescriptor::new(
+            "qq",
+            "QQ",
+            QqChannel::default_config(),
+            Arc::new(|config, bus, workspace, transcription_api_key| {
+                Ok(Arc::new(QqChannel::new(
+                    config,
+                    bus,
+                    workspace,
+                    transcription_api_key,
+                )?))
+            }),
+        ),
+    );
+    builtin.insert(
+        "wecom".to_string(),
+        ChannelDescriptor::new(
+            "wecom",
+            "WeCom",
+            WecomChannel::default_config(),
+            Arc::new(|config, bus, workspace, transcription_api_key| {
+                Ok(Arc::new(WecomChannel::new(
+                    config,
+                    bus,
+                    workspace,
+                    transcription_api_key,
+                )?))
+            }),
+        ),
+    );
+    builtin.insert(
+        "weixin".to_string(),
+        ChannelDescriptor::new(
+            "weixin",
+            "WeChat",
+            WeixinChannel::default_config(),
+            Arc::new(|config, bus, workspace, transcription_api_key| {
+                Ok(Arc::new(WeixinChannel::new(
+                    config,
+                    bus,
+                    workspace,
+                    transcription_api_key,
+                )?))
+            }),
+        ),
+    );
+    builtin.insert(
+        "mochat".to_string(),
+        ChannelDescriptor::new(
+            "mochat",
+            "Mochat",
+            MochatChannel::default_config(),
+            Arc::new(|config, bus, workspace, transcription_api_key| {
+                Ok(Arc::new(MochatChannel::new(
+                    config,
+                    bus,
+                    workspace,
+                    transcription_api_key,
+                )?))
             }),
         ),
     );
@@ -445,15 +676,56 @@ fn build_progress_update(msg: &OutboundMessage, content: String) -> OutboundMess
     }
 }
 
-async fn dispatch_outbound(channels: &BTreeMap<String, Arc<dyn Channel>>, msg: OutboundMessage) {
+async fn dispatch_outbound(
+    channels: &BTreeMap<String, Arc<dyn Channel>>,
+    msg: OutboundMessage,
+    max_retries: usize,
+) {
     let channel_name = msg.channel.clone();
     let chat_id = msg.chat_id.clone();
     let content_preview = msg.content.chars().take(200).collect::<String>();
+
+    let is_stream_delta = msg
+        .metadata
+        .get("_stream_delta")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let is_stream_end = msg
+        .metadata
+        .get("_stream_end")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
     if let Some(channel) = channels.get(&msg.channel) {
-        if let Err(err) = channel.send(msg).await {
-            eprintln!(
-                "failed to send outbound message via channel '{channel_name}' to '{chat_id}': {err}"
-            );
+        if is_stream_delta || is_stream_end {
+            if channel.supports_streaming() {
+                let _ = channel
+                    .send_delta(&msg.chat_id, &msg.content, &msg.metadata)
+                    .await;
+            }
+            if is_stream_end && !msg.metadata.get("_streamed").is_some() {
+                return;
+            }
+            if is_stream_delta {
+                return;
+            }
+        }
+
+        let retries = max_retries.max(1);
+        for attempt in 0..retries {
+            match channel.send(msg.clone()).await {
+                Ok(()) => return,
+                Err(err) => {
+                    if attempt + 1 < retries {
+                        let backoff = std::time::Duration::from_secs(1 << attempt.min(3));
+                        tokio::time::sleep(backoff).await;
+                    } else {
+                        eprintln!(
+                            "failed to send outbound message via channel '{channel_name}' to '{chat_id}' after {retries} attempts: {err}"
+                        );
+                    }
+                }
+            }
         }
     } else if channel_name == "system" {
         eprintln!("{content_preview}");
@@ -497,8 +769,12 @@ impl ChannelManager {
             if !enabled {
                 continue;
             }
-            let channel =
-                (descriptor.factory)(section.clone(), self.bus.clone(), self.workspace.clone())?;
+            let channel = (descriptor.factory)(
+                section.clone(),
+                self.bus.clone(),
+                self.workspace.clone(),
+                self.config.transcription_api_key.clone(),
+            )?;
             if channel.base().allow_from().is_empty() {
                 return Err(anyhow!(
                     "\"{name}\" has empty allowFrom (denies all). Set [\"*\"] or explicit IDs."
@@ -519,6 +795,7 @@ impl ChannelManager {
             let bus = self.bus.clone();
             let send_progress = self.config.send_progress;
             let send_tool_hints = self.config.send_tool_hints;
+            let send_max_retries = self.config.send_max_retries;
             *dispatch = Some(tokio::spawn(async move {
                 let mut muted_tool_hints = BTreeMap::<String, MutedToolHintState>::new();
                 loop {
@@ -542,6 +819,7 @@ impl ChannelManager {
                                         &msg,
                                         format_muted_tool_hint_notice(&tool_name),
                                     ),
+                                    send_max_retries,
                                 )
                                 .await;
                             }
@@ -550,6 +828,7 @@ impl ChannelManager {
                                     dispatch_outbound(
                                         &channels,
                                         build_progress_update(&msg, summary),
+                                        send_max_retries,
                                     )
                                     .await;
                                 }
@@ -558,8 +837,12 @@ impl ChannelManager {
                         }
                         if let Some(state) = muted_tool_hints.get_mut(&session_key) {
                             if let Some(summary) = state.finish_tool_run() {
-                                dispatch_outbound(&channels, build_progress_update(&msg, summary))
-                                    .await;
+                                dispatch_outbound(
+                                    &channels,
+                                    build_progress_update(&msg, summary),
+                                    send_max_retries,
+                                )
+                                .await;
                             }
                             if state.is_idle() {
                                 muted_tool_hints.remove(&session_key);
@@ -570,14 +853,18 @@ impl ChannelManager {
                         }
                     } else if let Some(state) = muted_tool_hints.get_mut(&session_key) {
                         if let Some(summary) = state.finish_tool_run() {
-                            dispatch_outbound(&channels, build_progress_update(&msg, summary))
-                                .await;
+                            dispatch_outbound(
+                                &channels,
+                                build_progress_update(&msg, summary),
+                                send_max_retries,
+                            )
+                            .await;
                         }
                         if state.is_idle() {
                             muted_tool_hints.remove(&session_key);
                         }
                     }
-                    dispatch_outbound(&channels, msg).await;
+                    dispatch_outbound(&channels, msg, send_max_retries).await;
                 }
             }));
         }
@@ -650,6 +937,8 @@ mod tests {
         ChannelsConfig {
             send_progress,
             send_tool_hints,
+            transcription_api_key: String::new(),
+            send_max_retries: 1,
             sections: BTreeMap::from([(
                 "local".to_string(),
                 json!({

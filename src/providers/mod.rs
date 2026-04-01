@@ -1,4 +1,8 @@
+pub mod anthropic;
 pub mod registry;
+pub mod transcription;
+
+pub use anthropic::{AnthropicProvider, DEFAULT_MODEL};
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};

@@ -327,10 +327,20 @@ pub struct SlackChannel {
 }
 
 impl SlackChannel {
-    pub fn new(config: Value, bus: MessageBus, workspace: PathBuf) -> Result<Self> {
+    pub fn new(
+        config: Value,
+        bus: MessageBus,
+        workspace: PathBuf,
+        transcription_api_key: String,
+    ) -> Result<Self> {
         let config: SlackConfig = serde_json::from_value(config)?;
         Ok(Self {
-            base: ChannelBase::new(serde_json::to_value(&config)?, bus, workspace),
+            base: ChannelBase::new(
+                serde_json::to_value(&config)?,
+                bus,
+                workspace,
+                transcription_api_key,
+            ),
             config,
             api: Arc::new(AsyncMutex::new(None)),
             bot_user_id: Arc::new(Mutex::new(None)),
@@ -773,6 +783,27 @@ impl Channel for SlackChannel {
 
     fn display_name(&self) -> &'static str {
         "Slack"
+    }
+
+    fn setup_instructions(&self) -> &'static str {
+        "Slack uses the Socket Mode API.\n\
+         \n\
+         1. Go to https://api.slack.com/apps and create a new app\n\
+         2. Under 'Socket Mode', enable it and generate an App-Level Token (xapp-...)\n\
+         3. Under 'OAuth & Permissions', add bot scopes: chat:write, app_mentions:read, \
+            im:history, im:read, files:read, files:write\n\
+         4. Install the app to your workspace and copy the Bot Token (xoxb-...)\n\
+         5. Under 'Event Subscriptions', subscribe to: message.im, app_mention\n\
+         6. Configure rbot:\n\
+         \n\
+            \"slack\": {\n\
+              \"enabled\": true,\n\
+              \"allowFrom\": [\"*\"],\n\
+              \"botToken\": \"xoxb-...\",\n\
+              \"appToken\": \"xapp-...\"\n\
+            }\n\
+         \n\
+         7. Run: rbot run"
     }
 
     async fn start(&self) -> Result<()> {

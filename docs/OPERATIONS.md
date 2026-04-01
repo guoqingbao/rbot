@@ -4,7 +4,7 @@
 
 `rbot` is designed to cover three persistent use cases from the same runtime:
 
-- AI assistant: interactive support over `email`, `slack`, `telegram`, or `feishu`
+- AI assistant: interactive support over `email`, `slack`, `telegram`, `feishu`, `dingtalk`, `discord`, `matrix`, `whatsapp`, `qq`, `wecom`, `weixin`, or `mochat`
 - autonomous software engineer: file edits, shell execution, tests, scheduled repo checks, GitHub/CI assistance through skills and MCP tools
 - autonomous data analyst: web search, web fetch, scheduled reports, workspace report generation, and channel delivery
 
@@ -39,9 +39,25 @@ Recommended built-ins:
 - `software-engineer`
 - `data-analyst`
 - `github-cli`
+- `github`
 - `scheduled-ops`
+- `memory` (always-on)
+- `memory-hygiene` (always-on)
+- `cron`
+- `clawhub`
+- `skill-creator`
+- `summarize`
+- `weather`
+- `tmux`
 
-The runtime injects always-on skills automatically and adds task-relevant skills when prompt keywords match their trigger metadata.
+The runtime injects always-on skills automatically and adds task-relevant skills when prompt keywords match their trigger metadata. Skills with unmet requirements (missing binaries, environment variables, or OS constraints) are marked as unavailable in the skills summary.
+
+### Skill Management CLI
+
+```bash
+rbot skills list          # List all skills with availability status
+rbot skills init my-skill # Scaffold a new skill directory
+```
 
 ## MCP for External Tooling
 
@@ -124,10 +140,18 @@ Current metrics include:
 Useful commands:
 
 ```bash
-cargo run -- status
-cargo run -- sessions
-cargo run -- jobs
-cargo run -- print-config
+cargo run -- status            # Runtime status
+cargo run -- sessions          # List active sessions
+cargo run -- jobs              # List scheduled cron jobs
+cargo run -- print-config      # Print resolved config
+cargo run -- channels list     # List all available channels
+cargo run -- channels status   # Show enabled/disabled state per channel
+cargo run -- channels login    # Interactive login (Weixin QR code, WhatsApp bridge)
+cargo run -- channels setup    # Show setup instructions (how to get tokens/keys)
+cargo run -- skills list       # List skills with availability status
+cargo run -- skills init NAME  # Scaffold a new skill directory
+cargo run -- config --provider # Interactive provider setup
+cargo run -- config --channel  # Interactive channel setup
 ```
 
 `status` resolves the current model/provider, inspects local system state, and prints the admin and metrics URLs.
@@ -162,10 +186,19 @@ Recommended pattern:
 3. Schedule recurring collection and report jobs with cron.
 4. Deliver summaries through channels and keep the detailed artifacts on disk.
 
+## Concurrency and Safety
+
+- `max_concurrent_requests` (default 3) limits total concurrent inbound processing via a global semaphore.
+- Per-session mutex ensures messages for the same session are serialized, preventing interleaved tool execution.
+- Channel outbound delivery retries with exponential backoff (`send_max_retries`, default 3).
+
 ## Reliability Notes
 
 - Provider retries now only apply to transient failures.
 - Local providers can run without API keys when recognized as local.
+- OAuth providers (GitHub Copilot, OpenAI Codex) skip the API key requirement.
+- Cursor provider requires explicit `apiBase` configuration.
 - MCP configuration errors fail fast at startup.
 - The admin API redacts secrets from the exposed config payload.
 - Durable memory writes use the `memory-entry-writer` skill plus a short model summarization pass, with heuristic fallback if the provider summary fails.
+- LLM-driven memory consolidation falls back to raw archive after 3 consecutive failures.

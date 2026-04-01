@@ -1,6 +1,7 @@
 ---
+name: software-engineer
 description: "Software engineering workflow for planning, code changes, tests, CI-style validation, and release hygiene."
-metadata: {"rbot":{"triggers":["bug","fix","feature","refactor","test","build","cargo","python","rust","git","pull request","ci","deploy"]}}
+metadata: {"rbot":{"triggers":["code","implement","debug","refactor","programming"]}}
 ---
 
 # Software Engineer

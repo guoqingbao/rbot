@@ -3,12 +3,15 @@ use std::net::IpAddr;
 
 use anyhow::{Result, anyhow, bail};
 
-use crate::channels::{EmailConfig, FeishuConfig, SlackConfig, TelegramConfig};
+use crate::channels::{
+    DingTalkConfig, DiscordConfig, EmailConfig, FeishuConfig, MatrixConfig, MochatConfig, QqConfig,
+    SlackConfig, TelegramConfig, WecomConfig, WhatsAppConfig,
+};
 use crate::config::{Config, ProviderConfig};
 use crate::providers::registry::find_by_name;
 use crate::providers::{
-    AzureOpenAiProvider, CustomProvider, GenerationSettings, OpenAiCompatibleProvider,
-    SharedProvider,
+    AnthropicProvider, AzureOpenAiProvider, CustomProvider, GenerationSettings,
+    OpenAiCompatibleProvider, SharedProvider,
 };
 use url::Url;
 
@@ -102,6 +105,79 @@ pub fn validate_run_config(config: &Config, model: &str) -> Result<()> {
         }
     }
 
+    if let Some(section) = config.channels.section("dingtalk") {
+        let dt: DingTalkConfig = serde_json::from_value(section.clone())
+            .map_err(|err| anyhow!("invalid dingtalk channel config: {err}"))?;
+        if dt.enabled {
+            if dt.app_key.trim().is_empty() || dt.app_secret.trim().is_empty() {
+                bail!("dingtalk channel is enabled but appKey/appSecret is incomplete");
+            }
+            if dt.robot_code.trim().is_empty() {
+                bail!("dingtalk channel is enabled but robotCode is empty (required for sending)");
+            }
+        }
+    }
+
+    if let Some(section) = config.channels.section("discord") {
+        let dc: DiscordConfig = serde_json::from_value(section.clone())
+            .map_err(|err| anyhow!("invalid discord channel config: {err}"))?;
+        if dc.enabled && dc.bot_token.trim().is_empty() {
+            bail!("discord channel is enabled but botToken is empty");
+        }
+    }
+
+    if let Some(section) = config.channels.section("matrix") {
+        let mx: MatrixConfig = serde_json::from_value(section.clone())
+            .map_err(|err| anyhow!("invalid matrix channel config: {err}"))?;
+        if mx.enabled {
+            if mx.homeserver_url.trim().is_empty() {
+                bail!("matrix channel is enabled but homeserverUrl is empty");
+            }
+            if mx.access_token.trim().is_empty() {
+                bail!("matrix channel is enabled but accessToken is empty");
+            }
+        }
+    }
+
+    if let Some(section) = config.channels.section("whatsapp") {
+        let wa: WhatsAppConfig = serde_json::from_value(section.clone())
+            .map_err(|err| anyhow!("invalid whatsapp channel config: {err}"))?;
+        if wa.enabled && wa.bridge_url.trim().is_empty() {
+            bail!("whatsapp channel is enabled but bridgeUrl is empty");
+        }
+    }
+
+    if let Some(section) = config.channels.section("qq") {
+        let qq: QqConfig = serde_json::from_value(section.clone())
+            .map_err(|err| anyhow!("invalid qq channel config: {err}"))?;
+        if qq.enabled {
+            if qq.app_id.trim().is_empty() || qq.secret.trim().is_empty() {
+                bail!("qq channel is enabled but appId/secret is incomplete");
+            }
+        }
+    }
+
+    if let Some(section) = config.channels.section("wecom") {
+        let wc: WecomConfig = serde_json::from_value(section.clone())
+            .map_err(|err| anyhow!("invalid wecom channel config: {err}"))?;
+        if wc.enabled {
+            if wc.agent_id.trim().is_empty() || wc.secret.trim().is_empty() {
+                bail!("wecom channel is enabled but agentId/secret is incomplete");
+            }
+            if wc.corp_id.trim().is_empty() {
+                bail!("wecom channel is enabled but corpId is empty (required for sending)");
+            }
+        }
+    }
+
+    if let Some(section) = config.channels.section("mochat") {
+        let mc: MochatConfig = serde_json::from_value(section.clone())
+            .map_err(|err| anyhow!("invalid mochat channel config: {err}"))?;
+        if mc.enabled && mc.claw_token.trim().is_empty() {
+            bail!("mochat channel is enabled but clawToken is empty");
+        }
+    }
+
     for (name, server) in &config.tools.mcp_servers {
         if !server.enabled {
             continue;
@@ -140,7 +216,19 @@ pub fn build_provider_client(
             })
         })
         .or_else(|| (provider_name == "openai").then(|| "https://api.openai.com/v1".to_string()));
-    let requires_api_key = !spec.map(|spec| spec.is_local).unwrap_or(false)
+    if api_base.is_none() && provider_name != "custom" && !spec.map(|s| s.is_local).unwrap_or(false)
+    {
+        if let Some(s) = spec {
+            if !s.is_oauth && s.default_api_base.is_empty() {
+                bail!(
+                    "provider '{provider_name}' requires apiBase because it has no built-in endpoint"
+                );
+            }
+        }
+    }
+    let is_oauth = spec.map(|spec| spec.is_oauth).unwrap_or(false);
+    let requires_api_key = !is_oauth
+        && !spec.map(|spec| spec.is_local).unwrap_or(false)
         && !api_base
             .as_deref()
             .map(api_base_looks_local)
@@ -171,6 +259,15 @@ pub fn build_provider_client(
             model.to_string(),
             generation,
             proxy,
+        )?)),
+        "anthropic" => Ok(std::sync::Arc::new(AnthropicProvider::new(
+            provider_cfg.api_key.clone(),
+            api_base,
+            model.to_string(),
+            provider_cfg.extra_headers.clone(),
+            generation,
+            proxy,
+            provider_cfg.reasoning_effort.clone(),
         )?)),
         _ => Ok(std::sync::Arc::new(OpenAiCompatibleProvider::new(
             provider_cfg.api_key.clone(),
@@ -317,6 +414,7 @@ mod tests {
                 api_key: String::new(),
                 api_base: Some("http://localhost:11434/v1".to_string()),
                 extra_headers: Default::default(),
+                reasoning_effort: None,
             },
             "ollama/qwen2.5-coder:7b",
             Some("http://localhost:11434/v1".to_string()),
@@ -335,6 +433,7 @@ mod tests {
                 api_key: String::new(),
                 api_base: Some("http://192.168.1.3:8000/v1".to_string()),
                 extra_headers: Default::default(),
+                reasoning_effort: None,
             },
             "Qwen3_5ForConditionalGeneration",
             Some("http://192.168.1.3:8000/v1".to_string()),

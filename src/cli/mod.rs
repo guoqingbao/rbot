@@ -23,9 +23,15 @@ use unicode_width::UnicodeWidthStr;
 use rbot::providers::TextStreamCallback;
 use rbot::util::{ensure_dir, tool_emoji, workspace_state_dir};
 
+pub mod channels_cli;
 pub mod config_cli;
+pub mod skills_cli;
 
+pub use channels_cli::{
+    run_channels_list, run_channels_login, run_channels_setup, run_channels_status,
+};
 pub use config_cli::{run_config_channel, run_config_provider};
+pub use skills_cli::{run_skills_init, run_skills_list};
 pub enum InputEvent {
     Prompt(String),
     Exit,

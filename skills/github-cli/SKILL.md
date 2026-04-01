@@ -1,6 +1,7 @@
 ---
+name: github-cli
 description: "Interact with GitHub and CI systems through the gh CLI."
-metadata: {"rbot":{"triggers":["github","gh","pull request","pr","workflow run","ci","actions"],"requires":{"bins":["gh"]}}}
+metadata: {"rbot":{"triggers":["github","git","pr","issue","repo"],"requires":{"bins":["gh"]}}}
 ---
 
 # GitHub CLI

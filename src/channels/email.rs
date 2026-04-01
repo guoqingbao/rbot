@@ -395,10 +395,20 @@ pub struct EmailChannel {
 impl EmailChannel {
     const MAX_PROCESSED_UIDS: usize = 100_000;
 
-    pub fn new(config: Value, bus: MessageBus, workspace: PathBuf) -> Result<Self> {
+    pub fn new(
+        config: Value,
+        bus: MessageBus,
+        workspace: PathBuf,
+        transcription_api_key: String,
+    ) -> Result<Self> {
         let config: EmailConfig = serde_json::from_value(config)?;
         Ok(Self {
-            base: ChannelBase::new(serde_json::to_value(&config)?, bus, workspace),
+            base: ChannelBase::new(
+                serde_json::to_value(&config)?,
+                bus,
+                workspace,
+                transcription_api_key,
+            ),
             config,
             backend: Arc::new(SystemEmailBackend),
             poll_task: AsyncMutex::new(None),
@@ -674,6 +684,28 @@ impl Channel for EmailChannel {
 
     fn display_name(&self) -> &'static str {
         "Email"
+    }
+
+    fn setup_instructions(&self) -> &'static str {
+        "Email uses IMAP for receiving and SMTP for sending.\n\
+         \n\
+         1. Use an email account that supports IMAP/SMTP (Gmail, Outlook, etc.)\n\
+         2. For Gmail: enable 'Less secure apps' or generate an App Password\n\
+         3. Note the IMAP host/port and SMTP host/port for your provider\n\
+         4. Configure rbot:\n\
+         \n\
+            \"email\": {\n\
+              \"enabled\": true,\n\
+              \"allowFrom\": [\"user@example.com\"],\n\
+              \"imapHost\": \"imap.gmail.com\",\n\
+              \"imapPort\": 993,\n\
+              \"smtpHost\": \"smtp.gmail.com\",\n\
+              \"smtpPort\": 465,\n\
+              \"address\": \"bot@gmail.com\",\n\
+              \"password\": \"<app-password>\"\n\
+            }\n\
+         \n\
+         5. Run: rbot run"
     }
 
     async fn start(&self) -> Result<()> {

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,6 +80,14 @@ impl TelegramApi for DummyTelegramApi {
     ) -> Result<()> {
         Ok(())
     }
+
+    async fn get_file(&self, _file_id: &str) -> Result<String> {
+        Ok(String::new())
+    }
+
+    async fn download_file(&self, _file_path: &str) -> Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
 }
 
 #[tokio::test]
@@ -88,7 +97,7 @@ async fn slack_gateway_handles_url_verification() {
         "slack": {"enabled": true, "allowFrom": ["*"], "botToken": "xoxb-test", "signingSecret": "secret", "webhookPath": "/slack/events"}
     }))
     .unwrap();
-    let manager = Arc::new(ChannelManager::new(cfg.clone(), bus).unwrap());
+    let manager = Arc::new(ChannelManager::new(cfg.clone(), bus, PathBuf::new()).unwrap());
     let slack_channel = manager.get_channel("slack").unwrap();
     let slack = slack_channel
         .as_any()
@@ -112,6 +121,9 @@ async fn slack_gateway_handles_url_verification() {
         }
         async fn reactions_remove(&self, _: &str, _: &str, _: &str) -> Result<()> {
             Ok(())
+        }
+        async fn download_file(&self, _: &str) -> Result<Vec<u8>> {
+            Ok(Vec::new())
         }
     }
     slack.set_api(Arc::new(FakeSlackApi)).await;
@@ -149,7 +161,7 @@ async fn telegram_gateway_validates_secret_and_publishes_inbound() {
         "telegram": {"enabled": true, "allowFrom": ["*"], "token": "123:abc", "webhookPath": "/telegram/webhook", "webhookSecret": "secret"}
     }))
     .unwrap();
-    let manager = Arc::new(ChannelManager::new(cfg.clone(), bus.clone()).unwrap());
+    let manager = Arc::new(ChannelManager::new(cfg.clone(), bus.clone(), PathBuf::new()).unwrap());
     let telegram_channel = manager.get_channel("telegram").unwrap();
     let telegram = telegram_channel
         .as_any()
@@ -213,7 +225,7 @@ async fn feishu_gateway_handles_challenge_and_event_delivery() {
         "feishu": {"enabled": true, "allowFrom": ["*"], "appId": "id", "appSecret": "secret", "webhookPath": "/feishu/events", "verificationToken": "vt"}
     }))
     .unwrap();
-    let manager = Arc::new(ChannelManager::new(cfg.clone(), bus.clone()).unwrap());
+    let manager = Arc::new(ChannelManager::new(cfg.clone(), bus.clone(), PathBuf::new()).unwrap());
     let router = build_webhook_router(&manager, &cfg).unwrap().unwrap();
     manager.start_all().await.unwrap();
 
@@ -284,7 +296,7 @@ async fn slack_gateway_rejects_invalid_signature() {
         "slack": {"enabled": true, "allowFrom": ["*"], "botToken": "xoxb-test", "signingSecret": "secret", "webhookPath": "/slack/events"}
     }))
     .unwrap();
-    let manager = Arc::new(ChannelManager::new(cfg.clone(), bus).unwrap());
+    let manager = Arc::new(ChannelManager::new(cfg.clone(), bus, PathBuf::new()).unwrap());
     let slack_channel = manager.get_channel("slack").unwrap();
     let slack = slack_channel
         .as_any()
@@ -308,6 +320,9 @@ async fn slack_gateway_rejects_invalid_signature() {
         }
         async fn reactions_remove(&self, _: &str, _: &str, _: &str) -> Result<()> {
             Ok(())
+        }
+        async fn download_file(&self, _: &str) -> Result<Vec<u8>> {
+            Ok(Vec::new())
         }
     }
     slack.set_api(Arc::new(FakeSlackApi)).await;
@@ -362,7 +377,9 @@ async fn admin_gateway_exposes_overview_and_metrics() {
         }
     }))
     .unwrap();
-    let manager = Arc::new(ChannelManager::new(config.channels.clone(), bus).unwrap());
+    let manager = Arc::new(
+        ChannelManager::new(config.channels.clone(), bus, workspace.path().to_path_buf()).unwrap(),
+    );
     manager.start_all().await.unwrap();
     let agent = Arc::new(
         AgentLoop::new(
@@ -370,6 +387,7 @@ async fn admin_gateway_exposes_overview_and_metrics() {
             workspace.path(),
             Some("ollama/qwen2.5-coder:7b".to_string()),
             4,
+            5,
             8_000,
             32 * 1024,
             Default::default(),
@@ -435,7 +453,7 @@ async fn gateway_exposes_health_and_status_endpoints() {
         "telegram": {"enabled": true, "allowFrom": ["*"], "token": "123:abc", "webhookPath": "/telegram/webhook"}
     }))
     .unwrap();
-    let manager = Arc::new(ChannelManager::new(cfg.clone(), bus).unwrap());
+    let manager = Arc::new(ChannelManager::new(cfg.clone(), bus, PathBuf::new()).unwrap());
     let telegram_channel = manager.get_channel("telegram").unwrap();
     let telegram = telegram_channel
         .as_any()

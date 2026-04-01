@@ -12,7 +12,11 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
-use cli::{CliOutput, CliShell, InputEvent, TurnSummary, run_config_channel, run_config_provider};
+use cli::{
+    CliOutput, CliShell, InputEvent, TurnSummary, run_channels_list, run_channels_login,
+    run_channels_setup, run_channels_status, run_config_channel, run_config_provider,
+    run_skills_init, run_skills_list,
+};
 use colored::*;
 use local_ip_address::local_ip;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -72,6 +76,32 @@ enum Command {
         #[arg(long)]
         channel: bool,
     },
+    Channels {
+        #[command(subcommand)]
+        subcommand: ChannelsCommand,
+    },
+    Skills {
+        #[command(subcommand)]
+        subcommand: SkillsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ChannelsCommand {
+    /// List all available channels
+    List,
+    /// Show enabled/disabled status of each channel
+    Status,
+    /// Interactive login for channels that support it (e.g. weixin QR code)
+    Login { name: Option<String> },
+    /// Show setup instructions for a channel (how to obtain tokens/keys)
+    Setup { name: Option<String> },
+}
+
+#[derive(Subcommand)]
+enum SkillsCommand {
+    List,
+    Init { name: String },
 }
 
 #[tokio::main]
@@ -93,6 +123,20 @@ async fn main() -> Result<()> {
         Command::Config { provider, channel } => {
             config_cmd(cli.config.as_deref(), provider, channel).await
         }
+        Command::Channels { subcommand } => match subcommand {
+            ChannelsCommand::List => run_channels_list().await,
+            ChannelsCommand::Status => run_channels_status(cli.config.as_deref()).await,
+            ChannelsCommand::Login { name } => {
+                run_channels_login(cli.config.as_deref(), name).await
+            }
+            ChannelsCommand::Setup { name } => {
+                run_channels_setup(cli.config.as_deref(), name).await
+            }
+        },
+        Command::Skills { subcommand } => match subcommand {
+            SkillsCommand::List => run_skills_list(cli.config.as_deref()).await,
+            SkillsCommand::Init { name } => run_skills_init(&name, cli.config.as_deref()).await,
+        },
     }
 }
 
@@ -487,7 +531,11 @@ async fn run(config_path: Option<&Path>, model_override: Option<String>) -> Resu
     configure_model_switch_persistence(&agent, config_path);
     *agent_slot.lock().expect("agent slot lock poisoned") = Some(agent.clone());
 
-    let runtime = AgentRuntime::new(agent.clone(), bus.clone());
+    let runtime = AgentRuntime::new(
+        agent.clone(),
+        bus.clone(),
+        config.agents.defaults.max_concurrent_requests,
+    );
     let heartbeat_service = build_heartbeat_service(
         &config,
         workspace.as_path(),
@@ -842,6 +890,7 @@ async fn build_agent_for_workspace(
         workspace,
         model,
         config.agents.defaults.max_tool_iterations,
+        config.agents.defaults.max_concurrent_tools,
         config.agents.defaults.context_window_tokens,
         config.agents.defaults.memory_max_bytes,
         config.tools.web.search.clone(),
@@ -1059,15 +1108,12 @@ fn detected_local_ip() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        format_run_welcome, repl_session_context_status, resolve_gateway_display_host,
-        resolve_startup_model, resolve_startup_model_selection,
-    };
+    use super::{format_run_welcome, repl_session_context_status, resolve_gateway_display_host};
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
     use rbot::config::Config;
     use rbot::engine::AgentLoop;
-    use rbot::providers::{LlmProvider, LlmResponse, ProviderModelInfo, SharedProvider};
+    use rbot::providers::{LlmProvider, LlmResponse, ProviderModelInfo};
     use rbot::storage::{ChatMessage, SessionManager};
     use serde_json::Value;
     use serde_json::json;
@@ -1217,6 +1263,7 @@ mod tests {
             dir.path(),
             Some("demo-model".to_string()),
             8,
+            5,
             262144,
             32 * 1024,
             Default::default(),

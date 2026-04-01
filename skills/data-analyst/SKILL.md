@@ -1,6 +1,7 @@
 ---
+name: data-analyst
 description: "Research, web analysis, evidence gathering, synthesis, and report-writing workflow."
-metadata: {"rbot":{"triggers":["research","analyze","analysis","report","market","trend","web search","summarize data","investigate"]}}
+metadata: {"rbot":{"triggers":["data","analyze","csv","statistics","chart"]}}
 ---
 
 # Data Analyst

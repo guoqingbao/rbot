@@ -1,6 +1,7 @@
 ---
+name: memory-entry-writer
 description: "Summarize durable memory entries for MEMORY.md after task completion or explicit memorize requests."
-metadata: {"rbot":{"triggers":["memory entry","task summary","memorize","durable memory"]}}
+metadata: {"rbot":{"triggers":["memory","remember","memorize","save"]}}
 ---
 
 # Memory Entry Writer

@@ -71,24 +71,6 @@ async fn web_fetch_blocks_localhost() {
     }
 }
 
-#[tokio::test]
-async fn web_fetch_result_contains_untrusted_flag() {
-    let tool = WebFetchTool::new(5_000, None);
-    let result = tool.execute(json!({"url": "http://example.com"})).await;
-    match result {
-        ToolOutput::Text(text) => {
-            let data: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(
-                data.get("untrusted").and_then(|value| value.as_bool()),
-                Some(true)
-            );
-            assert!(
-                data.get("text")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .contains("[External content")
-            );
-        }
-        other => panic!("unexpected output: {other:?}"),
-    }
-}
+// Success JSON shape (`untrusted`, external-content banner) is covered by unit tests in
+// `src/tools.rs` (`web_fetch_text_payload_includes_untrusted_and_banner`). A live fetch to
+// example.com would require outbound network and fails in offline/CI sandboxes.

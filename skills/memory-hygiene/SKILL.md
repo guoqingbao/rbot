@@ -1,6 +1,7 @@
 ---
+name: memory-hygiene
 description: "Always-on guidance for maintaining durable workspace memory and searching historical context."
-metadata: {"rbot":{"always":true,"triggers":["memory","remember","history","preference","project context"]}}
+metadata: {"rbot":{"always":true,"triggers":["memory","cleanup","consolidate","prune"]}}
 ---
 
 # Memory Hygiene

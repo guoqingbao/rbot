@@ -4,10 +4,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use futures::future::join_all;
 use regex::Regex;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use tokio::sync::Semaphore;
 
 use crate::config::{ExecToolConfig, WebSearchConfig};
 use crate::cron::CronService;
@@ -26,6 +28,14 @@ use crate::tools::{
 use crate::util::build_status_content;
 
 pub type ModelSwitchCallback = Arc<dyn Fn(String, Option<usize>) -> Result<()> + Send + Sync>;
+
+const NANOBOT_STYLE_HELP: &str = "Available commands:\n\
+  /help     - Show this help message\n\
+  /status   - Show current session status\n\
+  /new      - Clear current session and start fresh\n\
+  /stop     - Cancel current processing\n\
+  /model    - Switch model (e.g. /model gpt-4.1)\n\
+  /memorize - Save important facts to long-term memory";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentSnapshot {
@@ -57,6 +67,7 @@ pub struct AgentLoop {
     cron_tool: Option<Arc<CronTool>>,
     start_time: Instant,
     last_usage: Mutex<(usize, usize)>,
+    tool_semaphore: Arc<Semaphore>,
     cancellations: Arc<Mutex<HashSet<String>>>,
     active_turns: Arc<Mutex<BTreeMap<String, usize>>>,
     stop_notifications: Arc<Mutex<BTreeMap<String, StopNotification>>>,
@@ -70,6 +81,7 @@ impl AgentLoop {
         workspace: impl AsRef<Path>,
         model: Option<String>,
         max_iterations: usize,
+        max_concurrent_tools: usize,
         context_window_tokens: usize,
         max_memory_bytes: usize,
         web_search: WebSearchConfig,
@@ -141,6 +153,8 @@ impl AgentLoop {
         }
         register_mcp_tools(&mut tools, mcp_servers).await?;
 
+        let tool_semaphore = Arc::new(Semaphore::new(max_concurrent_tools.max(1)));
+
         Ok(Self {
             provider: provider.clone(),
             workspace,
@@ -158,6 +172,7 @@ impl AgentLoop {
             cron_tool,
             start_time: Instant::now(),
             last_usage: Mutex::new((0, 0)),
+            tool_semaphore,
             cancellations: Arc::new(Mutex::new(HashSet::new())),
             active_turns: Arc::new(Mutex::new(BTreeMap::new())),
             stop_notifications: Arc::new(Mutex::new(BTreeMap::new())),
@@ -217,13 +232,14 @@ impl AgentLoop {
 
         match trimmed_lower {
             "/new" | "new" | "/clear" | "clear" | "[clear]" => {
+                self.memory
+                    .maybe_consolidate_by_tokens(&mut session, context_window_tokens)?;
                 session.clear();
                 sessions.save(&session)?;
                 self.reset_session_announcement(session_key);
-                self.memory.store().reset_history()?;
                 return Ok(SessionSetup {
                     response: Some(
-                        target.outbound("New session started. Session cleared and history reset."),
+                        target.outbound("New session started. Previous messages were cleared."),
                     ),
                     session_notice: None,
                     active_model,
@@ -240,9 +256,7 @@ impl AgentLoop {
             }
             "/help" | "help" => {
                 return Ok(SessionSetup {
-                    response: Some(target.outbound(
-                        "/new (or clear)\n/stop\n/memorize <text>\n/model [name]\n/status\n/help",
-                    )),
+                    response: Some(target.outbound(NANOBOT_STYLE_HELP)),
                     session_notice: None,
                     active_model,
                     context_window_tokens,
@@ -812,7 +826,7 @@ impl AgentLoop {
                     last_tool_call_fingerprint = Some(tool_call_fingerprint);
                 }
 
-                let tool_calls = response
+                let openai_tool_calls = response
                     .tool_calls
                     .iter()
                     .map(|call| call.to_openai_tool_call())
@@ -828,12 +842,14 @@ impl AgentLoop {
                 self.context.add_assistant_message(
                     &mut messages,
                     assistant_content,
-                    Some(tool_calls),
+                    Some(openai_tool_calls),
                     response.reasoning_content.clone(),
                     response.thinking_blocks.clone(),
                 );
 
-                for tool_call in response.tool_calls {
+                let tool_call_requests = response.tool_calls;
+
+                for tool_call in &tool_call_requests {
                     // Check for cancellation before each tool call
                     {
                         if self
@@ -845,12 +861,27 @@ impl AgentLoop {
                             return Ok((None, messages, true));
                         }
                     }
-                    self.send_tool_hint(progress_target.as_ref(), &tool_call)
+                    self.send_tool_hint(progress_target.as_ref(), tool_call)
                         .await;
-                    let output = self
-                        .tools
-                        .execute(&tool_call.name, tool_call.arguments)
-                        .await;
+                }
+
+                let tools = self.tools.clone();
+                let sem = self.tool_semaphore.clone();
+                let tool_outputs = join_all(tool_call_requests.iter().map(|tool_call| {
+                    let tools = tools.clone();
+                    let sem = sem.clone();
+                    let name = tool_call.name.clone();
+                    let args = tool_call.arguments.clone();
+                    async move {
+                        let _permit = sem.acquire_owned().await.expect("tool semaphore closed");
+                        tools.execute(&name, args).await
+                    }
+                }))
+                .await;
+
+                for (tool_call, output) in
+                    tool_call_requests.into_iter().zip(tool_outputs.into_iter())
+                {
                     self.context.add_tool_result(
                         &mut messages,
                         &tool_call.id,
@@ -1272,6 +1303,7 @@ impl AgentLoop {
         build_status_content(
             env!("CARGO_PKG_VERSION"),
             &active_model,
+            &self.workspace.display().to_string(),
             self.start_time.elapsed().as_secs(),
             prompt_tokens,
             completion_tokens,
@@ -1291,7 +1323,7 @@ impl AgentLoop {
 
     fn record_usage(&self, response: &LlmResponse) {
         let mut usage = self.last_usage.lock().expect("usage lock poisoned");
-        usage.0 = usage.0.max(response.usage.prompt_tokens);
+        usage.0 += response.usage.prompt_tokens;
         usage.1 += response.usage.completion_tokens;
     }
 
@@ -1331,6 +1363,34 @@ impl AgentLoop {
             .maybe_consolidate_by_tokens(&mut session, context_window_tokens)?;
         sessions.save(&session)?;
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn consolidate_session_async(&self, session_key: &str) {
+        let (mut session, context_window_tokens) = {
+            let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
+            match sessions.get_or_create(session_key) {
+                Ok(session) => {
+                    let cwt = self.session_context_window_tokens(&session);
+                    (session, cwt)
+                }
+                Err(_) => return,
+            }
+        };
+        let model = self.session_model(&session);
+        let result = self
+            .memory
+            .maybe_consolidate_by_tokens_with_provider(
+                &mut session,
+                context_window_tokens,
+                self.provider.as_ref(),
+                &model,
+            )
+            .await;
+        if result.is_ok() {
+            let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
+            let _ = sessions.save(&session);
+        }
     }
 
     pub fn workspace(&self) -> &Path {
@@ -1777,6 +1837,7 @@ fn memory_entry_kind_label(kind: MemoryEntryKind) -> &'static str {
     match kind {
         MemoryEntryKind::TaskSummary => "Task Summary",
         MemoryEntryKind::UserInstructed => "User Instructed Memory",
+        MemoryEntryKind::ConsolidationSummary => "Consolidation Summary",
     }
 }
 

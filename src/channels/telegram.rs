@@ -376,10 +376,20 @@ pub struct TelegramChannel {
 }
 
 impl TelegramChannel {
-    pub fn new(config: Value, bus: MessageBus, workspace: PathBuf) -> Result<Self> {
+    pub fn new(
+        config: Value,
+        bus: MessageBus,
+        workspace: PathBuf,
+        transcription_api_key: String,
+    ) -> Result<Self> {
         let config: TelegramConfig = serde_json::from_value(config)?;
         Ok(Self {
-            base: ChannelBase::new(serde_json::to_value(&config)?, bus, workspace),
+            base: ChannelBase::new(
+                serde_json::to_value(&config)?,
+                bus,
+                workspace,
+                transcription_api_key,
+            ),
             config,
             api: AsyncMutex::new(None),
             bot_identity: Mutex::new(None),
@@ -674,6 +684,24 @@ impl Channel for TelegramChannel {
 
     fn display_name(&self) -> &'static str {
         "Telegram"
+    }
+
+    fn setup_instructions(&self) -> &'static str {
+        "Telegram uses the Bot API with long-polling.\n\
+         \n\
+         1. Message @BotFather on Telegram and send /newbot\n\
+         2. Follow the prompts to name your bot and get a token\n\
+         3. (Optional) Send /setprivacy to @BotFather and disable privacy mode\n\
+            if you want the bot to see all group messages\n\
+         4. Configure rbot:\n\
+         \n\
+            \"telegram\": {\n\
+              \"enabled\": true,\n\
+              \"allowFrom\": [\"*\"],\n\
+              \"token\": \"<your-bot-token>\"\n\
+            }\n\
+         \n\
+         5. Run: rbot run"
     }
 
     async fn start(&self) -> Result<()> {

@@ -13,7 +13,7 @@ use rbot::providers::{
 use rbot::runtime::AgentRuntime;
 use rbot::storage::{ChatMessage, InboundMessage, MessageBus, OutboundMessage, SessionManager};
 use rbot::tools::MessageSendCallback;
-use rbot::util::{DEFAULT_HISTORY_TEMPLATE, workspace_state_dir};
+use rbot::util::workspace_state_dir;
 use serde_json::Value;
 use serde_json::json;
 use tempfile::tempdir;
@@ -53,6 +53,7 @@ async fn agent_loop_executes_tool_then_returns_final_answer() {
         dir.path(),
         Some("test-model".to_string()),
         8,
+        5,
         8_000,
         32 * 1024,
         Default::default(),
@@ -119,6 +120,7 @@ async fn zero_max_tool_iterations_means_unbounded_until_completion() {
         dir.path(),
         Some("test-model".to_string()),
         0,
+        5,
         8_000,
         32 * 1024,
         Default::default(),
@@ -202,6 +204,7 @@ async fn provider_errors_still_persist_the_user_turn() {
         dir.path(),
         Some("test-model".to_string()),
         0,
+        5,
         8_000,
         32 * 1024,
         Default::default(),
@@ -259,6 +262,7 @@ async fn agent_loop_stops_on_repeated_tool_calls() {
         dir.path(),
         Some("test-model".to_string()),
         40,
+        5,
         8_000,
         32 * 1024,
         Default::default(),
@@ -305,6 +309,7 @@ async fn agent_loop_stops_on_repeated_tool_calls_even_with_new_ids() {
         dir.path(),
         Some("test-model".to_string()),
         40,
+        5,
         8_000,
         32 * 1024,
         Default::default(),
@@ -361,6 +366,7 @@ async fn agent_loop_does_not_stop_when_tool_arguments_change() {
         dir.path(),
         Some("test-model".to_string()),
         40,
+        5,
         8_000,
         32 * 1024,
         Default::default(),
@@ -444,6 +450,7 @@ async fn agent_loop_honors_stop_command() {
             dir.path(),
             Some("test-model".to_string()),
             200, // Many iterations
+            5,
             8_000,
             32 * 1024,
             Default::default(),
@@ -514,6 +521,7 @@ async fn stop_command_does_not_block_the_next_prompt() {
             dir.path(),
             Some("test-model".to_string()),
             8,
+            5,
             8_000,
             32 * 1024,
             Default::default(),
@@ -578,6 +586,7 @@ async fn runtime_stop_command_sends_threaded_ack_and_completion() {
             dir.path(),
             Some("test-model".to_string()),
             8,
+            5,
             8_000,
             32 * 1024,
             Default::default(),
@@ -595,7 +604,7 @@ async fn runtime_stop_command_sends_threaded_ack_and_completion() {
         .unwrap(),
     );
     let bus = MessageBus::new(16);
-    let runtime = AgentRuntime::new(agent, bus.clone());
+    let runtime = AgentRuntime::new(agent, bus.clone(), 3);
     runtime.start().await.unwrap();
 
     let session_key = "slack:C123:1700000000.000100".to_string();
@@ -635,12 +644,23 @@ async fn runtime_stop_command_sends_threaded_ack_and_completion() {
     .await
     .unwrap();
 
-    let ack = tokio::time::timeout(Duration::from_secs(1), bus.consume_outbound())
+    let mut ack = tokio::time::timeout(Duration::from_secs(1), bus.consume_outbound())
         .await
         .unwrap()
         .unwrap();
+    while ack.content != "Stopping current turn..." {
+        ack = tokio::time::timeout(Duration::from_secs(1), bus.consume_outbound())
+            .await
+            .unwrap()
+            .unwrap();
+    }
     assert_eq!(ack.content, "Stopping current turn...");
-    assert_eq!(ack.metadata, slack_metadata);
+    let mut expected_meta = slack_metadata.clone();
+    expected_meta.insert(
+        "_session_key".to_string(),
+        json!("slack:C123:1700000000.000100"),
+    );
+    assert_eq!(ack.metadata, expected_meta);
 
     let completion = tokio::time::timeout(Duration::from_secs(1), bus.consume_outbound())
         .await
@@ -653,7 +673,7 @@ async fn runtime_stop_command_sends_threaded_ack_and_completion() {
 }
 
 #[tokio::test]
-async fn clear_command_resets_history_template() {
+async fn clear_command_clears_session_and_preserves_history_file() {
     let dir = tempdir().unwrap();
     let provider = Arc::new(QueuedProvider::new(
         "test-model",
@@ -671,6 +691,7 @@ async fn clear_command_resets_history_template() {
         dir.path(),
         Some("test-model".to_string()),
         8,
+        5,
         8_000,
         32 * 1024,
         Default::default(),
@@ -704,11 +725,11 @@ async fn clear_command_resets_history_template() {
         .unwrap();
     assert_eq!(
         response.content,
-        "New session started. Session cleared and history reset."
+        "New session started. Previous messages were cleared."
     );
     assert_eq!(
         std::fs::read_to_string(history_path).unwrap(),
-        DEFAULT_HISTORY_TEMPLATE
+        "junk history"
     );
 }
 
@@ -746,6 +767,7 @@ async fn completed_tasks_append_task_summary_to_memory() {
         dir.path(),
         Some("test-model".to_string()),
         8,
+        5,
         8_000,
         32 * 1024,
         Default::default(),
@@ -801,6 +823,7 @@ async fn memorize_command_appends_user_memory_entry() {
         dir.path(),
         Some("test-model".to_string()),
         8,
+        5,
         8_000,
         32 * 1024,
         Default::default(),
@@ -844,6 +867,7 @@ async fn help_command_preserves_inbound_metadata() {
         dir.path(),
         Some("test-model".to_string()),
         8,
+        5,
         8_000,
         32 * 1024,
         Default::default(),
@@ -882,10 +906,21 @@ async fn help_command_preserves_inbound_metadata() {
         .unwrap()
         .unwrap();
 
-    assert_eq!(response.metadata, metadata);
+    let mut expected_meta = metadata.clone();
+    expected_meta.insert(
+        "_session_key".to_string(),
+        json!("slack:C123:1700000000.000100"),
+    );
+    assert_eq!(response.metadata, expected_meta);
     assert_eq!(
         response.content,
-        "/new (or clear)\n/stop\n/memorize <text>\n/model [name]\n/status\n/help"
+        "Available commands:\n\
+  /help     - Show this help message\n\
+  /status   - Show current session status\n\
+  /new      - Clear current session and start fresh\n\
+  /stop     - Cancel current processing\n\
+  /model    - Switch model (e.g. /model gpt-4.1)\n\
+  /memorize - Save important facts to long-term memory"
     );
 }
 
@@ -910,6 +945,7 @@ async fn model_command_lists_available_models() {
         dir.path(),
         Some("base-model".to_string()),
         8,
+        5,
         8_000,
         32 * 1024,
         Default::default(),
@@ -958,6 +994,7 @@ async fn model_command_switches_session_model_and_status_uses_provider_context()
         dir.path(),
         Some("base-model".to_string()),
         8,
+        5,
         8_000,
         32 * 1024,
         Default::default(),
@@ -991,6 +1028,7 @@ async fn model_command_switches_session_model_and_status_uses_provider_context()
         .unwrap()
         .unwrap();
     assert!(status.content.contains("Model: /models/alt-model"));
+    assert!(status.content.contains("Workspace:"));
     assert!(status.content.contains("Context: 0/256000 (0%)"));
 }
 
@@ -1015,6 +1053,7 @@ async fn model_command_persists_selected_model_and_context() {
         dir.path(),
         Some("base-model".to_string()),
         8,
+        5,
         8_000,
         32 * 1024,
         Default::default(),
@@ -1076,6 +1115,7 @@ async fn status_refreshes_resumed_session_context_from_provider_models() {
         dir.path(),
         Some("Qwen3.5 27B".to_string()),
         8,
+        5,
         262144,
         32 * 1024,
         Default::default(),
@@ -1098,7 +1138,8 @@ async fn status_refreshes_resumed_session_context_from_provider_models() {
         .unwrap()
         .unwrap();
     assert!(status.content.contains("Model: Qwen3.5-35B-A3B-FP8"));
-    assert!(status.content.contains("Context: 0/256000 (0%)"));
+    assert!(status.content.contains("Workspace:"));
+    assert!(status.content.contains("Context: 0/262144 (0%)"));
 
     let mut sessions = SessionManager::new(dir.path()).unwrap();
     let session = sessions.get_or_create("cli:direct").unwrap();
@@ -1107,7 +1148,7 @@ async fn status_refreshes_resumed_session_context_from_provider_models() {
             .metadata
             .get("contextWindowTokens")
             .and_then(Value::as_u64),
-        Some(256000)
+        Some(262144)
     );
 }
 
@@ -1162,6 +1203,7 @@ async fn backend_announces_new_session_once_per_runtime_session() {
         dir.path(),
         Some("test-model".to_string()),
         8,
+        5,
         8_000,
         32 * 1024,
         Default::default(),
@@ -1223,16 +1265,12 @@ async fn backend_announces_new_session_once_per_runtime_session() {
     let messages = progress_messages.lock().unwrap();
     assert_eq!(messages.len(), 1);
     assert!(
-        messages[0]
-            .content
-            .starts_with("Session: started new session for this conversation.\n\n*rbot v")
+        messages[0].content.starts_with(
+            "Session: started new session for this conversation.\n\n_Model: test-model_"
+        )
     );
-    assert!(messages[0].content.contains("\n*Model: test-model*\n"));
-    assert!(
-        messages[0]
-            .content
-            .contains("\n*Session: 0 history messages*\n")
-    );
+    assert!(messages[0].content.contains("Workspace:"));
+    assert!(messages[0].content.contains("Session messages: 0"));
 }
 
 #[tokio::test]
@@ -1270,6 +1308,7 @@ async fn backend_announces_when_resuming_existing_session() {
         dir.path(),
         Some("test-model".to_string()),
         8,
+        5,
         8_000,
         32 * 1024,
         Default::default(),
@@ -1314,15 +1353,9 @@ async fn backend_announces_when_resuming_existing_session() {
 
     let messages = progress_messages.lock().unwrap();
     assert_eq!(messages.len(), 1);
-    assert!(
-        messages[0]
-            .content
-            .starts_with("Session: resuming 1 previous message; /new to start fresh.\n\n*rbot v")
-    );
-    assert!(messages[0].content.contains("\n*Model: test-model*\n"));
-    assert!(
-        messages[0]
-            .content
-            .contains("\n*Session: 1 history messages*\n")
-    );
+    assert!(messages[0].content.starts_with(
+        "Session: resuming 1 previous message; /new to start fresh.\n\n_Model: test-model_"
+    ));
+    assert!(messages[0].content.contains("Workspace:"));
+    assert!(messages[0].content.contains("Session messages: 1"));
 }

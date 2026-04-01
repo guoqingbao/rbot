@@ -37,6 +37,7 @@ tokio = { version = "1.48", features = ["full"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 url = "2.5"
 unicode-width = "0.2"
+urlencoding = "2.1"
 uuid = { version = "1.18", features = ["serde", "v4"] }
 walkdir = "2.5"
 rustyline = "15.0"

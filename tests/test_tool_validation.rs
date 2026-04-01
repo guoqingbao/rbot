@@ -143,8 +143,8 @@ fn cast_params_string_to_number() {
         "type": "object",
         "properties": {"rate": {"type": "number"}}
     });
-    let cast = cast_params(&schema, &json!({"rate": "3.14"}));
-    assert_eq!(cast["rate"], json!(3.14));
+    let cast = cast_params(&schema, &json!({"rate": "2.5"}));
+    assert_eq!(cast["rate"], json!(2.5));
 }
 
 #[test]

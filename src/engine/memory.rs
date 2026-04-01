@@ -16,6 +16,14 @@ const MEMORY_ENTRIES_HEADING: &str = "## Memory Entries";
 pub enum MemoryEntryKind {
     TaskSummary,
     UserInstructed,
+    ConsolidationSummary,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConsolidationResult {
+    pub history_entry: String,
+    pub memory_update: Option<String>,
+    pub messages_consolidated: usize,
 }
 
 impl MemoryEntryKind {
@@ -23,6 +31,7 @@ impl MemoryEntryKind {
         match self {
             Self::TaskSummary => "Task Summary",
             Self::UserInstructed => "User Instructed Memory",
+            Self::ConsolidationSummary => "Consolidation Summary",
         }
     }
 }
@@ -170,8 +179,11 @@ impl MemoryStore {
     }
 }
 
+const MAX_CONSOLIDATION_FAILURES: u32 = 3;
+
 pub struct MemoryConsolidator {
     store: MemoryStore,
+    consecutive_failures: std::sync::Mutex<u32>,
 }
 
 impl MemoryConsolidator {
@@ -182,6 +194,7 @@ impl MemoryConsolidator {
     ) -> Result<Self> {
         Ok(Self {
             store: MemoryStore::new(workspace, max_memory_bytes)?,
+            consecutive_failures: std::sync::Mutex::new(0),
         })
     }
 
@@ -206,7 +219,125 @@ impl MemoryConsolidator {
             .sum()
     }
 
-    pub fn maybe_consolidate_by_tokens(
+    /// First exclusive index after `from` for one raw-archive chunk (same heuristic as token fallback).
+    fn chunk_end_exclusive(session: &Session, from: usize) -> usize {
+        let remaining = &session.messages[from..];
+        let boundary = remaining
+            .iter()
+            .position(|message| message.role == "user" && from > 0)
+            .unwrap_or(remaining.len().min(8))
+            .max(1);
+        (from + boundary).min(session.messages.len())
+    }
+
+    /// Returns the exclusive end index of the next chunk to consolidate, or [`None`] if the session
+    /// is within the 75% token budget or there is nothing left to consolidate.
+    pub fn pick_consolidation_boundary(
+        &self,
+        session: &Session,
+        context_window_tokens: usize,
+    ) -> Option<usize> {
+        if context_window_tokens == 0 {
+            return None;
+        }
+        let target = (context_window_tokens * 3) / 4;
+        if self.estimate_session_prompt_tokens(session) <= target {
+            return None;
+        }
+        if session.last_consolidated >= session.messages.len() {
+            return None;
+        }
+        Some(Self::chunk_end_exclusive(
+            session,
+            session.last_consolidated,
+        ))
+    }
+
+    /// Builds a prompt for an LLM to summarize a slice of chat messages as JSON
+    /// (`history_entry`, `memory_update`).
+    #[allow(clippy::unused_self)] // Instance method for symmetry with other consolidator APIs
+    pub fn build_consolidation_prompt(&self, messages: &[ChatMessage]) -> String {
+        let mut out = String::from(
+            "You are consolidating an older segment of a chat session.\n\
+\n\
+Summarize the messages below into durable, compact memory.\n\
+\n\
+Respond with ONLY a single JSON object (no markdown code fences, no commentary) using this exact shape:\n\
+{\"history_entry\":\"...\",\"memory_update\":\"...\"}\n\
+\n\
+Field rules:\n\
+- \"history_entry\": one brief plain-text line suitable for a chronological HISTORY log (what was discussed or decided).\n\
+- \"memory_update\": durable facts, preferences, or decisions to remember in MEMORY.md, or null if nothing should be persisted.\n\
+\n\
+Do not paste long transcripts into either field. Prefer facts over narration.\n\
+\n\
+Messages to summarize:\n\n",
+        );
+        for message in messages {
+            let ts = message
+                .timestamp
+                .as_deref()
+                .unwrap_or("?")
+                .chars()
+                .take(16)
+                .collect::<String>();
+            let body = message
+                .content_as_text()
+                .unwrap_or_else(|| "[non-text content]".to_string());
+            out.push_str(&format!(
+                "[{ts}] {}: {}\n",
+                message.role.to_uppercase(),
+                body
+            ));
+        }
+        out
+    }
+
+    /// Applies LLM-produced consolidation: appends `history_entry` to HISTORY.md, optionally
+    /// appends `memory_update` as a [`MemoryEntryKind::ConsolidationSummary`] to MEMORY.md, and
+    /// advances [`Session::last_consolidated`] to `consolidate_until_exclusive`.
+    pub fn consolidate_with_summary(
+        &self,
+        session: &mut Session,
+        history_entry: &str,
+        memory_update: Option<&str>,
+        consolidate_until_exclusive: usize,
+    ) -> Result<ConsolidationResult> {
+        let start = session.last_consolidated.min(session.messages.len());
+        let end = consolidate_until_exclusive.min(session.messages.len());
+        if end < start {
+            anyhow::bail!(
+                "consolidate_until_exclusive ({end}) must be >= last_consolidated ({start})"
+            );
+        }
+        let messages_consolidated = end - start;
+
+        self.store.append_history(history_entry.trim_end())?;
+        if let Some(text) = memory_update {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                let entry = MemoryEntry {
+                    kind: MemoryEntryKind::ConsolidationSummary,
+                    title: "Consolidation summary".to_string(),
+                    summary: trimmed.to_string(),
+                    attention_points: Vec::new(),
+                    recorded_at: now_iso(),
+                };
+                self.store.append_memory_entry(&entry)?;
+            }
+        }
+        session.last_consolidated = end;
+
+        Ok(ConsolidationResult {
+            history_entry: history_entry.to_string(),
+            memory_update: memory_update.map(|s| s.to_string()),
+            messages_consolidated,
+        })
+    }
+
+    /// Fallback when LLM-based consolidation is unavailable: archives raw message text to HISTORY.md
+    /// in chunks until the session is back under the 75% token threshold.
+    pub fn maybe_consolidate_raw_archive_by_tokens(
         &self,
         session: &mut Session,
         context_window_tokens: usize,
@@ -218,13 +349,7 @@ impl MemoryConsolidator {
         while self.estimate_session_prompt_tokens(session) > target
             && session.last_consolidated < session.messages.len()
         {
-            let remaining = &session.messages[session.last_consolidated..];
-            let boundary = remaining
-                .iter()
-                .position(|message| message.role == "user" && session.last_consolidated > 0)
-                .unwrap_or(remaining.len().min(8))
-                .max(1);
-            let end = (session.last_consolidated + boundary).min(session.messages.len());
+            let end = Self::chunk_end_exclusive(session, session.last_consolidated);
             let chunk = &session.messages[session.last_consolidated..end];
             self.store.archive_raw_messages(chunk)?;
             session.last_consolidated = end;
@@ -232,9 +357,113 @@ impl MemoryConsolidator {
         Ok(())
     }
 
+    /// Attempts LLM-driven consolidation first; falls back to raw archive after
+    /// [`MAX_CONSOLIDATION_FAILURES`] consecutive failures.
+    pub fn maybe_consolidate_by_tokens(
+        &self,
+        session: &mut Session,
+        context_window_tokens: usize,
+    ) -> Result<()> {
+        self.maybe_consolidate_raw_archive_by_tokens(session, context_window_tokens)
+    }
+
+    /// LLM-driven consolidation: sends a chunk to the provider with a `save_memory` tool,
+    /// parses the JSON response, and applies it. Falls back to raw archive after repeated failures.
+    pub async fn maybe_consolidate_by_tokens_with_provider(
+        &self,
+        session: &mut Session,
+        context_window_tokens: usize,
+        provider: &dyn crate::providers::LlmProvider,
+        model: &str,
+    ) -> Result<()> {
+        let failures = *self.consecutive_failures.lock().expect("failures lock");
+        if failures >= MAX_CONSOLIDATION_FAILURES {
+            return self.maybe_consolidate_raw_archive_by_tokens(session, context_window_tokens);
+        }
+
+        while let Some(end) = self.pick_consolidation_boundary(session, context_window_tokens) {
+            let chunk = &session.messages[session.last_consolidated..end];
+            let prompt = self.build_consolidation_prompt(chunk);
+
+            match self.try_llm_consolidation(provider, model, &prompt).await {
+                Ok((history_entry, memory_update)) => {
+                    *self.consecutive_failures.lock().expect("failures lock") = 0;
+                    self.consolidate_with_summary(
+                        session,
+                        &history_entry,
+                        memory_update.as_deref(),
+                        end,
+                    )?;
+                }
+                Err(_) => {
+                    let mut f = self.consecutive_failures.lock().expect("failures lock");
+                    *f += 1;
+                    if *f >= MAX_CONSOLIDATION_FAILURES {
+                        drop(f);
+                        return self.maybe_consolidate_raw_archive_by_tokens(
+                            session,
+                            context_window_tokens,
+                        );
+                    }
+                    self.store.archive_raw_messages(chunk)?;
+                    session.last_consolidated = end;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn try_llm_consolidation(
+        &self,
+        provider: &dyn crate::providers::LlmProvider,
+        model: &str,
+        prompt: &str,
+    ) -> Result<(String, Option<String>)> {
+        let messages = vec![ChatMessage::text("user", prompt)];
+        let response = provider
+            .chat(&messages, None, Some(model), Some(2048), None)
+            .await?;
+        let text = response
+            .content
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("empty consolidation response"))?;
+        parse_consolidation_json(text)
+    }
+
+    pub fn reset_failure_count(&self) {
+        *self.consecutive_failures.lock().expect("failures lock") = 0;
+    }
+
+    /// Exposes the number of consecutive LLM consolidation failures (for tests and diagnostics).
+    pub fn consecutive_consolidation_failures(&self) -> u32 {
+        *self.consecutive_failures.lock().expect("failures lock")
+    }
+
     pub fn archive_messages(&self, messages: &[ChatMessage]) -> Result<()> {
         self.store.archive_raw_messages(messages)
     }
+}
+
+/// Parses the JSON object returned by the consolidation LLM call.
+pub fn parse_consolidation_json(text: &str) -> Result<(String, Option<String>)> {
+    let cleaned = text
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let value: serde_json::Value = serde_json::from_str(cleaned)
+        .map_err(|e| anyhow::anyhow!("invalid consolidation JSON: {e}"))?;
+    let history_entry = value
+        .get("history_entry")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing history_entry in consolidation response"))?
+        .to_string();
+    let memory_update = value
+        .get("memory_update")
+        .and_then(|v| if v.is_null() { None } else { v.as_str() })
+        .map(|s| s.to_string());
+    Ok((history_entry, memory_update))
 }
 
 fn split_memory_document(content: &str) -> (String, Vec<String>) {
@@ -441,7 +670,10 @@ fn topic_terms(topic: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MemoryEntry, MemoryEntryKind, MemoryStore};
+    use super::{
+        ConsolidationResult, MemoryConsolidator, MemoryEntry, MemoryEntryKind, MemoryStore,
+    };
+    use crate::storage::{ChatMessage, Session};
     use tempfile::tempdir;
 
     #[test]
@@ -505,5 +737,120 @@ mod tests {
 
         let history = std::fs::read_to_string(store.memory_dir().join("HISTORY.md")).unwrap();
         assert_eq!(history, crate::util::DEFAULT_HISTORY_TEMPLATE);
+    }
+
+    #[test]
+    fn pick_consolidation_boundary_none_when_under_budget() {
+        let dir = tempdir().unwrap();
+        let c = MemoryConsolidator::new(dir.path(), 10_000, 32 * 1024).unwrap();
+        let mut session = Session::new("t");
+        session.add_message("user", "hello");
+        assert!(c.pick_consolidation_boundary(&session, 10_000).is_none());
+    }
+
+    #[test]
+    fn pick_consolidation_boundary_some_when_over_budget() {
+        let dir = tempdir().unwrap();
+        let c = MemoryConsolidator::new(dir.path(), 500, 32 * 1024).unwrap();
+        let mut session = Session::new("t");
+        let filler = "word ".repeat(200);
+        for _ in 0..40 {
+            session.add_message("user", &filler);
+        }
+        let end = c
+            .pick_consolidation_boundary(&session, 500)
+            .expect("expected consolidation");
+        assert!(end > session.last_consolidated);
+        assert!(end <= session.messages.len());
+    }
+
+    #[test]
+    fn build_consolidation_prompt_includes_json_shape() {
+        let dir = tempdir().unwrap();
+        let c = MemoryConsolidator::new(dir.path(), 10_000, 32 * 1024).unwrap();
+        let messages = vec![ChatMessage::text("user", "ping")];
+        let p = c.build_consolidation_prompt(&messages);
+        assert!(p.contains("history_entry"));
+        assert!(p.contains("memory_update"));
+        assert!(p.contains("ping"));
+    }
+
+    #[test]
+    fn consolidate_with_summary_updates_files_and_session() {
+        let dir = tempdir().unwrap();
+        let c = MemoryConsolidator::new(dir.path(), 10_000, 32 * 1024).unwrap();
+        let mut session = Session::new("t");
+        session.add_message("user", "a");
+        session.add_message("assistant", "b");
+        session.add_message("user", "c");
+
+        let r: ConsolidationResult = c
+            .consolidate_with_summary(
+                &mut session,
+                "Worked on feature X.",
+                Some("User prefers tabs."),
+                2,
+            )
+            .unwrap();
+
+        assert_eq!(r.history_entry, "Worked on feature X.");
+        assert_eq!(r.memory_update.as_deref(), Some("User prefers tabs."));
+        assert_eq!(r.messages_consolidated, 2);
+        assert_eq!(session.last_consolidated, 2);
+
+        let history = std::fs::read_to_string(c.store().memory_dir().join("HISTORY.md")).unwrap();
+        assert!(history.contains("Worked on feature X."));
+
+        let memory = c.store().read_long_term().unwrap();
+        assert!(memory.contains("Consolidation summary"));
+        assert!(memory.contains("User prefers tabs."));
+        assert!(memory.contains("Consolidation Summary"));
+    }
+
+    #[test]
+    fn consolidate_with_summary_skips_empty_memory_update_string() {
+        let dir = tempdir().unwrap();
+        let c = MemoryConsolidator::new(dir.path(), 10_000, 32 * 1024).unwrap();
+        let mut session = Session::new("t");
+        session.add_message("user", "x");
+
+        let before = c.store().read_long_term().unwrap();
+        c.consolidate_with_summary(&mut session, "Log line only.", Some("   "), 1)
+            .unwrap();
+        assert_eq!(c.store().read_long_term().unwrap(), before);
+    }
+
+    #[test]
+    fn maybe_consolidate_raw_archive_by_tokens_archives_raw_chunks() {
+        let dir = tempdir().unwrap();
+        let c = MemoryConsolidator::new(dir.path(), 400, 32 * 1024).unwrap();
+        let mut session = Session::new("t");
+        let filler = "tok ".repeat(120);
+        for i in 0..12 {
+            session.add_message(if i % 2 == 0 { "user" } else { "assistant" }, &filler);
+        }
+
+        c.maybe_consolidate_raw_archive_by_tokens(&mut session, 400)
+            .unwrap();
+
+        assert!(session.last_consolidated > 0);
+        let history = std::fs::read_to_string(c.store().memory_dir().join("HISTORY.md")).unwrap();
+        assert!(history.contains("[RAW]"));
+        assert!(
+            c.estimate_session_prompt_tokens(&session) <= (400 * 3) / 4
+                || session.last_consolidated >= session.messages.len()
+        );
+    }
+
+    #[test]
+    fn memory_entry_consolidation_summary_markdown() {
+        let e = MemoryEntry {
+            kind: MemoryEntryKind::ConsolidationSummary,
+            title: "t".to_string(),
+            summary: "s".to_string(),
+            attention_points: vec![],
+            recorded_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        assert!(e.to_markdown().contains("Consolidation Summary"));
     }
 }

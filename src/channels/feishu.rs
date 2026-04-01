@@ -808,10 +808,20 @@ impl FeishuChannel {
     const AUDIO_EXTS: &'static [&'static str] = &[".opus"];
     const VIDEO_EXTS: &'static [&'static str] = &[".mp4", ".mov", ".avi"];
 
-    pub fn new(config: Value, bus: MessageBus, workspace: PathBuf) -> Result<Self> {
+    pub fn new(
+        config: Value,
+        bus: MessageBus,
+        workspace: PathBuf,
+        transcription_api_key: String,
+    ) -> Result<Self> {
         let config: FeishuConfig = serde_json::from_value(config)?;
         Ok(Self {
-            base: ChannelBase::new(serde_json::to_value(&config)?, bus, workspace),
+            base: ChannelBase::new(
+                serde_json::to_value(&config)?,
+                bus,
+                workspace,
+                transcription_api_key,
+            ),
             config,
             api: AsyncMutex::new(None),
             _processed_message_ids: Mutex::new(VecDeque::new()),
@@ -1482,6 +1492,27 @@ impl Channel for FeishuChannel {
 
     fn display_name(&self) -> &'static str {
         "Feishu"
+    }
+
+    fn setup_instructions(&self) -> &'static str {
+        "Feishu (Lark) uses the Event Subscription v2 with WebSocket.\n\
+         \n\
+         1. Go to https://open.feishu.cn/app and create a custom app\n\
+         2. Under 'Credentials', copy the App ID and App Secret\n\
+         3. Under 'Event Subscriptions', enable WebSocket mode\n\
+         4. Add event subscriptions: im.message.receive_v1\n\
+         5. Under 'Permissions', add: im:message, im:message:send, im:resource\n\
+         6. Publish the app version and have an admin approve it\n\
+         7. Configure rbot:\n\
+         \n\
+            \"feishu\": {\n\
+              \"enabled\": true,\n\
+              \"allowFrom\": [\"*\"],\n\
+              \"appId\": \"<your-app-id>\",\n\
+              \"appSecret\": \"<your-app-secret>\"\n\
+            }\n\
+         \n\
+         8. Run: rbot run"
     }
 
     async fn start(&self) -> Result<()> {

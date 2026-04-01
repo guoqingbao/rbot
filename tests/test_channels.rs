@@ -54,6 +54,7 @@ fn is_allowed_requires_exact_match() {
             json!({"allowFrom":["allow@email.com"]}),
             MessageBus::new(4),
             PathBuf::new(),
+            String::new(),
         ),
     };
     assert!(channel.base().is_allowed("allow@email.com"));
@@ -78,9 +79,9 @@ fn discover_plugins_and_builtin_priority() {
         "line",
         "Line",
         json!({"enabled": false}),
-        Arc::new(|config, bus, workspace| {
+        Arc::new(|config, bus, workspace, transcription_api_key| {
             Ok(Arc::new(DummyChannel {
-                base: ChannelBase::new(config, bus, workspace),
+                base: ChannelBase::new(config, bus, workspace, transcription_api_key),
             }))
         }),
     ));
@@ -88,9 +89,9 @@ fn discover_plugins_and_builtin_priority() {
         "local",
         "Fake Local",
         json!({"enabled": false}),
-        Arc::new(|config, bus, workspace| {
+        Arc::new(|config, bus, workspace, transcription_api_key| {
             Ok(Arc::new(DummyChannel {
-                base: ChannelBase::new(config, bus, workspace),
+                base: ChannelBase::new(config, bus, workspace, transcription_api_key),
             }))
         }),
     ));
@@ -114,7 +115,7 @@ async fn manager_loads_plugin_from_dict_config_and_dispatches() {
         "fakeplugin",
         "Fake Plugin",
         json!({"enabled": false}),
-        Arc::new(move |config, bus, workspace| {
+        Arc::new(move |config, bus, workspace, transcription_api_key| {
             let sent = sent_ref.clone();
             struct FakeChannel {
                 base: ChannelBase,
@@ -145,7 +146,7 @@ async fn manager_loads_plugin_from_dict_config_and_dispatches() {
                 }
             }
             Ok(Arc::new(FakeChannel {
-                base: ChannelBase::new(config, bus, workspace),
+                base: ChannelBase::new(config, bus, workspace, transcription_api_key),
                 sent,
             }))
         }),

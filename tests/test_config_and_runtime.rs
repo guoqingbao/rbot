@@ -48,6 +48,7 @@ fn provider_matching_prefers_keyword_and_local_base_detection() {
             api_key: "sk-or-test".to_string(),
             api_base: None,
             extra_headers: Default::default(),
+            reasoning_effort: None,
         },
     );
     openrouter_only.agents.defaults.provider = "auto".to_string();
@@ -66,6 +67,7 @@ fn provider_matching_prefers_keyword_and_local_base_detection() {
             api_key: String::new(),
             api_base: Some("http://localhost:11434/v1".to_string()),
             extra_headers: Default::default(),
+            reasoning_effort: None,
         },
     );
     config.agents.defaults.provider = "auto".to_string();
@@ -106,6 +108,7 @@ async fn runtime_processes_bus_messages_and_message_tool_delivers_outbound() {
             dir.path(),
             Some("test-model".to_string()),
             4,
+            5,
             8_000,
             32 * 1024,
             Default::default(),
@@ -123,7 +126,7 @@ async fn runtime_processes_bus_messages_and_message_tool_delivers_outbound() {
         .unwrap(),
     );
     let bus = MessageBus::new(8);
-    let runtime = AgentRuntime::new(agent, bus.clone());
+    let runtime = AgentRuntime::new(agent, bus.clone(), 3);
     runtime.start().await.unwrap();
 
     bus.publish_inbound(InboundMessage {

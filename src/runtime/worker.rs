@@ -1,15 +1,18 @@
+use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 
 use anyhow::Result;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::engine::AgentLoop;
 use crate::storage::{MessageBus, OutboundMessage};
 use crate::tools::MessageSendCallback;
+
+type SessionLocks = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 
 #[derive(Clone)]
 pub struct AgentRuntime {
@@ -17,10 +20,12 @@ pub struct AgentRuntime {
     bus: MessageBus,
     running: Arc<AtomicBool>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    concurrency_semaphore: Arc<Semaphore>,
+    session_locks: SessionLocks,
 }
 
 impl AgentRuntime {
-    pub fn new(agent: Arc<AgentLoop>, bus: MessageBus) -> Self {
+    pub fn new(agent: Arc<AgentLoop>, bus: MessageBus, max_concurrent_requests: usize) -> Self {
         let publish_bus = bus.clone();
         let callback: MessageSendCallback = Arc::new(move |msg| {
             let bus = publish_bus.clone();
@@ -40,11 +45,18 @@ impl AgentRuntime {
         });
         agent.set_progress_sender(Some(progress_callback));
         agent.set_runtime_bus(bus.clone());
+        let permits = if max_concurrent_requests == 0 {
+            usize::MAX
+        } else {
+            max_concurrent_requests
+        };
         Self {
             agent,
             bus,
             running: Arc::new(AtomicBool::new(false)),
             task: Arc::new(Mutex::new(None)),
+            concurrency_semaphore: Arc::new(Semaphore::new(permits)),
+            session_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -54,6 +66,14 @@ impl AgentRuntime {
 
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
+    }
+
+    async fn get_session_lock(&self, session_key: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.session_locks.lock().await;
+        locks
+            .entry(session_key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     pub async fn start(&self) -> Result<()> {
@@ -66,8 +86,16 @@ impl AgentRuntime {
                 let Some(msg) = this.bus.consume_inbound().await else {
                     break;
                 };
+                let session_key = msg.session_key();
                 let this_clone = this.clone();
                 tokio::spawn(async move {
+                    let _permit = match this_clone.concurrency_semaphore.acquire().await {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    };
+                    let session_lock = this_clone.get_session_lock(&session_key).await;
+                    let _session_guard = session_lock.lock().await;
+
                     match this_clone.agent.process_inbound(msg).await {
                         Ok(Some(outbound)) => {
                             let _ = this_clone.bus.publish_outbound(outbound).await;

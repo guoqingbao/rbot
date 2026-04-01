@@ -174,6 +174,7 @@ pub fn tool_emoji(tool_name: &str) -> &'static str {
 pub fn build_status_content(
     version: &str,
     model: &str,
+    workspace: &str,
     uptime_seconds: u64,
     last_prompt_tokens: usize,
     last_completion_tokens: usize,
@@ -195,8 +196,9 @@ pub fn build_status_content(
     } else {
         0
     };
+    let total_tokens = last_prompt_tokens.saturating_add(last_completion_tokens);
     format!(
-        "Model: {model}\nTokens: {last_prompt_tokens} in / {last_completion_tokens} out\nContext: {context_tokens_estimate}/{context_window_tokens} ({pct}%)\nSession: {session_message_count} history messages\nUptime: {uptime}"
+        "Model: {model}\nWorkspace: {workspace}\nUptime: {uptime}\nSession messages: {session_message_count}\nToken usage (last turn): {last_prompt_tokens} prompt + {last_completion_tokens} completion (total {total_tokens})\nContext window: {context_window_tokens} tokens\nContext: {context_tokens_estimate}/{context_window_tokens} ({pct}%)\nrbot v{version}"
     )
 }
 
@@ -448,6 +450,26 @@ Return JSON only:
 - Keep only durable facts worth remembering across sessions
 - Do not copy code blocks, long quotes, raw logs, transcript filler, or markdown headings
 - Prefer the repository, workflow, bug, decision, or user preference that will matter later
+"#,
+        ),
+        (
+            state_dir.join("HEARTBEAT.md"),
+            r#"# Heartbeat
+
+This file defines periodic tasks that rbot checks on a regular interval (default: every 30 minutes).
+
+If there are no active tasks below, the heartbeat check is skipped.
+
+## Active Tasks
+
+<!-- Add recurring maintenance tasks here. Each task should be a clear, actionable item. -->
+<!-- Example: -->
+<!-- - Check for stale pull requests older than 3 days and post a reminder -->
+<!-- - Review error logs and summarize new patterns -->
+
+## Completed Tasks
+
+<!-- Move completed tasks here with a timestamp for reference. -->
 "#,
         ),
     ];

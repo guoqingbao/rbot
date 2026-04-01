@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Result, anyhow};
 use console::{Style, Term};
 use inquire::validator::Validation;
-use inquire::{Confirm, Select, Text};
+use inquire::{Confirm, Password, Select, Text};
 use serde_json::Value;
 
 use rbot::channels::discover_all;
@@ -43,14 +43,28 @@ pub async fn run_config_provider(config_path: Option<&Path>) -> Result<()> {
         .unwrap_or_default();
 
     if !spec.is_local && selected_provider_name != "custom" {
-        let api_key_prompt = if !provider_cfg.api_key.is_empty() {
-            Text::new("Enter API Key:").with_default(&provider_cfg.api_key)
-        } else {
-            Text::new("Enter API Key:")
-        };
-        let input = api_key_prompt.prompt()?;
-        if !input.is_empty() {
-            provider_cfg.api_key = input;
+        if !spec.is_oauth {
+            let new_api_key = Password::new("Enter API Key (leave blank to keep current):")
+                .without_confirmation()
+                .prompt()?;
+            if !new_api_key.is_empty() {
+                provider_cfg.api_key = new_api_key;
+            }
+        }
+
+        if spec.default_api_base.is_empty() {
+            provider_cfg.api_base = Some(
+                Text::new("Enter API Base URL:")
+                    .with_default(provider_cfg.api_base.as_deref().unwrap_or(""))
+                    .with_validator(|value: &str| {
+                        if value.trim().is_empty() {
+                            Ok(Validation::Invalid("Cannot be empty".into()))
+                        } else {
+                            Ok(Validation::Valid)
+                        }
+                    })
+                    .prompt()?,
+            );
         }
 
         println!(
@@ -64,10 +78,15 @@ pub async fn run_config_provider(config_path: Option<&Path>) -> Result<()> {
                 None
             }
         });
+        let api_key_for_snapshot = if provider_cfg.api_key.trim().is_empty() {
+            "dummy"
+        } else {
+            &provider_cfg.api_key
+        };
 
         let snapshot = rbot::observability::collect_provider_model_snapshot(
             &selected_provider_name,
-            "dummy", // we just want the list
+            api_key_for_snapshot,
             api_base.as_deref(),
         )
         .await;

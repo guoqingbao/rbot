@@ -14,7 +14,7 @@ This creates:
 - `~/.rbot/config.json`
 - `~/.rbot/workspace/`
 - a hidden runtime state directory at `<workspace>/.rbot/`
-- workspace bootstrap files such as `.rbot/AGENTS.md`, `.rbot/SOUL.md`, `.rbot/USER.md`, `.rbot/TOOLS.md`, and memory files
+- workspace bootstrap files such as `.rbot/AGENTS.md`, `.rbot/SOUL.md`, `.rbot/USER.md`, `.rbot/TOOLS.md`, `.rbot/HEARTBEAT.md`, and memory files
 - starter workspace skills under `.rbot/skills/`, including a memory-hygiene skill and editable project templates
 
 ## 2. Interactive Configuration
@@ -531,20 +531,45 @@ Built-in skills ship with the repository under `rbot/skills/`.
 
 Current built-in set:
 
-- `memory-hygiene`
+- `memory-hygiene` (always-on)
+- `memory` (always-on)
 - `memory-entry-writer`
 - `workspace-operator`
 - `software-engineer`
 - `data-analyst`
 - `github-cli`
+- `github`
 - `scheduled-ops`
+- `cron`
+- `clawhub`
+- `skill-creator`
+- `summarize`
+- `weather`
+- `tmux`
 
 Behavior:
 
 - always-on skills are injected automatically
 - relevant task-specific skills are suggested and loaded based on prompt keywords
+- skills with unmet requirements (missing binaries, env vars, or OS) are marked unavailable
 - workspace-local skills live under `<workspace>/.rbot/skills/<name>/SKILL.md`
 - new workspaces also get starter workspace skill templates that you can edit for project-specific context and delivery rules
+
+### Skill Management
+
+List all skills and their availability:
+
+```bash
+cargo run -- skills list
+```
+
+Scaffold a new skill:
+
+```bash
+cargo run -- skills init my-custom-skill
+```
+
+This creates `<workspace>/.rbot/skills/my-custom-skill/SKILL.md` with a starter template.
 
 ## 9. Useful Commands
 
@@ -576,6 +601,24 @@ cargo run -- config --provider   # Interactive provider setup
 cargo run -- config --channel    # Interactive channel setup
 ```
 
+### Channel Management
+
+```bash
+cargo run -- channels list       # List all available channels
+cargo run -- channels status     # Show enabled/disabled state per channel
+cargo run -- channels login      # Interactive login (e.g. Weixin QR code scan)
+cargo run -- channels login weixin   # Login to a specific channel
+cargo run -- channels setup      # Show setup instructions for a channel
+cargo run -- channels setup discord  # Setup instructions for a specific channel
+```
+
+### Skill Management
+
+```bash
+cargo run -- skills list         # List skills with availability status
+cargo run -- skills init NAME    # Scaffold a new skill directory
+```
+
 ## 10. Operational Notes
 
 - `run` validates enabled channel config before startup.
@@ -586,7 +629,311 @@ cargo run -- config --channel    # Interactive channel setup
 - The admin UI polls the runtime every few seconds and exposes channel controls plus heartbeat triggering.
 - The metrics endpoint exposes Prometheus-compatible counters and gauges for message counts, provider requests, token totals, latency, and throughput.
 
-## 11. Current Scope
+## 11. Additional Channel Configuration
+
+Each channel section below includes how to obtain the required credentials and the config format. You can also run `rbot channels setup <name>` to see setup instructions in the terminal.
+
+### DingTalk
+
+DingTalk uses the Stream gateway WebSocket protocol.
+
+**How to obtain credentials:**
+
+1. Go to <https://open-dev.dingtalk.com> and create a robot application
+2. Under **Credentials**, copy the Client ID (AppKey) and Client Secret (AppSecret)
+3. Under **Robot**, enable the robot and copy the Robot Code
+
+```json
+{
+  "channels": {
+    "dingtalk": {
+      "enabled": true,
+      "allowFrom": ["*"],
+      "clientId": "<AppKey from developer console>",
+      "clientSecret": "<AppSecret from developer console>",
+      "robotCode": "<Robot Code>"
+    }
+  }
+}
+```
+
+### Discord
+
+Discord connects via the Gateway v10 WebSocket.
+
+**How to obtain credentials:**
+
+1. Go to <https://discord.com/developers/applications> and create an application
+2. Under **Bot**, click "Add Bot" and copy the bot token
+3. Under **Bot**, enable "Message Content Intent" in Privileged Gateway Intents
+4. Under **OAuth2 > URL Generator**, select `bot` scope with `Send Messages` permission
+5. Use the generated URL to invite the bot to your server
+
+```json
+{
+  "channels": {
+    "discord": {
+      "enabled": true,
+      "allowFrom": ["*"],
+      "botToken": "<your-bot-token>",
+      "groupPolicy": "mention"
+    }
+  }
+}
+```
+
+`groupPolicy` options: `"mention"` (respond only when @mentioned), `"open"` (respond to all messages).
+
+### Matrix
+
+Matrix uses the CS API v3 long-poll `/sync` endpoint.
+
+**How to obtain credentials:**
+
+1. Create a bot account on your Matrix homeserver
+2. Obtain an access token (e.g. via Element: Settings > Help & About > Access Token)
+3. Note the full user ID (e.g. `@bot:example.com`)
+4. Invite the bot to the rooms where it should respond
+
+```json
+{
+  "channels": {
+    "matrix": {
+      "enabled": true,
+      "allowFrom": ["*"],
+      "homeserverUrl": "https://matrix.example.com",
+      "accessToken": "<your-access-token>",
+      "userId": "@bot:example.com"
+    }
+  }
+}
+```
+
+Note: End-to-end encrypted rooms (`m.room.encrypted`) are not supported; the bot will skip encrypted messages.
+
+### WhatsApp
+
+WhatsApp connects to a Node.js Baileys bridge via WebSocket.
+
+**Setup steps:**
+
+1. Install Node.js v18+
+2. Clone the Baileys bridge: `git clone https://github.com/nicepkg/whatsapp-bridge`
+3. `cd whatsapp-bridge && npm install && npm start`
+4. Scan the QR code displayed in the bridge terminal with WhatsApp
+5. The bridge saves auth state — subsequent starts reconnect automatically
+
+Run `rbot channels login whatsapp` for step-by-step guidance.
+
+```json
+{
+  "channels": {
+    "whatsapp": {
+      "enabled": true,
+      "allowFrom": ["*"],
+      "bridgeUrl": "ws://localhost:3001",
+      "bridgeToken": "",
+      "groupPolicy": "open"
+    }
+  }
+}
+```
+
+The bridge must be running before `rbot run`. Set `bridgeToken` if your bridge instance requires authentication.
+
+### QQ
+
+QQ uses the QQ Bot API with WebSocket gateway.
+
+**How to obtain credentials:**
+
+1. Go to <https://q.qq.com> and register as a QQ Bot developer
+2. Create a bot application and obtain the App ID and Secret
+3. Configure the bot's intents and permissions in the developer console
+
+```json
+{
+  "channels": {
+    "qq": {
+      "enabled": true,
+      "allowFrom": ["*"],
+      "appId": "<your-app-id>",
+      "secret": "<your-secret>"
+    }
+  }
+}
+```
+
+### WeCom
+
+WeCom (Enterprise WeChat) uses the AI Bot WebSocket protocol.
+
+**How to obtain credentials:**
+
+1. Log in to <https://work.weixin.qq.com> admin console
+2. Create a self-built application under **App Management**
+3. Note the Corp ID (from **My Enterprise**), Agent ID, and Secret
+
+```json
+{
+  "channels": {
+    "wecom": {
+      "enabled": true,
+      "allowFrom": ["*"],
+      "corpId": "<your-corp-id>",
+      "agentId": "<your-agent-id>",
+      "secret": "<your-secret>"
+    }
+  }
+}
+```
+
+All three fields (`corpId`, `agentId`, `secret`) are required — `agentId`/`secret` for WebSocket auth, `corpId` for outbound message delivery.
+
+### Weixin
+
+Weixin (personal WeChat) uses HTTP long-poll with QR code login via the ilinkai API.
+
+**Login flow:**
+
+1. Enable the channel in config (no token needed initially)
+2. Run `rbot channels login weixin` — a QR code URL will be printed
+3. Open the URL in WeChat and scan to authorize
+4. The token is saved to `<stateDir>/account.json` for future sessions
+
+Alternatively, run `rbot run` and the QR login starts automatically if no saved token is found.
+
+```json
+{
+  "channels": {
+    "weixin": {
+      "enabled": true,
+      "allowFrom": ["*"]
+    }
+  }
+}
+```
+
+### Mochat
+
+Mochat connects to a Mochat/OpenClaw instance via HTTP polling.
+
+**How to obtain credentials:**
+
+1. Obtain a Claw Token from your Mochat or OpenClaw instance admin
+2. Note the session IDs and/or panel IDs you want the bot to monitor
+
+```json
+{
+  "channels": {
+    "mochat": {
+      "enabled": true,
+      "allowFrom": ["*"],
+      "baseUrl": "https://your-instance.com",
+      "clawToken": "<your-token>",
+      "sessions": ["session-id-1"],
+      "panels": []
+    }
+  }
+}
+```
+
+## 12. Additional Provider Configuration
+
+### Anthropic
+
+Anthropic is supported natively with the Messages API:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": "anthropic/claude-sonnet-4-20250514",
+      "provider": "anthropic"
+    }
+  },
+  "providers": {
+    "anthropic": {
+      "apiKey": "sk-ant-..."
+    }
+  }
+}
+```
+
+Optional `reasoningEffort` can be set to control extended thinking behavior.
+
+### GitHub Copilot
+
+GitHub Copilot is an OAuth provider and does not require an API key:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": "github_copilot/gpt-4o",
+      "provider": "github_copilot"
+    }
+  },
+  "providers": {
+    "github_copilot": {}
+  }
+}
+```
+
+### Cursor
+
+Cursor requires an explicit `apiBase`:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": "cursor/gpt-4o",
+      "provider": "cursor"
+    }
+  },
+  "providers": {
+    "cursor": {
+      "apiKey": "your-key",
+      "apiBase": "https://your-cursor-api-base"
+    }
+  }
+}
+```
+
+## 13. Concurrency Configuration
+
+Control how many inbound messages are processed concurrently:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "maxConcurrentRequests": 3
+    }
+  }
+}
+```
+
+Messages for the same session are always serialized regardless of this setting.
+
+## 14. Channel Delivery Configuration
+
+Configure outbound delivery behavior:
+
+```json
+{
+  "channels": {
+    "sendProgress": true,
+    "sendToolHints": false,
+    "sendMaxRetries": 3
+  }
+}
+```
+
+- `sendMaxRetries`: number of delivery attempts with exponential backoff (1s, 2s, 4s...) before giving up.
+
+## 15. Current Scope
 
 The supported production channel set in this repository is:
 
@@ -594,5 +941,13 @@ The supported production channel set in this repository is:
 - `slack`
 - `telegram`
 - `feishu`
+- `dingtalk`
+- `discord`
+- `matrix`
+- `whatsapp`
+- `qq`
+- `wecom`
+- `weixin`
+- `mochat`
 
 The runtime is designed so additional providers and transports can be added behind the same trait boundaries without changing the agent loop.

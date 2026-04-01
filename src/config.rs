@@ -21,8 +21,12 @@ pub struct AgentDefaults {
     pub temperature: f32,
     #[serde(alias = "maxToolIterations")]
     pub max_tool_iterations: usize,
+    #[serde(alias = "maxConcurrentTools")]
+    pub max_concurrent_tools: usize,
     #[serde(alias = "memoryMaxBytes")]
     pub memory_max_bytes: usize,
+    #[serde(alias = "maxConcurrentRequests")]
+    pub max_concurrent_requests: usize,
 }
 
 impl Default for AgentDefaults {
@@ -35,7 +39,9 @@ impl Default for AgentDefaults {
             context_window_tokens: 65_536,
             temperature: 0.1,
             max_tool_iterations: 0,
+            max_concurrent_tools: 5,
             memory_max_bytes: 32 * 1024,
+            max_concurrent_requests: 3,
         }
     }
 }
@@ -53,6 +59,10 @@ pub struct ChannelsConfig {
     pub send_progress: bool,
     #[serde(alias = "sendToolHints")]
     pub send_tool_hints: bool,
+    #[serde(alias = "transcriptionApiKey")]
+    pub transcription_api_key: String,
+    #[serde(alias = "sendMaxRetries")]
+    pub send_max_retries: usize,
     #[serde(flatten)]
     pub sections: BTreeMap<String, serde_json::Value>,
 }
@@ -62,6 +72,8 @@ impl Default for ChannelsConfig {
         Self {
             send_progress: true,
             send_tool_hints: false,
+            transcription_api_key: String::new(),
+            send_max_retries: 3,
             sections: BTreeMap::new(),
         }
     }
@@ -82,6 +94,8 @@ pub struct ProviderConfig {
     pub api_base: Option<String>,
     #[serde(alias = "extraHeaders")]
     pub extra_headers: BTreeMap<String, String>,
+    #[serde(alias = "reasoningEffort")]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -325,6 +339,7 @@ impl Config {
                         "apiKey": cfg.api_key,
                         "apiBase": cfg.api_base,
                         "extraHeaders": cfg.extra_headers,
+                        "reasoningEffort": cfg.reasoning_effort,
                     }),
                 )
             })
@@ -343,6 +358,10 @@ impl Config {
             "sendToolHints".to_string(),
             serde_json::Value::Bool(self.channels.send_tool_hints),
         );
+        channels.insert(
+            "transcriptionApiKey".to_string(),
+            serde_json::Value::String(self.channels.transcription_api_key.clone()),
+        );
         let payload = serde_json::to_string_pretty(&serde_json::json!({
             "agents": {
                 "defaults": {
@@ -353,7 +372,9 @@ impl Config {
                     "contextWindowTokens": self.agents.defaults.context_window_tokens,
                     "temperature": self.agents.defaults.temperature,
                     "maxToolIterations": self.agents.defaults.max_tool_iterations,
+                    "maxConcurrentTools": self.agents.defaults.max_concurrent_tools,
                     "memoryMaxBytes": self.agents.defaults.memory_max_bytes,
+                    "maxConcurrentRequests": self.agents.defaults.max_concurrent_requests,
                 }
             },
             "providers": providers,

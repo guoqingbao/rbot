@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -99,9 +100,14 @@ async fn fetch_new_messages_parses_unseen_and_dedupes_uid() {
             "123",
         )]));
 
-    let channel = EmailChannel::new(make_config(), MessageBus::new(8))
-        .unwrap()
-        .with_backend(backend.clone());
+    let channel = EmailChannel::new(
+        make_config(),
+        MessageBus::new(8),
+        PathBuf::new(),
+        String::new(),
+    )
+    .unwrap()
+    .with_backend(backend.clone());
     let items = channel.fetch_new_messages().await.unwrap();
 
     assert_eq!(items.len(), 1);
@@ -132,9 +138,14 @@ async fn fetch_new_messages_retries_once_when_backend_goes_stale() {
             "123",
         )]));
 
-    let channel = EmailChannel::new(make_config(), MessageBus::new(8))
-        .unwrap()
-        .with_backend(backend.clone());
+    let channel = EmailChannel::new(
+        make_config(),
+        MessageBus::new(8),
+        PathBuf::new(),
+        String::new(),
+    )
+    .unwrap()
+    .with_backend(backend.clone());
     let items = channel.fetch_new_messages().await.unwrap();
 
     assert_eq!(items.len(), 1);
@@ -152,9 +163,14 @@ async fn fetch_new_messages_skips_missing_mailbox() {
             "Mailbox doesn't exist",
         )));
 
-    let channel = EmailChannel::new(make_config(), MessageBus::new(8))
-        .unwrap()
-        .with_backend(backend);
+    let channel = EmailChannel::new(
+        make_config(),
+        MessageBus::new(8),
+        PathBuf::new(),
+        String::new(),
+    )
+    .unwrap()
+    .with_backend(backend);
     let items = channel.fetch_new_messages().await.unwrap();
     assert!(items.is_empty());
 }
@@ -173,7 +189,7 @@ async fn start_returns_immediately_without_consent() {
     let backend = Arc::new(FakeEmailBackend::default());
     let mut cfg = make_config();
     cfg["consentGranted"] = json!(false);
-    let channel = EmailChannel::new(cfg, MessageBus::new(8))
+    let channel = EmailChannel::new(cfg, MessageBus::new(8), PathBuf::new(), String::new())
         .unwrap()
         .with_backend(backend.clone());
     channel.start().await.unwrap();
@@ -183,9 +199,14 @@ async fn start_returns_immediately_without_consent() {
 #[tokio::test]
 async fn send_uses_reply_subject_and_in_reply_to() {
     let backend = Arc::new(FakeEmailBackend::default());
-    let channel = EmailChannel::new(make_config(), MessageBus::new(8))
-        .unwrap()
-        .with_backend(backend.clone());
+    let channel = EmailChannel::new(
+        make_config(),
+        MessageBus::new(8),
+        PathBuf::new(),
+        String::new(),
+    )
+    .unwrap()
+    .with_backend(backend.clone());
     channel.remember_inbound_email("alice@example.com", "Invoice #42", "<m1@example.com>");
 
     channel
@@ -211,7 +232,7 @@ async fn send_skips_reply_when_auto_reply_disabled_unless_forced() {
     let backend = Arc::new(FakeEmailBackend::default());
     let mut cfg = make_config();
     cfg["autoReplyEnabled"] = json!(false);
-    let channel = EmailChannel::new(cfg, MessageBus::new(8))
+    let channel = EmailChannel::new(cfg, MessageBus::new(8), PathBuf::new(), String::new())
         .unwrap()
         .with_backend(backend.clone());
     channel.remember_inbound_email("alice@example.com", "Previous email", "<m1@example.com>");
@@ -248,7 +269,7 @@ async fn send_proactive_email_when_auto_reply_disabled() {
     let backend = Arc::new(FakeEmailBackend::default());
     let mut cfg = make_config();
     cfg["autoReplyEnabled"] = json!(false);
-    let channel = EmailChannel::new(cfg, MessageBus::new(8))
+    let channel = EmailChannel::new(cfg, MessageBus::new(8), PathBuf::new(), String::new())
         .unwrap()
         .with_backend(backend.clone());
 
@@ -283,9 +304,14 @@ async fn fetch_messages_between_dates_uses_date_range_without_mark_seen() {
             "Yesterday update",
             "999",
         )]));
-    let channel = EmailChannel::new(make_config(), MessageBus::new(8))
-        .unwrap()
-        .with_backend(backend.clone());
+    let channel = EmailChannel::new(
+        make_config(),
+        MessageBus::new(8),
+        PathBuf::new(),
+        String::new(),
+    )
+    .unwrap()
+    .with_backend(backend.clone());
 
     let items = channel
         .fetch_messages_between_dates(

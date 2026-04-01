@@ -4,14 +4,16 @@
 
 ## ✨ Features
 
-- 🧠 **Persistent Agent Runtime** - Long-running agent runtime with persistent sessions and memory files
-- 📝 **Permanent Memory Capture** - Automatic task summaries, explicit `/memorize` support, and topic-relevant memory lookup
+- 🧠 **Persistent Agent Runtime** - Long-running agent runtime with persistent sessions, per-session serialization, and configurable concurrency control
+- 📝 **Permanent Memory Capture** - LLM-driven memory consolidation, automatic task summaries, explicit `/memorize` support, and topic-relevant memory lookup
 - 🛠️ **Rich Toolset** - Filesystem, shell, web fetch, web search, messaging, cron, and background-task tools
-- 🌐 **Provider Integration** - OpenAI-compatible provider integration, including local engines that expose OpenAI-style APIs
+- 🌐 **Provider Integration** - OpenAI-compatible, Anthropic, GitHub Copilot (OAuth), Cursor, and local engines
 - 🔌 **MCP Support** - MCP stdio tool integration for external tool servers
-- 🧩 **Built-in Skills** - Software engineering, research/reporting, GitHub/CI, and scheduled operations
-- 📬 **Multi-Channel** - Channel backends for `email`, `slack`, `telegram`, and `feishu`
+- 🧩 **Built-in Skills** - Software engineering, research/reporting, GitHub/CI, scheduled operations, memory management, cron, and clawhub marketplace
+- 📬 **Multi-Channel** - 13 channel backends: `email`, `slack`, `telegram`, `feishu`, `dingtalk`, `discord`, `matrix`, `whatsapp`, `qq`, `wecom`, `weixin`, `mochat`, and extensible plugin channels
 - 🌐 **Gateway Process** - Webhook ingress, health checks, readiness checks, Prometheus metrics, and a web admin UI
+- 🔄 **Streaming** - Stream delta support with per-channel streaming, retry logic with exponential backoff
+- 🪝 **Hook System** - Extensible `AgentHook` trait for lifecycle callbacks without modifying the core agent loop
 
 ## 📚 Documentation
 
@@ -57,7 +59,16 @@ Use the interactive configuration tool:
 cargo run --release -- config --channel
 ```
 
-This tool helps you selectively enable channels, set permissions, and provide required tokens or secrets. For manual configuration or detailed channel options, see [Getting Started](./docs/USAGE.md#5-channel-configuration).
+List, configure, and log in to channels:
+
+```bash
+cargo run --release -- channels list          # List all available channels
+cargo run --release -- channels status        # Show enabled/disabled state
+cargo run --release -- channels setup discord # Setup instructions (how to get tokens)
+cargo run --release -- channels login weixin  # Interactive login (QR code scan)
+```
+
+Use `channels setup <name>` to see step-by-step instructions for obtaining the required tokens and keys for any channel. For channels that support interactive login (Weixin QR code, WhatsApp bridge), use `channels login`. For manual configuration or detailed channel options, see [Getting Started](./docs/USAGE.md#5-channel-configuration).
 
 > [!TIP]
 > **Slack Users:** Set up Slack App for Agents [Slack Manual](https://www.meta-intelligence.tech/en/insight-openclaw-slack).
@@ -86,6 +97,13 @@ The CLI includes:
 - 💻 Local shell commands such as `/help` and `/clear`
 - 🤖 Agent commands such as `/new`, `/clear`, `/memorize <text>`, `/status`, and `/stop`
 
+### Manage skills:
+
+```bash
+cargo run --release -- skills list
+cargo run --release -- skills init my-custom-skill
+```
+
 ## ⚡ Backend Bot
 ### Start the backend (Personal AI Assistant):
 
@@ -101,6 +119,8 @@ Sending task(s) to `rbot` using configured channels (such as Slack APP).
 cargo run --release -- status
 cargo run --release -- sessions
 cargo run --release -- jobs
+cargo run --release -- channels status
+cargo run --release -- skills list
 ```
 
 ## 📡 Runtime Surfaces
@@ -108,9 +128,17 @@ cargo run --release -- jobs
 ### Channel Backends
 
 - 📧 **email**: IMAP polling + SMTP send
-- 💬 **slack**: webhook ingress + send
+- 💬 **slack**: Socket Mode or webhook ingress + send
 - ✈️ **telegram**: webhook ingress + send
 - 🦘 **feishu**: webhook ingress + send, including inbound media/resource handling
+- 🔔 **dingtalk**: Stream gateway WebSocket + REST send
+- 🎮 **discord**: Gateway v10 WebSocket + REST send
+- 🏠 **matrix**: CS API v3 long-poll sync + send
+- 📱 **whatsapp**: WebSocket bridge to Node.js Baileys
+- 🐧 **qq**: QQ Bot API WebSocket gateway + REST send
+- 🏢 **wecom**: Enterprise WeChat AI Bot WebSocket
+- 💬 **weixin**: Personal WeChat via HTTP long-poll
+- 🌐 **mochat**: HTTP polling with session/panel support
 - 🔌 **mcp**: stdio-based external tool servers exposed as native tools
 
 ### Channel Commands

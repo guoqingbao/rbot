@@ -91,6 +91,12 @@ fn stop_response(content: &str) -> LlmResponse {
     }
 }
 
+fn outbound_metadata(base: &BTreeMap<String, Value>, session_key: &str) -> BTreeMap<String, Value> {
+    let mut m = base.clone();
+    m.insert("_session_key".to_string(), json!(session_key));
+    m
+}
+
 fn tool_response(id: &str, task: &str, label: &str) -> LlmResponse {
     LlmResponse {
         content: Some("Delegating work.".to_string()),
@@ -119,6 +125,7 @@ async fn runtime_routes_completed_subagent_back_to_origin_chat() {
             dir.path(),
             Some("test-model".to_string()),
             6,
+            5,
             8_000,
             32 * 1024,
             Default::default(),
@@ -136,7 +143,7 @@ async fn runtime_routes_completed_subagent_back_to_origin_chat() {
         .unwrap(),
     );
     let bus = MessageBus::new(8);
-    let runtime = AgentRuntime::new(agent, bus.clone());
+    let runtime = AgentRuntime::new(agent, bus.clone(), 3);
     runtime.start().await.unwrap();
 
     bus.publish_inbound(InboundMessage {
@@ -180,6 +187,7 @@ async fn stop_command_cancels_active_subagent_tasks() {
         dir.path(),
         Some("test-model".to_string()),
         6,
+        5,
         8_000,
         32 * 1024,
         Default::default(),
@@ -228,6 +236,7 @@ async fn runtime_stop_command_acknowledges_and_confirms_subagent_cancellation() 
             dir.path(),
             Some("test-model".to_string()),
             6,
+            5,
             8_000,
             32 * 1024,
             Default::default(),
@@ -245,7 +254,7 @@ async fn runtime_stop_command_acknowledges_and_confirms_subagent_cancellation() 
         .unwrap(),
     );
     let bus = MessageBus::new(16);
-    let runtime = AgentRuntime::new(agent, bus.clone());
+    let runtime = AgentRuntime::new(agent, bus.clone(), 3);
     runtime.start().await.unwrap();
 
     let metadata = BTreeMap::from([(
@@ -270,11 +279,29 @@ async fn runtime_stop_command_acknowledges_and_confirms_subagent_cancellation() 
     .await
     .unwrap();
 
+    // Non-cli channels get a one-time backend session notice before the turn reply.
+    let session_notice = tokio::time::timeout(Duration::from_secs(1), bus.consume_outbound())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        session_notice
+            .content
+            .contains("Session: started new session"),
+        "unexpected first outbound: {:?}",
+        session_notice.content
+    );
+    assert_eq!(
+        session_notice.metadata,
+        outbound_metadata(&metadata, &session_key)
+    );
+
     let started = tokio::time::timeout(Duration::from_secs(1), bus.consume_outbound())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(started.content, "Background task started.");
+    assert_eq!(started.metadata, outbound_metadata(&metadata, &session_key));
 
     bus.publish_inbound(InboundMessage {
         channel: "slack".to_string(),
@@ -284,7 +311,7 @@ async fn runtime_stop_command_acknowledges_and_confirms_subagent_cancellation() 
         timestamp: chrono::Utc::now(),
         media: Vec::new(),
         metadata: metadata.clone(),
-        session_key_override: Some(session_key),
+        session_key_override: Some(session_key.clone()),
     })
     .await
     .unwrap();
@@ -294,7 +321,7 @@ async fn runtime_stop_command_acknowledges_and_confirms_subagent_cancellation() 
         .unwrap()
         .unwrap();
     assert_eq!(ack.content, "Stopping 1 task(s)...");
-    assert_eq!(ack.metadata, metadata);
+    assert_eq!(ack.metadata, outbound_metadata(&metadata, &session_key));
 
     let completion = tokio::time::timeout(Duration::from_secs(1), bus.consume_outbound())
         .await
