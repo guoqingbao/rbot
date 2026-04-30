@@ -2,10 +2,8 @@ use std::borrow::Cow;
 use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use console::Term;
@@ -266,309 +264,31 @@ impl OutputTarget {
 
 type SharedPrinter = Arc<Mutex<Box<dyn RustylineExternalPrinter + Send>>>;
 
-fn write_stderr_raw(text: &str) {
-    eprint!("{text}");
-    let _ = io::stderr().flush();
-}
-
 pub struct TurnSummary {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub elapsed: Duration,
 }
 
-#[derive(Clone)]
-struct FooterController {
-    style: Style,
-    state: Arc<Mutex<FooterState>>,
-}
-
-struct FooterState {
-    target: Option<OutputTarget>,
-    display: FooterDisplay,
-    hidden: bool,
-    overlay_suspended: bool,
-    mode: FooterMode,
-    queue_depth: usize,
-    last_prompt_tokens: usize,
-    last_completion_tokens: usize,
-    last_elapsed: Option<Duration>,
-    active_since: Option<Instant>,
-    spinner_frame: usize,
-    exit_pending: bool,
-    detail: Option<String>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FooterMode {
-    Idle,
-    Waiting,
-    Working,
-    Interrupted,
-    Error,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FooterDisplay {
-    None,
-    Transcript,
-    Overlay,
-}
-
-impl FooterController {
-    fn new(style: Style, model: String, provider: String, cwd_name: String) -> Self {
-        let _ = (model, provider, cwd_name);
-        Self {
-            style,
-            state: Arc::new(Mutex::new(FooterState {
-                target: None,
-                display: FooterDisplay::None,
-                hidden: false,
-                overlay_suspended: false,
-                mode: FooterMode::Idle,
-                queue_depth: 0,
-                last_prompt_tokens: 0,
-                last_completion_tokens: 0,
-                last_elapsed: None,
-                active_since: None,
-                spinner_frame: 0,
-                exit_pending: false,
-                detail: None,
-            })),
-        }
-    }
-
-    fn attach_target(&self, target: OutputTarget) -> Self {
-        let mut state = self.state.lock().expect("footer state lock poisoned");
-        state.target = Some(target);
-        self.clone()
-    }
-
-    fn reset_render_state(&self) {
-        let mut state = self.state.lock().expect("footer state lock poisoned");
-        if state.display == FooterDisplay::Overlay {
-            clear_overlay_footer();
-        }
-        state.display = FooterDisplay::None;
-        state.hidden = false;
-        state.overlay_suspended = false;
-    }
-
-    fn set_idle(&self) {
-        let mut state = self.state.lock().expect("footer state lock poisoned");
-        state.hidden = false;
-        state.mode = FooterMode::Idle;
-        state.overlay_suspended = false;
-        state.active_since = None;
-        state.detail = None;
-    }
-
-    fn set_waiting(&self, detail: &str) {
-        let mut state = self.state.lock().expect("footer state lock poisoned");
-        state.hidden = false;
-        state.mode = FooterMode::Waiting;
-        state.overlay_suspended = false;
-        state.active_since = Some(Instant::now());
-        state.spinner_frame = 0;
-        state.detail = Some(detail.to_string());
-        state.exit_pending = false;
-    }
-
-    fn set_working(&self, detail: &str) {
-        let mut state = self.state.lock().expect("footer state lock poisoned");
-        state.mode = FooterMode::Working;
-        if state.active_since.is_none() {
-            state.active_since = Some(Instant::now());
-        }
-        state.detail = Some(detail.to_string());
-    }
-
-    fn complete(&self, summary: &TurnSummary) {
-        let mut state = self.state.lock().expect("footer state lock poisoned");
-        state.hidden = false;
-        state.mode = FooterMode::Idle;
-        state.overlay_suspended = false;
-        state.active_since = None;
-        state.last_prompt_tokens = summary.prompt_tokens;
-        state.last_completion_tokens = summary.completion_tokens;
-        state.last_elapsed = Some(summary.elapsed);
-        state.detail = None;
-        state.exit_pending = false;
-    }
-
-    fn set_interrupted(&self) {
-        let mut state = self.state.lock().expect("footer state lock poisoned");
-        state.hidden = false;
-        state.mode = FooterMode::Interrupted;
-        state.overlay_suspended = false;
-        state.active_since = None;
-        state.last_elapsed = None;
-        state.detail = Some("turn interrupted".to_string());
-        state.exit_pending = false;
-    }
-
-    fn set_error(&self, detail: &str) {
-        let mut state = self.state.lock().expect("footer state lock poisoned");
-        state.hidden = false;
-        state.mode = FooterMode::Error;
-        state.overlay_suspended = false;
-        state.active_since = None;
-        state.last_elapsed = None;
-        state.detail = Some(detail.to_string());
-        state.exit_pending = false;
-    }
-
-    fn set_queue_depth(&self, queued: usize) {
-        let mut state = self.state.lock().expect("footer state lock poisoned");
-        state.queue_depth = queued;
-    }
-
-    fn set_exit_pending(&self, exit_pending: bool) {
-        let mut state = self.state.lock().expect("footer state lock poisoned");
-        state.exit_pending = exit_pending;
-    }
-
-    fn tick(&self) {
-        // No animation needed; spinner removed
-    }
-
-    fn render_current(&self) {
-        let mut state = self.state.lock().expect("footer state lock poisoned");
-        render_footer_locked(&self.style, &mut state);
-    }
-
-    fn hide(&self) {
-        let mut state = self.state.lock().expect("footer state lock poisoned");
-        state.hidden = true;
-        state.overlay_suspended = false;
-        if state.display == FooterDisplay::Overlay {
-            clear_overlay_footer();
-        }
-        state.display = FooterDisplay::None;
-    }
-
-    fn suspend_overlay(&self) {
-        let mut state = self.state.lock().expect("footer state lock poisoned");
-        state.overlay_suspended = true;
-        if state.display == FooterDisplay::Overlay {
-            clear_overlay_footer();
-            state.display = FooterDisplay::None;
-        }
-    }
-
-    fn resume_overlay(&self) {
-        let mut state = self.state.lock().expect("footer state lock poisoned");
-        state.overlay_suspended = false;
-        render_footer_locked(&self.style, &mut state);
-    }
-}
-
-fn render_footer_locked(style: &Style, state: &mut FooterState) {
-    let Some(target) = state.target.clone() else {
-        return;
-    };
-    if state.hidden {
-        if state.display == FooterDisplay::Overlay {
-            clear_overlay_footer();
-        }
-        state.display = FooterDisplay::None;
-        return;
-    }
-    let rendered = build_footer_line(style, state);
-    if style.ansi && target.uses_external_printer() {
-        if state.overlay_suspended {
-            return;
-        }
-        write_overlay_footer(&rendered);
-        state.display = FooterDisplay::Overlay;
-        return;
-    }
-    if state.display == FooterDisplay::Overlay {
-        clear_overlay_footer();
-        state.display = FooterDisplay::None;
-    }
-
-    let text = format!("{rendered}\n");
-    if style.ansi && state.display == FooterDisplay::Transcript {
-        target.write_raw(format!("\x1b[1A\r\x1b[2K{text}"));
-    } else {
-        target.write_raw(&text);
-        state.display = FooterDisplay::Transcript;
-    }
-}
-
-fn write_overlay_footer(rendered: &str) {
-    write_stderr_raw(&format!("\x1b[s\r\n\x1b[2K{rendered}\x1b[u"));
-}
-
-fn clear_overlay_footer() {
-    write_stderr_raw("\x1b[s\r\n\x1b[2K\x1b[u");
-}
-
-fn build_footer_line(style: &Style, state: &FooterState) -> String {
-    let status = match state.mode {
-        FooterMode::Idle => style.accent("ready"),
-        FooterMode::Waiting => style.accent("waiting"),
-        FooterMode::Working => style.accent("working"),
-        FooterMode::Interrupted => style.error("interrupted"),
-        FooterMode::Error => style.error("error"),
-    };
-    let last_elapsed = state.last_elapsed.map(format_elapsed_short);
-    let tokens = if state.last_prompt_tokens == 0 && state.last_completion_tokens == 0 {
-        None
-    } else {
-        Some(format!(
-            "↑{} ↓{}",
-            state.last_prompt_tokens, state.last_completion_tokens
-        ))
-    };
-    let detail = state
-        .detail
-        .as_deref()
-        .filter(|detail| !detail.is_empty())
-        .map(|detail| truncate_middle(detail, 24));
-    let hint = match state.mode {
-        FooterMode::Waiting | FooterMode::Working => {
-            if state.exit_pending {
-                "Ctrl-C /stop · queue input · /exit pending"
-            } else {
-                "Ctrl-C /stop · queue input · /exit after turn"
-            }
-        }
-        FooterMode::Interrupted => "enter continues · queued input kept",
-        FooterMode::Error => "enter retries · /new resets · /exit quits",
-        FooterMode::Idle => "Ctrl-C exits · /new · /model · /status",
-    };
-
-    let mut parts = vec![
-        if matches!(state.mode, FooterMode::Waiting) {
+impl TurnSummary {
+    fn format_one_line(&self, status: &str, style: &Style) -> String {
+        let tokens = if self.prompt_tokens == 0 && self.completion_tokens == 0 {
             String::new()
         } else {
-            "╰".to_string()
-        },
-        status,
-    ];
-    if state.queue_depth > 0 {
-        parts.push(style.subtle(format!("queue {}", state.queue_depth)));
+            format!("↑{} ↓{}", self.prompt_tokens, self.completion_tokens)
+        };
+        let elapsed = format_elapsed_short(self.elapsed);
+        let mut parts = vec![style.accent(status)];
+        if !tokens.is_empty() {
+            parts.push(style.subtle(tokens));
+        }
+        parts.push(style.subtle(format!("last {elapsed}")));
+        parts
+            .into_iter()
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ")
     }
-    if let Some(tokens) = tokens {
-        parts.push(style.subtle(tokens));
-    }
-    if let Some(detail) = detail {
-        parts.push(style.subtle(detail));
-    }
-    if let Some(last_elapsed) = last_elapsed {
-        parts.push(style.subtle(format!("last {last_elapsed}")));
-    }
-    if state.exit_pending && !matches!(state.mode, FooterMode::Waiting | FooterMode::Working) {
-        parts.push(style.subtle("exit pending"));
-    }
-    parts.push(style.dim(hint));
-    parts
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" · ")
 }
 
 fn format_elapsed_short(elapsed: Duration) -> String {
@@ -586,7 +306,6 @@ pub struct CliShell {
     editor: Editor<CliHelper, DefaultHistory>,
     history_path: PathBuf,
     style: Style,
-    footer: FooterController,
     workspace: PathBuf,
     cwd: PathBuf,
     model: String,
@@ -605,23 +324,13 @@ impl CliShell {
         let mut editor = Editor::<CliHelper, DefaultHistory>::new()?;
         editor.set_helper(Some(CliHelper));
         let _ = editor.load_history(&history_path);
-        let cwd_name = cwd
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| cwd.display().to_string());
+        let _ = cwd;
         let model = model.into();
         let provider = provider.into();
-        let footer = FooterController::new(
-            style.clone(),
-            model.clone(),
-            provider.clone(),
-            truncate_middle(&cwd_name, 24),
-        );
         Ok(Self {
             editor,
             history_path,
             style,
-            footer,
             workspace: workspace.to_path_buf(),
             cwd: cwd.to_path_buf(),
             model,
@@ -684,14 +393,12 @@ impl CliShell {
             .unwrap_or_else(|| OutputTarget::stdout(self.style.clone()));
         Ok(CliOutput {
             style: self.style.clone(),
-            footer: self.footer.attach_target(target.clone()),
             target,
         })
     }
 
     pub fn read_event(&mut self) -> Result<InputEvent> {
         loop {
-            self.footer.render_current();
             let line = match self.editor.readline(&self.style.primary_prompt()) {
                 Ok(line) => line,
                 Err(ReadlineError::Interrupted) => return Ok(InputEvent::Interrupt),
@@ -710,7 +417,6 @@ impl CliShell {
                 Some(LocalCommand::Stop) => return Ok(InputEvent::Stop),
                 Some(LocalCommand::Help) => {
                     self.print_help();
-                    self.footer.render_current();
                     continue;
                 }
                 Some(LocalCommand::Clear) => {
@@ -728,12 +434,7 @@ impl CliShell {
 
     pub fn stream_renderer(&self) -> StreamRenderer {
         let target = OutputTarget::stdout(self.style.clone());
-        let footer = self.footer.attach_target(target.clone());
-        StreamRenderer::new(target, footer)
-    }
-
-    pub fn hide_footer(&self) {
-        self.footer.hide();
+        StreamRenderer::new(target)
     }
 
     fn print_help(&self) {
@@ -760,7 +461,6 @@ impl CliShell {
     }
 
     fn clear_screen(&self) {
-        self.footer.reset_render_state();
         if self.style.ansi {
             if is_vscode_terminal() {
                 // VS Code overlays a sticky terminal header at the top edge.
@@ -805,33 +505,16 @@ fn is_vscode_terminal() -> bool {
 pub struct CliOutput {
     style: Style,
     target: OutputTarget,
-    footer: FooterController,
 }
 
 impl CliOutput {
-    fn write_with_footer_hidden(&self, text: impl AsRef<str>) {
-        self.footer.suspend_overlay();
-        self.target.write_raw(text);
-        self.footer.resume_overlay();
-    }
-
     pub fn stream_renderer(&self) -> StreamRenderer {
-        StreamRenderer::new(self.target.clone(), self.footer.clone())
-    }
-
-    pub fn show_idle_footer(&self) {
-        self.footer.set_idle();
-        self.footer.render_current();
-    }
-
-    pub fn set_queue_depth(&self, queued: usize) {
-        self.footer.set_queue_depth(queued);
+        StreamRenderer::new(self.target.clone())
     }
 
     pub fn print_queue_notice(&self, queued: usize, prompt: &str) {
-        self.footer.set_queue_depth(queued);
         let preview = truncate_middle(prompt.trim(), 64);
-        self.write_with_footer_hidden(format!(
+        self.target.write_raw(format!(
             "\n{}\n",
             self.style
                 .queue_pill(format!("queued #{queued} · {}", preview))
@@ -839,9 +522,8 @@ impl CliOutput {
     }
 
     pub fn print_dequeue_notice(&self, remaining: usize, prompt: &str) {
-        self.footer.set_queue_depth(remaining);
         let preview = truncate_middle(prompt.trim(), 64);
-        self.write_with_footer_hidden(format!(
+        self.target.write_raw(format!(
             "\n{}\n",
             self.style.queue_pill(format!(
                 "running queued turn · {}{}",
@@ -856,8 +538,7 @@ impl CliOutput {
     }
 
     pub fn print_exit_notice(&self) {
-        self.footer.set_exit_pending(true);
-        self.write_with_footer_hidden(format!(
+        self.target.write_raw(format!(
             "\n{}\n",
             self.style
                 .queue_pill("exit requested · finishing the current turn first")
@@ -865,9 +546,7 @@ impl CliOutput {
     }
 
     pub fn print_interrupt_notice(&self, queued: usize) {
-        self.footer.set_queue_depth(queued);
-        self.footer.set_interrupted();
-        self.write_with_footer_hidden(format!(
+        self.target.write_raw(format!(
             "\n{}\n\n",
             self.style.error(if queued == 0 {
                 "turn cancelled"
@@ -881,7 +560,6 @@ impl CliOutput {
 #[derive(Clone)]
 pub struct StreamRenderer {
     target: OutputTarget,
-    footer: FooterController,
     state: Arc<Mutex<StreamState>>,
 }
 
@@ -892,8 +570,6 @@ struct StreamState {
     code_language: Option<String>,
     pending_table: Option<PendingTable>,
     trailing_newlines: usize,
-    waiting_stop: Option<Arc<AtomicBool>>,
-    waiting_handle: Option<JoinHandle<()>>,
 }
 
 #[derive(Default)]
@@ -907,45 +583,24 @@ struct PendingTableLine {
     has_newline: bool,
 }
 
-impl Drop for StreamState {
-    fn drop(&mut self) {
-        stop_waiting_indicator(self);
-    }
-}
-
 impl StreamRenderer {
-    fn write_with_footer_hidden(&self, text: impl AsRef<str>) {
-        self.footer.suspend_overlay();
-        self.target.write_raw(text);
-        self.footer.resume_overlay();
-    }
-
-    fn new(target: OutputTarget, footer: FooterController) -> Self {
+    fn new(target: OutputTarget) -> Self {
         Self {
             target,
-            footer,
             state: Arc::new(Mutex::new(StreamState::default())),
         }
     }
 
     pub fn start_waiting(&self) {
-        let mut state = self.state.lock().expect("cli stream state lock poisoned");
-        if state.started || state.waiting_handle.is_some() {
-            return;
-        }
-        start_waiting_indicator(&mut state, &self.footer, "awaiting model", Duration::ZERO);
+        // No-op: waiting indicator removed
     }
 
     pub fn callback(&self) -> TextStreamCallback {
         let target = self.target.clone();
-        let footer = self.footer.clone();
         let state = self.state.clone();
         Arc::new(Mutex::new(Box::new(move |delta: String| {
             let mut state = state.lock().expect("cli stream state lock poisoned");
             if !state.started {
-                stop_waiting_indicator(&mut state);
-                footer.hide();
-                footer.set_working("streaming");
                 target.write_raw("\n".to_string());
                 state.started = true;
                 note_output(&mut state, "\n");
@@ -958,7 +613,6 @@ impl StreamRenderer {
                 target.uses_external_printer(),
             );
             if !rendered.is_empty() {
-                footer.suspend_overlay();
                 target.write_raw(&rendered);
                 note_output(&mut state, &rendered);
             }
@@ -967,11 +621,8 @@ impl StreamRenderer {
 
     pub fn tool_hint(&self, hint: &str, tool_name: Option<&str>, tool_args: Option<&Value>) {
         let mut state = self.state.lock().expect("cli stream state lock poisoned");
-        stop_waiting_indicator(&mut state);
-        self.footer.hide();
-        self.footer.set_working(&truncate_middle(hint.trim(), 36));
         if !state.started {
-            self.write_with_footer_hidden("\n");
+            self.target.write_raw("\n");
             state.started = true;
             note_output(&mut state, "\n");
         }
@@ -985,26 +636,18 @@ impl StreamRenderer {
             }
         }
         let rendered = format!("{prefix}{rendered_hint}\n");
-        self.write_with_footer_hidden(&rendered);
+        self.target.write_raw(&rendered);
         state.trailing_newlines = rendered_hint
             .chars()
             .rev()
             .take_while(|ch| *ch == '\n')
             .count()
             .max(1);
-        start_waiting_indicator(
-            &mut state,
-            &self.footer,
-            &format!(""),
-            Duration::from_secs(10),
-        );
         drop(state);
     }
 
     pub fn finish(&self, content: &str, reasoning_content: Option<&str>, summary: &TurnSummary) {
         let mut state = self.state.lock().expect("cli stream state lock poisoned");
-        stop_waiting_indicator(&mut state);
-        self.footer.suspend_overlay();
         if state.started {
             let tail = render_stream_delta(
                 &self.target.style,
@@ -1037,8 +680,9 @@ impl StreamRenderer {
             ));
             note_output(&mut state, &rendered);
         }
-        self.footer.complete(summary);
-        self.footer.render_current();
+        // Print one-line status after turn completes
+        let status_line = summary.format_one_line("ready", &self.target.style);
+        self.target.write_raw(format!("\n{}\n", status_line));
     }
 
     fn render_reasoning_content(&self, reasoning: &str) -> String {
@@ -1056,8 +700,6 @@ impl StreamRenderer {
 
     pub fn finish_empty(&self, note: &str, summary: &TurnSummary) {
         let mut state = self.state.lock().expect("cli stream state lock poisoned");
-        stop_waiting_indicator(&mut state);
-        self.footer.suspend_overlay();
         let tail = render_stream_delta(
             &self.target.style,
             &mut state,
@@ -1074,14 +716,13 @@ impl StreamRenderer {
             self.target.write_raw(&rendered);
             note_output(&mut state, &rendered);
         }
-        self.footer.complete(summary);
-        self.footer.render_current();
+        // Print one-line status after turn completes
+        let status_line = summary.format_one_line("ready", &self.target.style);
+        self.target.write_raw(format!("\n{}\n", status_line));
     }
 
     pub fn finish_error(&self, err: &str) {
         let mut state = self.state.lock().expect("cli stream state lock poisoned");
-        stop_waiting_indicator(&mut state);
-        self.footer.suspend_overlay();
         let tail = render_stream_delta(
             &self.target.style,
             &mut state,
@@ -1096,56 +737,7 @@ impl StreamRenderer {
         let rendered = format!("\n{} {}\n", self.target.style.error("error:"), err);
         self.target.write_raw(&rendered);
         note_output(&mut state, &rendered);
-        self.footer.set_error(&truncate_middle(err, 40));
-        self.footer.render_current();
     }
-}
-
-fn stop_waiting_indicator(state: &mut StreamState) {
-    if let Some(stop) = state.waiting_stop.take() {
-        stop.store(true, Ordering::SeqCst);
-    }
-    if let Some(handle) = state.waiting_handle.take() {
-        let _ = handle.join();
-    }
-}
-
-fn start_waiting_indicator(
-    state: &mut StreamState,
-    footer: &FooterController,
-    detail: &str,
-    delay: Duration,
-) {
-    stop_waiting_indicator(state);
-    if delay.is_zero() {
-        footer.set_waiting(detail);
-        footer.render_current();
-    }
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_flag = Arc::clone(&stop);
-    let footer = footer.clone();
-    let detail = detail.to_string();
-    let handle = thread::spawn(move || {
-        if !delay.is_zero() {
-            let mut delayed = Duration::ZERO;
-            while delayed < delay {
-                if stop_flag.load(Ordering::SeqCst) {
-                    return;
-                }
-                let step = Duration::from_millis(100).min(delay - delayed);
-                thread::sleep(step);
-                delayed += step;
-            }
-            footer.set_waiting(&detail);
-            footer.render_current();
-        }
-        while !stop_flag.load(Ordering::SeqCst) {
-            thread::sleep(Duration::from_millis(90));
-            footer.tick();
-        }
-    });
-    state.waiting_stop = Some(stop);
-    state.waiting_handle = Some(handle);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -241,7 +241,6 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
         println!("{notice}");
     }
     let output = shell.create_output()?;
-    output.show_idle_footer();
     let (tx, mut rx) = unbounded_channel::<ReplEvent>();
     let input_tx = tx.clone();
     let busy_flag = Arc::new(AtomicBool::new(false));
@@ -251,7 +250,6 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
         loop {
             match shell.read_event() {
                 Ok(InputEvent::Prompt(prompt)) => {
-                    shell.hide_footer();
                     if input_tx
                         .send(ReplEvent::Input(InputEvent::Prompt(prompt)))
                         .is_err()
@@ -260,7 +258,6 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                     }
                 }
                 Ok(InputEvent::Exit) => {
-                    shell.hide_footer();
                     let _ = input_tx.send(ReplEvent::Input(InputEvent::Exit));
                     break;
                 }
@@ -273,7 +270,6 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                             break;
                         }
                     } else {
-                        shell.hide_footer();
                         let _ = input_tx.send(ReplEvent::Input(InputEvent::Exit));
                         break;
                     }
@@ -303,7 +299,6 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                     pending.push_back(prompt.clone());
                     output.print_queue_notice(pending.len(), &prompt);
                 } else {
-                    output.set_queue_depth(0);
                     active_task = Some(spawn_repl_turn(
                         agent.clone(),
                         session_key.clone(),
@@ -340,7 +335,7 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                             busy = true;
                             busy_flag.store(true, Ordering::SeqCst);
                         } else {
-                            output.show_idle_footer();
+                            // Ready for next input
                         }
                     }
                 } else {
@@ -371,7 +366,7 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                             busy = true;
                             busy_flag.store(true, Ordering::SeqCst);
                         } else {
-                            output.show_idle_footer();
+                            // Ready for next input
                         }
                     }
                 } else {
@@ -406,7 +401,7 @@ async fn repl(config_path: Option<&Path>, model: Option<String>) -> Result<()> {
                     busy = true;
                     busy_flag.store(true, Ordering::SeqCst);
                 } else {
-                    output.show_idle_footer();
+                    // Ready for next input
                 }
             }
         }
