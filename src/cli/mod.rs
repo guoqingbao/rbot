@@ -429,11 +429,7 @@ impl FooterController {
     }
 
     fn tick(&self) {
-        let mut state = self.state.lock().expect("footer state lock poisoned");
-        if matches!(state.mode, FooterMode::Waiting) && !state.hidden {
-            state.spinner_frame = state.spinner_frame.wrapping_add(1);
-            render_footer_locked(&self.style, &mut state);
-        }
+        // No animation needed; spinner removed
     }
 
     fn render_current(&self) {
@@ -510,13 +506,9 @@ fn clear_overlay_footer() {
 }
 
 fn build_footer_line(style: &Style, state: &FooterState) -> String {
-    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let status = match state.mode {
         FooterMode::Idle => style.accent("ready"),
-        FooterMode::Waiting => style.accent(format!(
-            "› {} waiting",
-            spinner[state.spinner_frame % spinner.len()]
-        )),
+        FooterMode::Waiting => style.accent("waiting"),
         FooterMode::Working => style.accent("working"),
         FooterMode::Interrupted => style.error("interrupted"),
         FooterMode::Error => style.error("error"),
