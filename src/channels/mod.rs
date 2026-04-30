@@ -679,9 +679,10 @@ fn build_progress_update(msg: &OutboundMessage, content: String) -> OutboundMess
 
 async fn dispatch_outbound(
     channels: &BTreeMap<String, Arc<dyn Channel>>,
-    msg: OutboundMessage,
+    mut msg: OutboundMessage,
     max_retries: usize,
 ) {
+    msg.reasoning_content = None;
     let channel_name = msg.channel.clone();
     let chat_id = msg.chat_id.clone();
     let content_preview = msg.content.chars().take(200).collect::<String>();
@@ -1047,6 +1048,32 @@ mod tests {
                 "Done.",
             ]
         );
+
+        manager.stop_all().await.expect("stop channels");
+    }
+
+    #[tokio::test]
+    async fn channel_dispatch_strips_reasoning_content() {
+        let workspace = tempdir().expect("tempdir");
+        let bus = MessageBus::new(16);
+        let manager = ChannelManager::new(
+            test_channels_config(true, true),
+            bus.clone(),
+            workspace.path().to_path_buf(),
+        )
+        .expect("channel manager");
+        manager.start_all().await.expect("start channels");
+
+        let mut msg = final_message("chat-reasoning", "session-reasoning", "Visible answer.");
+        msg.reasoning_content = Some("private reasoning".to_string());
+        bus.publish_outbound(msg)
+            .await
+            .expect("publish final message");
+
+        wait_for_sent_count(&manager, 1).await;
+        let sent = local_sent_messages(&manager);
+        assert_eq!(sent[0].content, "Visible answer.");
+        assert_eq!(sent[0].reasoning_content, None);
 
         manager.stop_all().await.expect("stop channels");
     }

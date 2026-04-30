@@ -641,8 +641,13 @@ impl AgentLoop {
             ),
         )
         .await;
-        self.record_completed_task_memory(&msg.content, final_content.as_deref(), &all_messages)
-            .await;
+        self.record_completed_task_memory(
+            &msg.content,
+            final_content.as_deref(),
+            &all_messages,
+            Some(&target),
+        )
+        .await;
 
         if self.message_tool.sent_in_turn() {
             return Ok(None);
@@ -1023,6 +1028,20 @@ impl AgentLoop {
         let _ = callback(outbound).await;
     }
 
+    async fn send_backend_tool_hint(
+        &self,
+        target: Option<&ProgressTarget>,
+        name: &str,
+        arguments: Value,
+    ) {
+        let tool_call = crate::providers::ToolCallRequest {
+            id: format!("backend_{name}"),
+            name: name.to_string(),
+            arguments,
+        };
+        self.send_tool_hint(target, &tool_call).await;
+    }
+
     async fn handle_stop_signal(
         &self,
         msg: &InboundMessage,
@@ -1220,11 +1239,18 @@ impl AgentLoop {
         task_text: &str,
         final_content: Option<&str>,
         messages: &[ChatMessage],
+        target: Option<&ProgressTarget>,
     ) {
         let summary_source = final_content
             .map(ToOwned::to_owned)
             .or_else(|| latest_assistant_text(messages))
             .unwrap_or_else(|| task_text.to_string());
+        self.send_backend_tool_hint(
+            target,
+            "memory_summary",
+            serde_json::json!({"task":"summarize completed task memory"}),
+        )
+        .await;
         let entry = self
             .build_memory_entry_with_skill(
                 MemoryEntryKind::TaskSummary,
@@ -1276,7 +1302,7 @@ impl AgentLoop {
                 ],
                 None,
                 Some(&self.model),
-                Some(400),
+                None,
                 Some(0.1),
             )
             .await
@@ -1778,14 +1804,17 @@ fn extract_attention_points(text: &str) -> Vec<String> {
 }
 
 fn parse_memory_entry_response(content: &str) -> Result<MemoryEntrySummary> {
-    for candidate in extract_json_candidates(content) {
+    // Strip reasoning tags that some providers include in content
+    let think_re = Regex::new(r"(?s)<think>.*?</think>").expect("valid think regex");
+    let cleaned = think_re.replace_all(content, "").trim().to_string();
+    for candidate in extract_json_candidates(&cleaned) {
         if let Ok(parsed) = serde_json::from_str::<MemoryEntrySummary>(&candidate) {
             return Ok(parsed);
         }
     }
     Err(anyhow::anyhow!(
         "memory summary response was not valid JSON: {}",
-        truncate_plain(content, 160)
+        truncate_plain(&cleaned, 160)
     ))
 }
 

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -800,6 +800,99 @@ async fn completed_tasks_append_task_summary_to_memory() {
     assert!(memory.contains("Stop acknowledgement flow"));
     assert!(memory.contains("Added immediate stop acknowledgement and completion replies"));
     assert!(memory.contains("Keep threaded channel metadata on both replies."));
+}
+
+#[tokio::test]
+async fn completed_task_memory_emits_backend_tool_hint_without_context_entry() {
+    let dir = tempdir().unwrap();
+    let provider = Arc::new(QueuedProvider::new(
+        "test-model",
+        vec![
+            LlmResponse {
+                content: Some("Finished the requested work.".to_string()),
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: LlmUsage::default(),
+                reasoning_content: None,
+                thinking_blocks: None,
+            },
+            LlmResponse {
+                content: Some(
+                    r#"{"title":"Requested work finished","summary":"Finished the requested work.","attention_points":[]}"#
+                        .to_string(),
+                ),
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: LlmUsage::default(),
+                reasoning_content: None,
+                thinking_blocks: None,
+            },
+        ],
+    ));
+    let agent = AgentLoop::new(
+        provider,
+        dir.path(),
+        Some("test-model".to_string()),
+        8,
+        5,
+        8_000,
+        32 * 1024,
+        Default::default(),
+        None,
+        ExecToolConfig {
+            enable: false,
+            timeout: 60,
+            path_append: String::new(),
+        },
+        false,
+        None,
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+    let progress_messages = Arc::new(Mutex::new(Vec::<OutboundMessage>::new()));
+    let captured = progress_messages.clone();
+    let callback: MessageSendCallback = Arc::new(move |msg| {
+        let captured = captured.clone();
+        Box::pin(async move {
+            captured.lock().expect("progress lock poisoned").push(msg);
+            Ok(())
+        })
+    });
+    agent.set_progress_sender(Some(callback));
+
+    agent
+        .process_direct("finish requested work", "cli:direct", "cli", "direct")
+        .await
+        .unwrap();
+
+    let progress = progress_messages.lock().expect("progress lock poisoned");
+    let hint = progress
+        .iter()
+        .find(|msg| {
+            msg.metadata.get("_tool_name").and_then(Value::as_str) == Some("memory_summary")
+        })
+        .expect("memory summary tool hint should be emitted");
+    assert_eq!(
+        hint.metadata.get("_progress").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        hint.metadata.get("_tool_hint").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(hint.content.contains("memory_summary"));
+    drop(progress);
+
+    let mut sessions = SessionManager::new(dir.path()).unwrap();
+    let session = sessions.get_or_create("cli:direct").unwrap();
+    assert!(
+        !session
+            .messages
+            .iter()
+            .filter_map(ChatMessage::content_as_text)
+            .any(|content| content.contains("memory_summary"))
+    );
 }
 
 #[tokio::test]
