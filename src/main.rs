@@ -209,7 +209,11 @@ async fn chat(
         .await?
     {
         let summary = turn_summary(&built.agent, started.elapsed())?;
-        stream.finish(&response.content, &summary);
+        stream.finish(
+            &response.content,
+            response.reasoning_content.as_deref(),
+            &summary,
+        );
     }
     Ok(())
 }
@@ -434,7 +438,11 @@ fn spawn_repl_turn(
             .await
         {
             Ok(Some(response)) => match turn_summary(&agent, started.elapsed()) {
-                Ok(summary) => stream.finish(&response.content, &summary),
+                Ok(summary) => stream.finish(
+                    &response.content,
+                    response.reasoning_content.as_deref(),
+                    &summary,
+                ),
                 Err(err) => stream.finish_error(&err.to_string()),
             },
             Ok(None) => match turn_summary(&agent, started.elapsed()) {
@@ -1405,6 +1413,7 @@ fn build_heartbeat_service(
                     content: response,
                     reply_to: None,
                     media: Vec::new(),
+                    reasoning_content: None,
                     metadata: Default::default(),
                 })
                 .await?;

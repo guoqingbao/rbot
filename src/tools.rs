@@ -1474,6 +1474,7 @@ impl Tool for MessageTool {
             content,
             reply_to: None,
             media,
+            reasoning_content: None,
             metadata: message_id
                 .map(|message_id| {
                     BTreeMap::from([("message_id".to_string(), Value::String(message_id))])

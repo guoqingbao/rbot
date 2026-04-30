@@ -94,6 +94,9 @@ impl ChatMessage {
         if let Some(name) = &self.name {
             out["name"] = json!(name);
         }
+        if let Some(reasoning_content) = &self.reasoning_content {
+            out["reasoning_content"] = json!(reasoning_content);
+        }
         out
     }
 }
@@ -266,6 +269,37 @@ mod tests {
 
         assert_eq!(payload.get("role").unwrap(), "user");
         assert_eq!(payload.get("content").unwrap(), "hello");
+    }
+
+    #[test]
+    fn to_openai_payload_includes_reasoning_content() {
+        let message = ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(json!("The answer is 42")),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            timestamp: None,
+            reasoning_content: Some("Let me think step by step...".to_string()),
+            thinking_blocks: None,
+            metadata: None,
+        };
+        let payload = message.to_openai_payload();
+
+        assert_eq!(payload.get("role").unwrap(), "assistant");
+        assert_eq!(payload.get("content").unwrap(), "The answer is 42");
+        assert_eq!(
+            payload.get("reasoning_content").unwrap(),
+            "Let me think step by step..."
+        );
+    }
+
+    #[test]
+    fn to_openai_payload_omits_reasoning_content_when_none() {
+        let message = ChatMessage::text("assistant", "hello");
+        let payload = message.to_openai_payload();
+
+        assert!(payload.get("reasoning_content").is_none());
     }
 }
 

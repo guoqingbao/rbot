@@ -170,6 +170,7 @@ async fn manager_loads_plugin_from_dict_config_and_dispatches() {
         content: "hello".to_string(),
         reply_to: None,
         media: Vec::new(),
+        reasoning_content: None,
         metadata: BTreeMap::new(),
     })
     .await

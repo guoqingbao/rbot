@@ -208,6 +208,7 @@ async fn slack_send_uses_thread_for_channel_messages() {
             content: "hello".to_string(),
             reply_to: None,
             media: vec!["/tmp/demo.txt".to_string()],
+            reasoning_content: None,
             metadata: BTreeMap::from([(
                 "slack".to_string(),
                 json!({"thread_ts": "1700000000.000100", "channel_type": "channel"}),
@@ -249,6 +250,7 @@ async fn slack_send_updates_reactions_for_final_responses() {
             content: "done".to_string(),
             reply_to: None,
             media: Vec::new(),
+            reasoning_content: None,
             metadata: BTreeMap::from([(
                 "slack".to_string(),
                 json!({"event": {"ts": "1700000000.000100"}, "channel_type": "channel"}),
@@ -400,6 +402,7 @@ async fn telegram_send_preserves_topic_and_infers_reply_topic_from_cache() {
             content: "hello".to_string(),
             reply_to: None,
             media: Vec::new(),
+            reasoning_content: None,
             metadata: BTreeMap::from([
                 ("_progress".to_string(), json!(true)),
                 ("message_thread_id".to_string(), json!(42)),
@@ -414,6 +417,7 @@ async fn telegram_send_preserves_topic_and_infers_reply_topic_from_cache() {
             content: "reply".to_string(),
             reply_to: None,
             media: Vec::new(),
+            reasoning_content: None,
             metadata: BTreeMap::from([("message_id".to_string(), json!(10))]),
         })
         .await
@@ -454,6 +458,7 @@ async fn telegram_send_routes_media_and_blocks_unsafe_remote_urls() {
                 local_photo.display().to_string(),
                 "http://127.0.0.1/internal.jpg".to_string(),
             ],
+            reasoning_content: None,
             metadata: BTreeMap::new(),
         })
         .await

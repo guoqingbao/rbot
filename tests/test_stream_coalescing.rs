@@ -149,6 +149,7 @@ async fn stream_delta_goes_to_send_delta_not_send() {
         content: "partial text".to_string(),
         reply_to: None,
         media: Vec::new(),
+        reasoning_content: None,
         metadata: meta,
     })
     .await
@@ -199,6 +200,7 @@ async fn stream_end_without_streamed_skips_regular_send() {
         content: String::new(),
         reply_to: None,
         media: Vec::new(),
+        reasoning_content: None,
         metadata: meta,
     })
     .await
@@ -253,6 +255,7 @@ async fn send_retries_use_exponential_backoff_before_succeeding() {
         content: "final".to_string(),
         reply_to: None,
         media: Vec::new(),
+        reasoning_content: None,
         metadata: meta,
     })
     .await

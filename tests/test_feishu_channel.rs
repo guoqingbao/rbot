@@ -238,6 +238,7 @@ async fn tool_hint_sends_interactive_code_card() {
             content: r#"[ 🔍 web_search  query="test query" ]"#.to_string(),
             reply_to: None,
             media: Vec::new(),
+            reasoning_content: None,
             metadata: BTreeMap::from([("_tool_hint".to_string(), json!(true))]),
         })
         .await
@@ -275,6 +276,7 @@ async fn send_uses_reply_api_when_configured_and_falls_back_to_create() {
             content: "hello".to_string(),
             reply_to: None,
             media: Vec::new(),
+            reasoning_content: None,
             metadata: BTreeMap::from([("message_id".to_string(), json!("om_001"))]),
         })
         .await
@@ -313,6 +315,7 @@ async fn send_uses_expected_feishu_msg_type_for_uploaded_files() {
                 content: String::new(),
                 reply_to: None,
                 media: vec![path.display().to_string()],
+                reasoning_content: None,
                 metadata: BTreeMap::new(),
             })
             .await

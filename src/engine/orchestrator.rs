@@ -604,7 +604,8 @@ impl AgentLoop {
             )
             .await
         };
-        let (final_content, all_messages, interrupted) = match loop_result {
+        let (final_content, all_messages, interrupted, final_reasoning_content) = match loop_result
+        {
             Ok(result) => result,
             Err(err) => {
                 self.persist_session_messages(&session_key, &initial_messages)?;
@@ -646,9 +647,18 @@ impl AgentLoop {
         if self.message_tool.sent_in_turn() {
             return Ok(None);
         }
-        Ok(Some(target.outbound(final_content.unwrap_or_else(|| {
+        let content = final_content.unwrap_or_else(|| {
             "I've completed processing but have no response to give.".to_string()
-        }))))
+        });
+        Ok(Some(OutboundMessage {
+            channel: target.channel,
+            chat_id: target.chat_id,
+            content,
+            reply_to: None,
+            media: Vec::new(),
+            reasoning_content: final_reasoning_content,
+            metadata: target.metadata,
+        }))
     }
 
     async fn process_system_inbound(&self, msg: InboundMessage) -> Result<Option<OutboundMessage>> {
@@ -716,7 +726,8 @@ impl AgentLoop {
             )
             .await
         };
-        let (final_content, all_messages, interrupted) = match loop_result {
+        let (final_content, all_messages, interrupted, _final_reasoning_content) = match loop_result
+        {
             Ok(result) => result,
             Err(err) => {
                 self.persist_session_messages(&session_key, &initial_messages)?;
@@ -753,9 +764,8 @@ impl AgentLoop {
         )
         .await;
 
-        Ok(Some(progress_target.outbound(
-            final_content.unwrap_or_else(|| "Background task completed.".to_string()),
-        )))
+        let content = final_content.unwrap_or_else(|| "Background task completed.".to_string());
+        Ok(Some(progress_target.outbound(content)))
     }
 
     async fn run_agent_loop(
@@ -765,9 +775,10 @@ impl AgentLoop {
         mut messages: Vec<ChatMessage>,
         text_stream: Option<TextStreamCallback>,
         progress_target: Option<ProgressTarget>,
-    ) -> Result<(Option<String>, Vec<ChatMessage>, bool)> {
+    ) -> Result<(Option<String>, Vec<ChatMessage>, bool, Option<String>)> {
         *self.last_usage.lock().expect("usage lock poisoned") = (0, 0);
         let mut final_content = None;
+        let mut final_reasoning_content = None;
         let think_re = Regex::new(r"(?s)<think>.*?</think>").expect("valid think regex");
         let mut last_tool_call_fingerprint: Option<String> = None;
         let mut repeated_tool_call_streak = 0_usize;
@@ -783,7 +794,7 @@ impl AgentLoop {
                     .expect("cancellations lock poisoned")
                     .contains(session_key)
                 {
-                    return Ok((None, messages, true));
+                    return Ok((None, messages, true, None));
                 }
             }
 
@@ -813,7 +824,7 @@ impl AgentLoop {
                     .expect("cancellations lock poisoned")
                     .contains(session_key)
                 {
-                    return Ok((None, messages, true));
+                    return Ok((None, messages, true, None));
                 }
             }
 
@@ -858,7 +869,7 @@ impl AgentLoop {
                             .expect("cancellations lock poisoned")
                             .contains(session_key)
                         {
-                            return Ok((None, messages, true));
+                            return Ok((None, messages, true, None));
                         }
                     }
                     self.send_tool_hint(progress_target.as_ref(), tool_call)
@@ -898,7 +909,7 @@ impl AgentLoop {
                         .expect("cancellations lock poisoned")
                         .contains(session_key)
                     {
-                        return Ok((None, messages, true));
+                        return Ok((None, messages, true, None));
                     }
                 }
 
@@ -927,6 +938,7 @@ impl AgentLoop {
                     response.thinking_blocks.clone(),
                 );
                 final_content = content;
+                final_reasoning_content = response.reasoning_content.clone();
                 break;
             }
         }
@@ -939,7 +951,7 @@ impl AgentLoop {
                 .expect("cancellations lock poisoned")
                 .contains(session_key)
             {
-                return Ok((None, messages, true));
+                return Ok((None, messages, true, None));
             }
         }
 
@@ -951,7 +963,7 @@ impl AgentLoop {
             ));
         }
 
-        Ok((final_content, messages, false))
+        Ok((final_content, messages, false, final_reasoning_content))
     }
 
     fn recent_tool_diagnostics(messages: &[ChatMessage]) -> Vec<String> {
@@ -1290,6 +1302,7 @@ impl AgentLoop {
             content: self.build_status_content(session),
             reply_to: None,
             media: Vec::new(),
+            reasoning_content: None,
             metadata: msg.metadata.clone(),
         }
     }
@@ -1506,6 +1519,7 @@ impl ProgressTarget {
             content: content.into(),
             reply_to: None,
             media: Vec::new(),
+            reasoning_content: None,
             metadata,
         }
     }

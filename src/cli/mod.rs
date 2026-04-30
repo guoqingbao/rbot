@@ -1009,7 +1009,7 @@ impl StreamRenderer {
         drop(state);
     }
 
-    pub fn finish(&self, content: &str, summary: &TurnSummary) {
+    pub fn finish(&self, content: &str, reasoning_content: Option<&str>, summary: &TurnSummary) {
         let mut state = self.state.lock().expect("cli stream state lock poisoned");
         stop_waiting_indicator(&mut state);
         self.footer.suspend_overlay();
@@ -1032,6 +1032,11 @@ impl StreamRenderer {
                 .write_raw(format!("\n{}\n", self.target.style.separator(60)));
             state.trailing_newlines = 1;
         } else {
+            if let Some(reasoning) = reasoning_content {
+                let rendered_reasoning = self.render_reasoning_content(reasoning);
+                self.target.write_raw(rendered_reasoning);
+                note_output(&mut state, "\n");
+            }
             let rendered = render_markdown_response(&self.target.style, content);
             self.target.write_raw(format!(
                 "\n{}\n\n{}\n",
@@ -1042,6 +1047,19 @@ impl StreamRenderer {
         }
         self.footer.complete(summary);
         self.footer.render_current();
+    }
+
+    fn render_reasoning_content(&self, reasoning: &str) -> String {
+        let lines: Vec<&str> = reasoning.lines().collect();
+        if lines.is_empty() {
+            return String::new();
+        }
+        let mut out = String::new();
+        out.push_str(&self.target.style.subtle("\n· · · reasoning · · ·\n"));
+        for line in lines {
+            out.push_str(&self.target.style.subtle(format!("  {line}\n")));
+        }
+        out
     }
 
     pub fn finish_empty(&self, note: &str, summary: &TurnSummary) {

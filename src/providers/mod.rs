@@ -838,6 +838,7 @@ fn apply_openai_like_sse_event(
     }
     if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
         state.reasoning_content.push_str(reasoning);
+        emit_text_delta(text_stream, &format!("\x1b[2;3m{reasoning}\x1b[0m"));
     }
     if let Some(blocks) = delta.get("thinking_blocks").and_then(Value::as_array) {
         state.thinking_blocks.extend(blocks.iter().cloned());

@@ -672,6 +672,7 @@ fn build_progress_update(msg: &OutboundMessage, content: String) -> OutboundMess
         content,
         reply_to: None,
         media: Vec::new(),
+        reasoning_content: None,
         metadata,
     }
 }
@@ -982,6 +983,7 @@ mod tests {
             content: format!("[ {tool_name} ]"),
             reply_to: None,
             media: Vec::new(),
+            reasoning_content: None,
             metadata: BTreeMap::from([
                 ("_progress".to_string(), Value::Bool(true)),
                 ("_tool_hint".to_string(), Value::Bool(true)),
@@ -1004,6 +1006,7 @@ mod tests {
             content: content.to_string(),
             reply_to: None,
             media: Vec::new(),
+            reasoning_content: None,
             metadata: BTreeMap::from([(
                 SESSION_KEY_METADATA.to_string(),
                 Value::String(session_key.to_string()),

@@ -110,6 +110,7 @@ impl AgentRuntime {
                                     content: format!("Error processing inbound message: {err}"),
                                     reply_to: None,
                                     media: Vec::new(),
+                                    reasoning_content: None,
                                     metadata: Default::default(),
                                 })
                                 .await;

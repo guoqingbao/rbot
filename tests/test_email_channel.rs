@@ -216,6 +216,7 @@ async fn send_uses_reply_subject_and_in_reply_to() {
             content: "Acknowledged.".to_string(),
             reply_to: None,
             media: Vec::new(),
+            reasoning_content: None,
             metadata: BTreeMap::new(),
         })
         .await
@@ -244,6 +245,7 @@ async fn send_skips_reply_when_auto_reply_disabled_unless_forced() {
             content: "Should not send.".to_string(),
             reply_to: None,
             media: Vec::new(),
+            reasoning_content: None,
             metadata: BTreeMap::new(),
         })
         .await
@@ -257,6 +259,7 @@ async fn send_skips_reply_when_auto_reply_disabled_unless_forced() {
             content: "Force send.".to_string(),
             reply_to: None,
             media: Vec::new(),
+            reasoning_content: None,
             metadata: BTreeMap::from([("force_send".to_string(), json!(true))]),
         })
         .await
@@ -280,6 +283,7 @@ async fn send_proactive_email_when_auto_reply_disabled() {
             content: "Hello, this is a proactive email.".to_string(),
             reply_to: None,
             media: Vec::new(),
+            reasoning_content: None,
             metadata: BTreeMap::new(),
         })
         .await

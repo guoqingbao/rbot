@@ -112,6 +112,7 @@ impl AgentHook for CallbackHook {
                 content: delta.to_string(),
                 reply_to: None,
                 media: Vec::new(),
+                reasoning_content: None,
                 metadata: meta,
             };
             sender(msg).await?;
@@ -136,6 +137,7 @@ impl AgentHook for CallbackHook {
                 content: String::new(),
                 reply_to: None,
                 media: Vec::new(),
+                reasoning_content: None,
                 metadata: meta,
             };
             sender(msg).await?;

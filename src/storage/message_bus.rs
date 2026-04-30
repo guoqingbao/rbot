@@ -41,6 +41,8 @@ pub struct OutboundMessage {
     pub reply_to: Option<String>,
     #[serde(default)]
     pub media: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(default)]
     pub metadata: BTreeMap<String, Value>,
 }
