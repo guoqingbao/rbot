@@ -1260,12 +1260,12 @@ impl AgentLoop {
             .map(ToOwned::to_owned)
             .or_else(|| latest_assistant_text(messages))
             .unwrap_or_else(|| task_text.to_string());
-        self.send_backend_tool_hint(
-            target,
-            "memory_summary",
-            serde_json::json!({"task":"summarize completed task memory"}),
-        )
-        .await;
+        // self.send_backend_tool_hint(
+        //     target,
+        //     "memory_summary",
+        //     serde_json::json!({"task":"summarize completed task memory"}),
+        // )
+        // .await;
         let entry = self
             .build_memory_entry_with_skill(
                 MemoryEntryKind::TaskSummary,
