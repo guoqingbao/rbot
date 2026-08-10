@@ -258,14 +258,7 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &mut App) {
             .enumerate()
             .map(|(offset, line)| {
                 let line_index = visible_start + offset;
-                if app
-                    .selection_columns(line_index)
-                    .is_some_and(|(from, to)| from < to)
-                {
-                    line.clone().patch_style(Style::default().bg(SELECTION_BG))
-                } else {
-                    line.clone()
-                }
+                line_with_selection(line, app.selection_columns(line_index))
             })
             .collect()
     } else {
@@ -782,6 +775,41 @@ fn transcript_line_text(line: &Line<'_>) -> String {
         .collect()
 }
 
+fn line_with_selection(line: &Line<'static>, selection: Option<(usize, usize)>) -> Line<'static> {
+    let Some((from, to)) = selection.filter(|(from, to)| from < to) else {
+        return line.clone();
+    };
+
+    let mut column = 0;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for grapheme in line.styled_graphemes(Style::default()) {
+        let width = UnicodeWidthStr::width(grapheme.symbol);
+        let selected = if width == 0 {
+            column >= from && column < to
+        } else {
+            column < to && column.saturating_add(width) > from
+        };
+        let style = if selected {
+            grapheme.style.patch(Style::default().bg(SELECTION_BG))
+        } else {
+            grapheme.style
+        };
+
+        if let Some(previous) = spans.last_mut().filter(|span| span.style == style) {
+            previous.content.to_mut().push_str(grapheme.symbol);
+        } else {
+            spans.push(Span::styled(grapheme.symbol.to_string(), style));
+        }
+        column = column.saturating_add(width);
+    }
+
+    Line {
+        style: line.style,
+        alignment: line.alignment,
+        spans,
+    }
+}
+
 fn render_reasoning_block(lines: &mut Vec<Line<'static>>, reasoning: Option<&str>) {
     let Some(reasoning) = reasoning else { return };
     if reasoning.trim().is_empty() {
@@ -1072,6 +1100,28 @@ pub mod tests {
                 assert!(UnicodeWidthStr::width(truncated.as_str()) <= width);
             }
         }
+    }
+
+    #[test]
+    fn selection_highlights_only_selected_text_columns() {
+        let line = Line::from(vec![
+            Span::styled("prefix ", Style::default().fg(USER_FG)),
+            Span::styled("selected text", Style::default().fg(TEXT_PRIMARY)),
+        ]);
+
+        let selected = line_with_selection(&line, Some((7, 15)));
+
+        assert_eq!(
+            selected
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["prefix ", "selected", " text"]
+        );
+        assert_eq!(selected.spans[0].style.bg, None);
+        assert_eq!(selected.spans[1].style.bg, Some(SELECTION_BG));
+        assert_eq!(selected.spans[2].style.bg, None);
     }
 
     #[test]

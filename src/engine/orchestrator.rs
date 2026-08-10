@@ -356,6 +356,21 @@ impl AgentLoop {
             .expect("model switch callback lock poisoned") = callback;
     }
 
+    /// Make the configured startup model authoritative for a session.
+    ///
+    /// The interactive REPL uses this when it starts so an old session
+    /// metadata entry cannot silently keep routing requests to a cached model.
+    pub fn set_session_model(&self, session_key: &str, model: &str) -> Result<()> {
+        let mut sessions = self.sessions.lock().expect("session manager lock poisoned");
+        let mut session = sessions.get_or_create(session_key)?;
+        session.metadata.insert(
+            SESSION_MODEL_KEY.to_string(),
+            Value::String(model.to_string()),
+        );
+        session.metadata.remove(SESSION_CONTEXT_WINDOW_KEY);
+        sessions.save(&session)
+    }
+
     pub fn set_auto_task_summary_enabled(&self, enabled: bool) {
         self.auto_task_summary_enabled
             .store(enabled, Ordering::SeqCst);

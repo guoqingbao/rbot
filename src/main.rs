@@ -508,9 +508,8 @@ async fn repl(
         subagent_model,
     } = built;
     let session_message_count = repl_session_message_count(&workspace, &session_key)?;
+    agent.set_session_model(&session_key, &model)?;
     let context_status = repl_session_context_status(&agent, &session_key).await?;
-    let display_model =
-        repl_session_model(&workspace, &session_key)?.unwrap_or_else(|| model.clone());
 
     if let Some(notice) = &startup_notice {
         eprintln!("{notice}");
@@ -521,7 +520,7 @@ async fn repl(
 
     tui::run_tui_repl(
         agent,
-        display_model,
+        model,
         provider_name,
         workspace,
         cwd,
@@ -1502,14 +1501,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repl_context_header_reuses_status_context_line() {
+    async fn repl_startup_model_overrides_cached_session_model() {
         let dir = tempdir().unwrap();
         let mut sessions = SessionManager::new(dir.path()).unwrap();
         let mut session = sessions.get_or_create("cli:demo").unwrap();
         session.add_message("user", "hello");
-        session
-            .metadata
-            .insert("model".to_string(), Value::String("demo-model".to_string()));
+        session.metadata.insert(
+            "model".to_string(),
+            Value::String("cached-model".to_string()),
+        );
         session
             .metadata
             .insert("contextTokens".to_string(), Value::from(5_u64));
@@ -1517,14 +1517,14 @@ mod tests {
 
         let agent = AgentLoop::new(
             Arc::new(CatalogProvider {
-                model: "demo-model".to_string(),
+                model: "configured-model".to_string(),
                 models: vec![ProviderModelInfo {
-                    id: "demo-model".to_string(),
+                    id: "configured-model".to_string(),
                     context_window_tokens: Some(524288),
                 }],
             }),
             dir.path(),
-            Some("demo-model".to_string()),
+            Some("configured-model".to_string()),
             8,
             5,
             262144,
@@ -1543,10 +1543,20 @@ mod tests {
         .await
         .unwrap();
 
+        agent
+            .set_session_model("cli:demo", "configured-model")
+            .unwrap();
         let context = repl_session_context_status(&agent, "cli:demo")
             .await
             .unwrap();
         assert_eq!(context, "5/524288 (0%)");
+
+        let mut sessions = SessionManager::new(dir.path()).unwrap();
+        let session = sessions.get_or_create("cli:demo").unwrap();
+        assert_eq!(
+            session.metadata.get("model"),
+            Some(&Value::String("configured-model".into()))
+        );
     }
 }
 
@@ -1731,16 +1741,6 @@ fn cli_session_key(cwd: &Path) -> String {
 fn repl_session_message_count(workspace: &Path, session_key: &str) -> Result<usize> {
     let mut sessions = SessionManager::new(workspace)?;
     Ok(sessions.get_or_create(session_key)?.get_history(0).len())
-}
-
-fn repl_session_model(workspace: &Path, session_key: &str) -> Result<Option<String>> {
-    let mut sessions = SessionManager::new(workspace)?;
-    Ok(sessions
-        .get_or_create(session_key)?
-        .metadata
-        .get("model")
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned))
 }
 
 async fn repl_session_context_status(agent: &AgentLoop, session_key: &str) -> Result<String> {
